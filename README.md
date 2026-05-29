@@ -85,3 +85,15 @@ This repository is currently at the naming and project-skeleton stage.
 
 See [ROADMAP.md](ROADMAP.md) for the first version boundary and planned
 milestones.
+
+## Agent Development Workflow
+
+ForgeLane uses repo-local agent guidance and workflow docs:
+
+- [AGENTS.md](AGENTS.md) for repository guardrails.
+- [CONTEXT.md](CONTEXT.md) for product vocabulary and source-of-truth
+  boundaries.
+- [docs/agents/issue-tracker.md](docs/agents/issue-tracker.md) for GitHub issue
+  tracking conventions.
+- [docs/agents/ralph.md](docs/agents/ralph.md) for the issue-to-PR execution
+  loop.

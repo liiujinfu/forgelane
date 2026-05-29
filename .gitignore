@@ -18,3 +18,10 @@ node_modules/
 # Local runtime state
 .forgelane/
 .omx/
+.scratch/
+
+# Local agent-tool links and settings
+.codebuddy/
+.claude/settings.local.json
+.claude/skills
+CLAUDE.md

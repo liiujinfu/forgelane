@@ -3,6 +3,27 @@
 ForgeLane is an open control plane for agentic software delivery. Keep agent
 workflows observable, controllable, auditable, and centered on PR/MR delivery.
 
+## Read First
+
+Before changing behavior, read the relevant local context:
+
+- `ROADMAP.md` for version boundaries and non-goals.
+- `CONTEXT.md` for product vocabulary, source-of-truth boundaries, and early
+  invariants.
+- Relevant ADRs under `docs/adr/` when the change touches durable architecture
+  or trade-offs.
+
+Read `docs/agents/*` only when a task explicitly involves agent skills, PRDs,
+issues, triage state, or domain-doc maintenance.
+
+## Agent Framework
+
+- Issue tracker: GitHub Issues by default; see `docs/agents/issue-tracker.md`.
+- Triage labels: canonical role mapping lives in
+  `docs/agents/triage-labels.md`.
+- Domain docs: context routing lives in `docs/agents/domain.md`.
+- Ralph execution: issue-to-PR work loop lives in `docs/agents/ralph.md`.
+
 ## Product Guardrails
 
 - Do not build an independent issue tracker in the early product unless the
@@ -42,3 +63,6 @@ approval gates, or provider source-of-truth boundaries.
 
 Keep documentation concise and decision-oriented. Record why a boundary exists,
 not just what files were added.
+
+Use project vocabulary from `CONTEXT.md`. Update it only when a change
+introduces durable vocabulary, invariants, or architecture decisions.
