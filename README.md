@@ -37,8 +37,9 @@ Teams need:
 ## v0 Direction
 
 The first version stays intentionally small and is tracked in
-[docs/roadmap/v0.md](docs/roadmap/v0.md). The current CLI is a skeleton only;
-workflow commands will be added by later slices.
+[docs/roadmap/v0.md](docs/roadmap/v0.md). The current CLI has the first local
+repository configuration command; workflow commands will be added by later
+slices.
 
 ## Architecture Bias
 
@@ -77,9 +78,9 @@ Stable core:
 
 ## Status
 
-This repository is currently at the v0 CLI skeleton stage. The CLI exposes only
-the skeleton help and version surfaces while the issue-to-draft-PR workflow is
-built through later slices.
+This repository is currently in the early v0 CLI stage. The CLI exposes help,
+version, and local repository initialization while the issue-to-draft-PR
+workflow is built through later slices.
 
 See [docs/vision.md](docs/vision.md) for the long-term product direction.
 See [docs/roadmap/v0.md](docs/roadmap/v0.md) for the first version boundary
@@ -100,6 +101,7 @@ Inspect the current CLI surface:
 ```bash
 go run ./cmd/forgelane --help
 go run ./cmd/forgelane version
+go run ./cmd/forgelane init --repo-url https://github.com/owner/repo
 ```
 
 ## Agent Development Workflow
