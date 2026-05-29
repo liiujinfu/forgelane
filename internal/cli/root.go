@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/liiujinfu/forgelane/internal/repositoryconfig"
 	"github.com/liiujinfu/forgelane/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -42,9 +43,35 @@ func NewRootCommand(options Options) *cobra.Command {
 	root.SetErr(stderr)
 	root.SetVersionTemplate("{{.Name}} version {{.Version}}\n")
 
+	root.AddCommand(newInitCommand(stdout))
 	root.AddCommand(newVersionCommand(stdout))
 
 	return root
+}
+
+func newInitCommand(stdout io.Writer) *cobra.Command {
+	var options repositoryconfig.InitOptions
+
+	cmd := &cobra.Command{
+		Use:   "init",
+		Short: "Configure the local ForgeLane repository context.",
+		Args:  cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			forgeProject, err := repositoryconfig.Configure(options)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(stdout, "Configured ForgeProject %s\n", repositoryconfig.ForgeProjectRef(forgeProject))
+			return err
+		},
+	}
+
+	cmd.Flags().StringVar(&options.RepoURL, "repo-url", "", "GitHub repository URL")
+	cmd.Flags().StringVar(&options.Provider, "provider", "", "WorkItem provider")
+	cmd.Flags().StringVar(&options.Repo, "repo", "", "Provider repository path")
+	cmd.Flags().BoolVar(&options.Force, "force", false, "Replace an existing ForgeProject config")
+
+	return cmd
 }
 
 func newVersionCommand(stdout io.Writer) *cobra.Command {
