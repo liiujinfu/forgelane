@@ -34,15 +34,11 @@ Teams need:
 - Auditability: who approved what, which agent acted, which sandbox produced it.
 - Delivery discipline: work flows through PR/MR review, not private chat history.
 
-## MVP Direction
+## v0 Direction
 
-The first version should stay intentionally small:
-
-1. Connect to GitHub or GitLab as the external work tracker.
-2. Start an agent run from an issue.
-3. Create an early draft PR/MR and keep pushing commits to it.
-4. Stream run status, logs, commits, CI, and review state into ForgeLane.
-5. Allow a human to approve, request changes, retry, stop, or close the run.
+The first version stays intentionally small and is tracked in
+[docs/roadmap/v0.md](docs/roadmap/v0.md). The current CLI is a skeleton only;
+workflow commands will be added by later slices.
 
 ## Architecture Bias
 
@@ -81,13 +77,30 @@ Stable core:
 
 ## Status
 
-This repository is currently at the naming and project-skeleton stage.
+This repository is currently at the v0 CLI skeleton stage. The CLI exposes only
+the skeleton help and version surfaces while the issue-to-draft-PR workflow is
+built through later slices.
 
 See [docs/vision.md](docs/vision.md) for the long-term product direction.
 See [docs/roadmap/v0.md](docs/roadmap/v0.md) for the first version boundary
 and planned milestones.
 See [docs/architecture/v0.md](docs/architecture/v0.md) for the first
 architecture boundary.
+
+## Local Development
+
+Run the skeleton test suite:
+
+```bash
+go test ./...
+```
+
+Inspect the current CLI surface:
+
+```bash
+go run ./cmd/forgelane --help
+go run ./cmd/forgelane version
+```
 
 ## Agent Development Workflow
 
