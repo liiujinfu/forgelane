@@ -82,3 +82,6 @@ Stable core:
 ## Status
 
 This repository is currently at the naming and project-skeleton stage.
+
+See [ROADMAP.md](ROADMAP.md) for the first version boundary and planned
+milestones.
