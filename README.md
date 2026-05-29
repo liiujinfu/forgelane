@@ -83,8 +83,8 @@ Stable core:
 
 This repository is currently at the naming and project-skeleton stage.
 
-See [ROADMAP.md](ROADMAP.md) for the first version boundary and planned
-milestones.
+See [docs/roadmap/v0.md](docs/roadmap/v0.md) for the first version boundary
+and planned milestones.
 
 ## Agent Development Workflow
 

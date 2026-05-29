@@ -9,7 +9,7 @@ Read these first when they are relevant to the task:
 
 - `CONTEXT.md` at the repository root for product vocabulary, source-of-truth
   boundaries, and invariants.
-- `ROADMAP.md` for version boundaries and non-goals.
+- `docs/roadmap/v0.md` for the first version boundary and non-goals.
 - `docs/adr/` for architectural decision records.
 
 If one of these files does not exist, proceed silently. Do not create missing
@@ -23,9 +23,9 @@ Current layout is single-context:
 ```text
 /
 ├── CONTEXT.md
-├── ROADMAP.md
 ├── docs/
 │   ├── agents/
+│   ├── roadmap/
 │   └── adr/
 └── .scratch/
     └── <slug>/          # local PRD/issues fallback only

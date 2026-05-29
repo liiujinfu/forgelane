@@ -7,7 +7,7 @@ workflows observable, controllable, auditable, and centered on PR/MR delivery.
 
 Before changing behavior, read the relevant local context:
 
-- `ROADMAP.md` for version boundaries and non-goals.
+- `docs/roadmap/v0.md` for the first version boundary and non-goals.
 - `CONTEXT.md` for product vocabulary, source-of-truth boundaries, and early
   invariants.
 - Relevant ADRs under `docs/adr/` when the change touches durable architecture
