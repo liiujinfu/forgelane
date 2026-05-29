@@ -83,8 +83,11 @@ Stable core:
 
 This repository is currently at the naming and project-skeleton stage.
 
+See [docs/vision.md](docs/vision.md) for the long-term product direction.
 See [docs/roadmap/v0.md](docs/roadmap/v0.md) for the first version boundary
 and planned milestones.
+See [docs/architecture/v0.md](docs/architecture/v0.md) for the first
+architecture boundary.
 
 ## Agent Development Workflow
 

@@ -59,7 +59,7 @@ Each issue file should include:
   necessary provider/API/runner/UI/test layers for one user-observable behavior.
 - Keep template headings and structural fields in English, such as `Parent`,
   `What to build`, `Acceptance criteria`, and `Blocked by`.
-- Narrative content may be Chinese or English. When working with the maintainer
-  in Chinese, write issue/PRD background, acceptance criteria, implementation
-  notes, and test notes in Chinese while preserving code identifiers, API paths,
-  commands, labels, statuses, and other exact technical terms.
+- Write issue and PRD narrative content in English by default, regardless of the
+  language used in the planning conversation. Use another language only when the
+  maintainer explicitly requests it. Always preserve code identifiers, API
+  paths, commands, labels, statuses, and other exact technical terms.

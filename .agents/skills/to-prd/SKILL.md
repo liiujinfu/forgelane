@@ -17,7 +17,7 @@ A deep module (as opposed to a shallow module) is one which encapsulates a lot o
 
 Check with the user that these modules match their expectations. Check with the user which modules they want tests written for.
 
-3. Write the PRD using the template below, then publish it to the project issue tracker. Keep the template headings in English, and write the narrative content inside each section in Chinese. Apply the `ready-for-agent` triage label - no need for additional triage.
+3. Write the PRD using the template below, then publish it to the project issue tracker. Keep the template headings in English, and write narrative content in English by default unless the user explicitly requests another language. Apply the `ready-for-agent` triage label - no need for additional triage.
 
 <prd-template>
 
