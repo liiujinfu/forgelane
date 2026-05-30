@@ -15,10 +15,11 @@ ForgeLane is an agentic software delivery control plane.
 - Control action: a human action such as stop, retry, request changes, close, or
   reassign.
 - Event: an immutable record of something that happened in the delivery loop.
-- Repository config: ForgeLane-owned defaults for one target repository, such
-  as the default WorkItem provider/repo used to resolve shorthand input; it
-  belongs to the local ForgeLane context, not the target source repository or
-  provider-owned state.
+- Repository config: ForgeLane-owned defaults for one target repository or
+  ForgeProject, such as the default WorkItem provider/repo used to resolve
+  shorthand input.
+- Instance state store: ForgeLane-owned persistent state for one local
+  ForgeLane instance, including ForgeProjects, WorkItem snapshots, and Events.
 - Target repository: the Git repository ForgeLane will prepare as the code
   workspace and later deliver changes against.
 - Default WorkItem source: the provider-owned source used to resolve shorthand
@@ -44,9 +45,19 @@ ForgeLane is an agentic software delivery control plane.
   `--provider github --repo owner/repo`, but this is a CLI convenience over a
   canonical repository URL and must not become the persisted identity.
 - A canonical WorkItem ProviderRef identifies one ForgeLane WorkItem; repeated
-  imports refresh its provider-owned snapshot instead of creating duplicates.
+  imports refresh its provider-owned snapshot and append audit Events instead
+  of creating duplicate WorkItems, even when provider content has not changed.
+- Provider pull requests and merge requests are delivery artifacts or later
+  review/fix inputs, not issue WorkItems in the v0 WorkItem import path.
+- ForgeLane instance state such as ForgeProjects, WorkItem snapshots, and
+  Events belongs in the instance state store, not inside target source
+  repositories and not in provider-owned systems.
 - WorkItem snapshots are cached provider state, not a replacement source of
   truth; show/import output should expose snapshot freshness.
+- WorkItem `imported_at` records the first local import time; `refreshed_at`
+  records the most recent explicit import/refresh time.
+- WorkItem show commands read cached ForgeLane snapshots. Provider refresh is
+  an explicit import operation, not an implicit side effect of viewing.
 - Provider identity is the primary CLI lookup path for WorkItems. Local
   WorkItem ids may exist for storage, joins, and explicit debugging commands,
   but they are not the main user-facing identity.
