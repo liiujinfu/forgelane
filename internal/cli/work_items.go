@@ -143,12 +143,12 @@ func resolveIssueNumber(input string, instanceStore *store.Store) (workitems.Pro
 	}
 	forgeProject, err := repositoryconfig.InferForgeProjectFromOrigin("")
 	if err != nil {
-		return workitems.ProviderRef{}, err
+		return workitems.ProviderRef{}, fmt.Errorf("%w; pass a full ProviderRef or run forgelane init", err)
 	}
 	projectRef := repositoryconfig.ForgeProjectRef(forgeProject)
 	persistedProject, err := instanceStore.GetForgeProjectByRef(projectRef)
 	if err != nil {
-		return workitems.ProviderRef{}, err
+		return workitems.ProviderRef{}, fmt.Errorf("%w; pass a full ProviderRef or run forgelane init", err)
 	}
 	return workitems.ProviderRef{
 		Provider:       persistedProject.Provider,

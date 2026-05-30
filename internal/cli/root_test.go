@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -423,6 +424,315 @@ func TestWorkItemImportRejectsRawGitHubWebURLBeforeProviderRead(t *testing.T) {
 	if fakeProvider.calls != 0 {
 		t.Fatalf("expected invalid input not to call provider, got %d calls", fakeProvider.calls)
 	}
+}
+
+func TestRunsCreateImportsWorkItemAndCreatesPlannedRunSpec(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Create an AgentRun and immutable RunSpec",
+			Body:                "Create ForgeLane-owned execution state without running an agent.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Created AgentRun",
+		"WorkItem: github://github.com/owner/repo/issues/123",
+		"Status: planned",
+		"ControlAction ID:",
+		"RunSpec ID:",
+		"Branch: forgelane/issue-123",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected runs create output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if fakeProvider.calls != 1 {
+		t.Fatalf("expected missing WorkItem snapshot to be imported through provider once, got %d calls", fakeProvider.calls)
+	}
+
+	assertTableCount(t, homeDir, "work_items", 1)
+	assertTableCount(t, homeDir, "control_actions", 1)
+	assertTableCount(t, homeDir, "agent_runs", 1)
+	assertTableCount(t, homeDir, "run_specs", 1)
+	assertEventTypes(t, homeDir, []string{
+		"work_item.imported",
+		"control_action.succeeded",
+		"agent_run.created",
+		"run_spec.created",
+	})
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	var runID int64
+	var workItemID int64
+	var status string
+	if err := db.QueryRow("SELECT id, work_item_id, status FROM agent_runs").Scan(&runID, &workItemID, &status); err != nil {
+		t.Fatalf("query AgentRun: %v", err)
+	}
+	if status != "planned" {
+		t.Fatalf("expected AgentRun status planned, got %q", status)
+	}
+	if workItemID == 0 {
+		t.Fatal("expected AgentRun to reference a WorkItem")
+	}
+
+	var specJSON string
+	if err := db.QueryRow("SELECT spec_json FROM run_specs WHERE agent_run_id = ?", runID).Scan(&specJSON); err != nil {
+		t.Fatalf("query RunSpec: %v", err)
+	}
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(specJSON), &spec); err != nil {
+		t.Fatalf("expected RunSpec JSON to decode: %v\n%s", err, specJSON)
+	}
+	if got := spec["branch"]; got != "forgelane/issue-123" {
+		t.Fatalf("expected RunSpec branch forgelane/issue-123, got %#v", got)
+	}
+	workItemSnapshot, ok := spec["work_item"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected RunSpec work_item object, got %#v", spec["work_item"])
+	}
+	if got := workItemSnapshot["provider_ref"]; got != "github://github.com/owner/repo/issues/123" {
+		t.Fatalf("expected RunSpec WorkItem ProviderRef, got %#v", got)
+	}
+	if got := workItemSnapshot["provider_status_raw"]; got != "open" {
+		t.Fatalf("expected RunSpec WorkItem raw provider status, got %#v", got)
+	}
+	if got := workItemSnapshot["url"]; got != "https://github.com/owner/repo/issues/123" {
+		t.Fatalf("expected RunSpec WorkItem URL, got %#v", got)
+	}
+	if got := workItemSnapshot["imported_at"]; got == "" {
+		t.Fatalf("expected RunSpec WorkItem imported_at, got %#v", got)
+	}
+	if got := workItemSnapshot["body_snapshot"]; got != "Create ForgeLane-owned execution state without running an agent." {
+		t.Fatalf("expected RunSpec WorkItem body snapshot, got %#v", got)
+	}
+	repoSnapshot, ok := spec["repo"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected RunSpec repo object, got %#v", spec["repo"])
+	}
+	if got := repoSnapshot["ref"]; got != "github://github.com/owner/repo" {
+		t.Fatalf("expected RunSpec repo ref, got %#v", got)
+	}
+	agentAdapter, ok := spec["agent_adapter"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected RunSpec agent_adapter object, got %#v", spec["agent_adapter"])
+	}
+	if got := agentAdapter["kind"]; got != "command" {
+		t.Fatalf("expected generic command AgentAdapter, got %#v", got)
+	}
+}
+
+func TestRunsCreateReusesWorkItemSnapshotButCreatesNewAgentRunEachTime(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Repeatable AgentRun creation",
+			Body:                "Every run creation is a new bounded attempt.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "work-items", "import", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected WorkItem import to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	for i := 0; i < 2; i++ {
+		stdout, stderr, err := executeForTestWithOptions(t, Options{
+			WorkItemProvider: fakeProvider,
+		}, "runs", "create", "github://github.com/owner/repo/issues/123")
+		if err != nil {
+			t.Fatalf("expected runs create #%d to succeed: %v\nstderr:\n%s", i+1, err, stderr)
+		}
+		if stderr != "" {
+			t.Fatalf("expected no stderr, got %q", stderr)
+		}
+		if !strings.Contains(stdout, "Status: planned") {
+			t.Fatalf("expected planned run output, got:\n%s", stdout)
+		}
+	}
+	if fakeProvider.calls != 1 {
+		t.Fatalf("expected runs create to reuse cached WorkItem without provider calls, got %d calls", fakeProvider.calls)
+	}
+
+	assertTableCount(t, homeDir, "work_items", 1)
+	assertTableCount(t, homeDir, "control_actions", 2)
+	assertTableCount(t, homeDir, "agent_runs", 2)
+	assertTableCount(t, homeDir, "run_specs", 2)
+	assertEventTypes(t, homeDir, []string{
+		"work_item.imported",
+		"control_action.succeeded",
+		"agent_run.created",
+		"run_spec.created",
+		"control_action.succeeded",
+		"agent_run.created",
+		"run_spec.created",
+	})
+}
+
+func TestRunsCreateResolvesIssueNumberThroughCurrentForgeProject(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "git@github.com:owner/repo.git")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init", "--provider", "github"); err != nil {
+		t.Fatalf("expected init to persist current ForgeProject: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Create from shorthand issue number",
+			Body:                "Resolve numeric issue shorthand before creating run state.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "123")
+	if err != nil {
+		t.Fatalf("expected shorthand runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Created AgentRun",
+		"WorkItem: github://github.com/owner/repo/issues/123",
+		"Branch: forgelane/issue-123",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected shorthand runs create output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+
+	assertTableCount(t, homeDir, "work_items", 1)
+	assertTableCount(t, homeDir, "control_actions", 1)
+	assertTableCount(t, homeDir, "agent_runs", 1)
+	assertTableCount(t, homeDir, "run_specs", 1)
+}
+
+func TestRunsCreateIssueNumberFailsWithoutCurrentForgeProject(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef: "github://github.com/owner/repo/issues/123",
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "123")
+	if err == nil {
+		t.Fatal("expected shorthand runs create without current ForgeProject to fail")
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "pass a full ProviderRef or run forgelane init") {
+		t.Fatalf("expected shorthand guidance, got:\n%s", stderr)
+	}
+	if fakeProvider.calls != 0 {
+		t.Fatalf("expected shorthand resolution failure not to call provider, got %d calls", fakeProvider.calls)
+	}
+	assertTableCount(t, homeDir, "work_items", 0)
+	assertTableCount(t, homeDir, "agent_runs", 0)
+	assertTableCount(t, homeDir, "run_specs", 0)
+	assertTableCount(t, homeDir, "events", 0)
+}
+
+func TestRunsCreateFullProviderRefImportDoesNotEnableIssueNumberShorthand(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "git@github.com:owner/repo.git")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Full ref import does not initialize shorthand",
+			Body:                "Import-side ForgeProject rows are not explicit repository config.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected full ProviderRef runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "123")
+	if err == nil {
+		t.Fatal("expected shorthand runs create without forgelane init to fail")
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "pass a full ProviderRef or run forgelane init") {
+		t.Fatalf("expected shorthand guidance, got:\n%s", stderr)
+	}
+	assertTableCount(t, homeDir, "work_items", 1)
+	assertTableCount(t, homeDir, "agent_runs", 1)
+	assertTableCount(t, homeDir, "run_specs", 1)
 }
 
 func TestRootHelpShowsSkeletonCommands(t *testing.T) {

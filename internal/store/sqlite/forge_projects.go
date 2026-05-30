@@ -8,11 +8,15 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/liiujinfu/forgelane/internal/workitems"
 	_ "modernc.org/sqlite"
 )
+
+// ErrWorkItemNotFound reports a missing cached WorkItem snapshot.
+var ErrWorkItemNotFound = errors.New("WorkItem not found")
 
 // Store owns access to ForgeLane's instance-global SQLite database.
 type Store struct {
@@ -26,6 +30,7 @@ type ForgeProject struct {
 	ProviderHost   string
 	RepositoryPath string
 	ProviderRef    string
+	Initialized    bool
 }
 
 // Open opens the SQLite store, creating the parent state directory when needed.
@@ -84,6 +89,7 @@ CREATE TABLE IF NOT EXISTS forge_projects (
 	provider_host TEXT NOT NULL,
 	repository_path TEXT NOT NULL,
 	provider_ref TEXT NOT NULL,
+	initialized_at TEXT,
 	created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 	updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 	UNIQUE(provider_ref),
@@ -110,6 +116,58 @@ CREATE TABLE IF NOT EXISTS work_items (
 CREATE INDEX IF NOT EXISTS idx_work_items_project_issue
 ON work_items(forge_project_id, provider_issue_number);
 
+CREATE TABLE IF NOT EXISTS agent_runs (
+	id INTEGER PRIMARY KEY,
+	work_item_id INTEGER NOT NULL REFERENCES work_items(id),
+	status TEXT NOT NULL CHECK(status IN (
+		'planned',
+		'queued',
+		'preparing',
+		'running',
+		'cancel_requested',
+		'finalizing',
+		'completed',
+		'failed',
+		'cancelled',
+		'timed_out'
+	)),
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_work_item_id
+ON agent_runs(work_item_id);
+
+CREATE TABLE IF NOT EXISTS run_specs (
+	id INTEGER PRIMARY KEY,
+	agent_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+	spec_json TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	UNIQUE(agent_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS control_actions (
+	id INTEGER PRIMARY KEY,
+	type TEXT NOT NULL,
+	target_type TEXT NOT NULL,
+	target_ref TEXT NOT NULL,
+	requested_by TEXT NOT NULL,
+	reason TEXT NOT NULL,
+	input TEXT NOT NULL,
+	status TEXT NOT NULL CHECK(status IN (
+		'requested',
+		'accepted',
+		'rejected',
+		'executing',
+		'succeeded',
+		'failed',
+		'cancelled'
+	)),
+	created_at TEXT NOT NULL,
+	decided_at TEXT,
+	result_event_refs TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
 	id INTEGER PRIMARY KEY,
 	type TEXT NOT NULL,
@@ -121,6 +179,7 @@ CREATE TABLE IF NOT EXISTS events (
 	work_item_id INTEGER REFERENCES work_items(id),
 	work_item_ref TEXT,
 	agent_run_id INTEGER,
+	control_action_id INTEGER REFERENCES control_actions(id),
 	change_set_id INTEGER,
 	provider_ref TEXT,
 	correlation_id TEXT,
@@ -128,10 +187,50 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_work_item_id ON events(work_item_id);
-CREATE INDEX IF NOT EXISTS idx_events_forge_project_id ON events(forge_project_id);`
+CREATE INDEX IF NOT EXISTS idx_events_forge_project_id ON events(forge_project_id);
+CREATE INDEX IF NOT EXISTS idx_events_agent_run_id ON events(agent_run_id);`
 
 	if _, err := store.db.Exec(schema); err != nil {
 		return fmt.Errorf("initialize ForgeLane database schema: %w", err)
+	}
+	if err := store.ensureColumn("forge_projects", "initialized_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := store.ensureColumn("events", "control_action_id", "INTEGER REFERENCES control_actions(id)"); err != nil {
+		return err
+	}
+	if _, err := store.db.Exec("CREATE INDEX IF NOT EXISTS idx_events_control_action_id ON events(control_action_id)"); err != nil {
+		return fmt.Errorf("initialize ControlAction event index: %w", err)
+	}
+	return nil
+}
+
+func (store *Store) ensureColumn(table string, column string, definition string) error {
+	rows, err := store.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return fmt.Errorf("inspect %s schema: %w", table, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var dataType string
+		var notNull int
+		var defaultValue sql.NullString
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan %s schema: %w", table, err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate %s schema: %w", table, err)
+	}
+	if _, err := store.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition); err != nil {
+		return fmt.Errorf("add %s.%s column: %w", table, column, err)
 	}
 	return nil
 }
@@ -166,6 +265,39 @@ type WorkItemImportResult struct {
 	Event    Event
 }
 
+// AgentRun is a persisted bounded agent attempt.
+type AgentRun struct {
+	ID         int64
+	WorkItemID int64
+	Status     string
+	CreatedAt  string
+	UpdatedAt  string
+}
+
+// RunSpec is the immutable execution input snapshot for one AgentRun.
+type RunSpec struct {
+	ID         int64
+	AgentRunID int64
+	SpecJSON   string
+	CreatedAt  string
+}
+
+// AgentRunCreateResult is the outcome of creating AgentRun execution state.
+type AgentRunCreateResult struct {
+	ControlAction ControlAction
+	AgentRun      AgentRun
+	RunSpec       RunSpec
+	Branch        string
+	Events        []Event
+}
+
+// ControlAction is a persisted operator request to change the delivery loop.
+type ControlAction struct {
+	ID     int64
+	Type   string
+	Status string
+}
+
 // ImportWorkItem persists a provider-owned issue snapshot and matching audit Event.
 func (store *Store) ImportWorkItem(issue workitems.ProviderIssue) (WorkItemImportResult, error) {
 	ref, err := workitems.ParseProviderRef(issue.ProviderRef)
@@ -185,6 +317,7 @@ func (store *Store) ImportWorkItem(issue workitems.ProviderIssue) (WorkItemImpor
 		ProviderHost:   ref.ProviderHost,
 		RepositoryPath: ref.RepositoryPath,
 		ProviderRef:    ref.RepositoryRef(),
+		Initialized:    false,
 	})
 	if err != nil {
 		return WorkItemImportResult{}, err
@@ -385,12 +518,311 @@ WHERE `
 		&workItem.RefreshedAt,
 	)
 	if err == sql.ErrNoRows {
-		return WorkItem{}, fmt.Errorf("WorkItem not found")
+		return WorkItem{}, fmt.Errorf("%w: %s", ErrWorkItemNotFound, arg)
 	}
 	if err != nil {
 		return WorkItem{}, fmt.Errorf("query WorkItem: %w", err)
 	}
 	return workItem, nil
+}
+
+// CreateAgentRun creates one planned AgentRun and its immutable RunSpec.
+func (store *Store) CreateAgentRun(workItem WorkItem) (AgentRunCreateResult, error) {
+	ref, err := workitems.ParseProviderRef(workItem.ProviderRef)
+	if err != nil {
+		return AgentRunCreateResult{}, err
+	}
+
+	branch := fmt.Sprintf("forgelane/issue-%d", workItem.ProviderIssueNumber)
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	tx, err := store.db.Begin()
+	if err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("begin AgentRun create transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	actionInput, err := json.Marshal(map[string]any{
+		"provider_ref": workItem.ProviderRef,
+	})
+	if err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("encode ControlAction input: %w", err)
+	}
+	actionResult, err := tx.Exec(`
+INSERT INTO control_actions (
+	type,
+	target_type,
+	target_ref,
+	requested_by,
+	reason,
+	input,
+	status,
+	created_at,
+	decided_at,
+	result_event_refs
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"start",
+		"work_item",
+		workItem.ProviderRef,
+		"local",
+		"forgelane runs create",
+		string(actionInput),
+		"succeeded",
+		now,
+		now,
+		"[]",
+	)
+	if err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("insert ControlAction: %w", err)
+	}
+	controlActionID, err := actionResult.LastInsertId()
+	if err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("read inserted ControlAction id: %w", err)
+	}
+
+	runResult, err := tx.Exec(`
+INSERT INTO agent_runs (work_item_id, status, created_at, updated_at)
+VALUES (?, ?, ?, ?)`,
+		workItem.ID,
+		"planned",
+		now,
+		now,
+	)
+	if err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("insert AgentRun: %w", err)
+	}
+	runID, err := runResult.LastInsertId()
+	if err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("read inserted AgentRun id: %w", err)
+	}
+
+	specJSON, err := encodeRunSpec(runID, workItem, ref, branch)
+	if err != nil {
+		return AgentRunCreateResult{}, err
+	}
+
+	specResult, err := tx.Exec(`
+INSERT INTO run_specs (agent_run_id, spec_json, created_at)
+VALUES (?, ?, ?)`,
+		runID,
+		specJSON,
+		now,
+	)
+	if err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("insert RunSpec for AgentRun %d: %w", runID, err)
+	}
+	specID, err := specResult.LastInsertId()
+	if err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("read inserted RunSpec id: %w", err)
+	}
+
+	controlActionEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "control_action.succeeded",
+		OccurredAt:      now,
+		ForgeProjectID:  workItem.ForgeProjectID,
+		SubjectType:     "control_action",
+		SubjectRef:      fmt.Sprintf("control_action:%d", controlActionID),
+		WorkItemID:      workItem.ID,
+		WorkItemRef:     workItem.ProviderRef,
+		AgentRunID:      runID,
+		ControlActionID: controlActionID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"type":              "start",
+			"status":            "succeeded",
+			"agent_run_id":      runID,
+			"work_item_id":      workItem.ID,
+			"provider_ref":      workItem.ProviderRef,
+		},
+	})
+	if err != nil {
+		return AgentRunCreateResult{}, err
+	}
+
+	runEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "agent_run.created",
+		OccurredAt:      now,
+		ForgeProjectID:  workItem.ForgeProjectID,
+		SubjectType:     "agent_run",
+		SubjectRef:      fmt.Sprintf("agent_run:%d", runID),
+		WorkItemID:      workItem.ID,
+		WorkItemRef:     workItem.ProviderRef,
+		AgentRunID:      runID,
+		ControlActionID: controlActionID,
+		Payload: map[string]any{
+			"agent_run_id": runID,
+			"work_item_id": workItem.ID,
+			"provider_ref": workItem.ProviderRef,
+			"status":       "planned",
+		},
+	})
+	if err != nil {
+		return AgentRunCreateResult{}, err
+	}
+
+	specEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "run_spec.created",
+		OccurredAt:      now,
+		ForgeProjectID:  workItem.ForgeProjectID,
+		SubjectType:     "run_spec",
+		SubjectRef:      fmt.Sprintf("run_spec:%d", specID),
+		WorkItemID:      workItem.ID,
+		WorkItemRef:     workItem.ProviderRef,
+		AgentRunID:      runID,
+		ControlActionID: controlActionID,
+		Payload: map[string]any{
+			"agent_run_id": runID,
+			"run_spec_id":  specID,
+			"branch":       branch,
+		},
+	})
+	if err != nil {
+		return AgentRunCreateResult{}, err
+	}
+
+	resultEventRefs, err := json.Marshal([]int64{controlActionEvent.ID, runEvent.ID, specEvent.ID})
+	if err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("encode ControlAction result Event refs: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE control_actions SET result_event_refs = ? WHERE id = ?", string(resultEventRefs), controlActionID); err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("update ControlAction result Event refs: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return AgentRunCreateResult{}, fmt.Errorf("commit AgentRun create: %w", err)
+	}
+
+	return AgentRunCreateResult{
+		ControlAction: ControlAction{
+			ID:     controlActionID,
+			Type:   "start",
+			Status: "succeeded",
+		},
+		AgentRun: AgentRun{
+			ID:         runID,
+			WorkItemID: workItem.ID,
+			Status:     "planned",
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		},
+		RunSpec: RunSpec{
+			ID:         specID,
+			AgentRunID: runID,
+			SpecJSON:   specJSON,
+			CreatedAt:  now,
+		},
+		Branch: branch,
+		Events: []Event{controlActionEvent, runEvent, specEvent},
+	}, nil
+}
+
+func encodeRunSpec(runID int64, workItem WorkItem, ref workitems.ProviderRef, branch string) (string, error) {
+	owner, name, err := splitRepositoryPath(ref.RepositoryPath)
+	if err != nil {
+		return "", err
+	}
+	spec := map[string]any{
+		"run_id": fmt.Sprintf("run_%d", runID),
+		"work_item": map[string]any{
+			"id":                  workItem.ID,
+			"provider":            workItem.Provider,
+			"provider_ref":        workItem.ProviderRef,
+			"repository_ref":      workItem.RepositoryRef,
+			"provider_issue":      workItem.ProviderIssueNumber,
+			"title":               workItem.Title,
+			"body_snapshot":       workItem.Body,
+			"status":              workItem.Status,
+			"provider_status_raw": workItem.ProviderStatusRaw,
+			"url":                 workItem.URL,
+			"provider_updated_at": workItem.ProviderUpdatedAt,
+			"imported_at":         workItem.ImportedAt,
+			"refreshed_at":        workItem.RefreshedAt,
+		},
+		"repo": map[string]any{
+			"provider":    ref.Provider,
+			"host":        ref.ProviderHost,
+			"owner":       owner,
+			"name":        name,
+			"ref":         ref.RepositoryRef(),
+			"base_branch": "main",
+		},
+		"branch": branch,
+		"agent_adapter": map[string]any{
+			"kind":       "command",
+			"preset":     "codex",
+			"env_policy": "scrubbed",
+		},
+	}
+	encoded, err := json.Marshal(spec)
+	if err != nil {
+		return "", fmt.Errorf("encode RunSpec JSON: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func splitRepositoryPath(repositoryPath string) (string, string, error) {
+	parts := strings.Split(repositoryPath, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid repository path %q", repositoryPath)
+	}
+	return parts[0], parts[1], nil
+}
+
+type agentRunEventInput struct {
+	Type            string
+	OccurredAt      string
+	ForgeProjectID  int64
+	SubjectType     string
+	SubjectRef      string
+	WorkItemID      int64
+	WorkItemRef     string
+	AgentRunID      int64
+	ControlActionID int64
+	Payload         map[string]any
+}
+
+func appendAgentRunEventTx(tx *sql.Tx, input agentRunEventInput) (Event, error) {
+	payload, err := json.Marshal(input.Payload)
+	if err != nil {
+		return Event{}, fmt.Errorf("encode %s event payload: %w", input.Type, err)
+	}
+
+	result, err := tx.Exec(`
+INSERT INTO events (
+	type,
+	occurred_at,
+	actor,
+	forge_project_id,
+	subject_type,
+	subject_ref,
+	work_item_id,
+	work_item_ref,
+	agent_run_id,
+	control_action_id,
+	provider_ref,
+	payload
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		input.Type,
+		input.OccurredAt,
+		"forgelane",
+		input.ForgeProjectID,
+		input.SubjectType,
+		input.SubjectRef,
+		input.WorkItemID,
+		input.WorkItemRef,
+		input.AgentRunID,
+		input.ControlActionID,
+		input.WorkItemRef,
+		string(payload),
+	)
+	if err != nil {
+		return Event{}, fmt.Errorf("append %s event: %w", input.Type, err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return Event{}, fmt.Errorf("read inserted %s Event id: %w", input.Type, err)
+	}
+	return Event{ID: id, Type: input.Type}, nil
 }
 
 // GetForgeProjectByRef returns a persisted ForgeProject by canonical ref.
@@ -399,7 +831,7 @@ func (store *Store) GetForgeProjectByRef(providerRef string) (ForgeProject, erro
 	err := store.db.QueryRow(`
 SELECT id, provider, provider_host, repository_path, provider_ref
 FROM forge_projects
-WHERE provider_ref = ?`, providerRef).Scan(
+WHERE provider_ref = ? AND initialized_at IS NOT NULL`, providerRef).Scan(
 		&forgeProject.ID,
 		&forgeProject.Provider,
 		&forgeProject.ProviderHost,
@@ -436,13 +868,18 @@ type forgeProjectExecutor interface {
 }
 
 func upsertForgeProjectExecutor(executor forgeProjectExecutor, forgeProject ForgeProject) (int64, error) {
+	var initializedAt any
+	if forgeProject.Initialized {
+		initializedAt = time.Now().UTC().Format(time.RFC3339)
+	}
 	const statement = `
-INSERT INTO forge_projects (provider, provider_host, repository_path, provider_ref)
-VALUES (?, ?, ?, ?)
+INSERT INTO forge_projects (provider, provider_host, repository_path, provider_ref, initialized_at)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(provider_ref) DO UPDATE SET
 	provider = excluded.provider,
 	provider_host = excluded.provider_host,
 	repository_path = excluded.repository_path,
+	initialized_at = COALESCE(excluded.initialized_at, forge_projects.initialized_at),
 	updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now');`
 
 	_, err := executor.Exec(
@@ -451,6 +888,7 @@ ON CONFLICT(provider_ref) DO UPDATE SET
 		forgeProject.ProviderHost,
 		forgeProject.RepositoryPath,
 		forgeProject.ProviderRef,
+		initializedAt,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("persist ForgeProject %s: %w", forgeProject.ProviderRef, err)
