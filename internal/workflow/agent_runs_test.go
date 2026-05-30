@@ -99,56 +99,14 @@ func TestCreatePlannedAgentRunCreatesRunSpecAndEvents(t *testing.T) {
 }
 
 func TestExecuteAgentRunCommandFailsWhenStartedRunnerReportsCaptureError(t *testing.T) {
-	instanceStore, err := store.Open(filepath.Join(t.TempDir(), "forgelane.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer instanceStore.Close()
-	if err := instanceStore.Initialize(); err != nil {
-		t.Fatalf("initialize store: %v", err)
-	}
-
-	importResult, err := instanceStore.ImportWorkItem(workitems.ProviderIssue{
-		ProviderRef:         "github://github.com/owner/repo/issues/123",
-		RepositoryRef:       "github://github.com/owner/repo",
-		Provider:            "github",
-		ProviderIssueNumber: 123,
-		Title:               "Execute command",
-		Body:                "Run command.",
-		Status:              "open",
-		RawStatus:           "open",
-		URL:                 "https://github.com/owner/repo/issues/123",
-		ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
-	})
-	if err != nil {
-		t.Fatalf("import WorkItem: %v", err)
-	}
-	createResult, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
-		WorkItem: importResult.WorkItem,
-	})
-	if err != nil {
-		t.Fatalf("create planned AgentRun: %v", err)
-	}
-	paths := workflow.WorkspacePaths{
-		Root:      filepath.Join(t.TempDir(), "workspace"),
-		Repo:      filepath.Join(t.TempDir(), "workspace", "repo"),
-		Logs:      filepath.Join(t.TempDir(), "workspace", "logs"),
-		Artifacts: filepath.Join(t.TempDir(), "workspace", "artifacts"),
-		Tmp:       filepath.Join(t.TempDir(), "workspace", "tmp"),
-	}
-	if _, err := instanceStore.AllocateWorkspace(createResult.AgentRun.ID, paths); err != nil {
-		t.Fatalf("allocate Workspace: %v", err)
-	}
-	if _, err := instanceStore.MarkWorkspaceReady(createResult.AgentRun.ID); err != nil {
-		t.Fatalf("mark Workspace ready: %v", err)
-	}
+	instanceStore, runID := preparedAgentRun(t)
 
 	result, err := workflow.ExecuteAgentRunCommand(
 		context.Background(),
 		instanceStore,
 		staticCommandPlanner{},
 		startedCaptureErrorRunner{},
-		createResult.AgentRun.ID,
+		runID,
 	)
 	if err != nil {
 		t.Fatalf("execute AgentRun command: %v", err)
@@ -156,7 +114,153 @@ func TestExecuteAgentRunCommandFailsWhenStartedRunnerReportsCaptureError(t *test
 	if result.AgentRun.Status != "failed" {
 		t.Fatalf("expected capture error to fail AgentRun, got %q", result.AgentRun.Status)
 	}
+	if result.RunnerJob.Status != "failed" {
+		t.Fatalf("expected capture error to fail RunnerJob, got %q", result.RunnerJob.Status)
+	}
+	if got := eventTypes(result.Events); got != "agent_command.failed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+}
+
+func TestExecuteAgentRunCommandRecordsSuccessfulTerminalOutcome(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+
+	result, err := workflow.ExecuteAgentRunCommand(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("execute AgentRun command: %v", err)
+	}
+	if result.AgentRun.Status != "completed" {
+		t.Fatalf("expected successful command to complete AgentRun, got %q", result.AgentRun.Status)
+	}
+	if result.RunnerJob.Status != "completed" {
+		t.Fatalf("expected successful command to complete RunnerJob, got %q", result.RunnerJob.Status)
+	}
 	if got := eventTypes(result.Events); got != "agent_command.completed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	events, err := instanceStore.ListEventsForAgentRun(runID)
+	if err != nil {
+		t.Fatalf("list Events: %v", err)
+	}
+	if got := eventTypes(events); got != "control_action.succeeded,agent_run.created,run_spec.created,workspace.allocated,workspace.prepared,agent_command.started,agent_command.completed" {
+		t.Fatalf("unexpected persisted Event sequence %s", got)
+	}
+}
+
+func TestExecuteAgentRunCommandRecordsNonZeroExitAsFailedWithLogs(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+
+	result, err := workflow.ExecuteAgentRunCommand(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		nonZeroExitCommandRunner{},
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("execute AgentRun command: %v", err)
+	}
+	if result.AgentRun.Status != "failed" {
+		t.Fatalf("expected non-zero command to fail AgentRun, got %q", result.AgentRun.Status)
+	}
+	if result.RunnerJob.Status != "failed" {
+		t.Fatalf("expected non-zero command to fail RunnerJob, got %q", result.RunnerJob.Status)
+	}
+	if got := eventTypes(result.Events); got != "agent_command.failed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	segments, err := instanceStore.ListLogSegmentsForAgentRun(runID, "")
+	if err != nil {
+		t.Fatalf("list LogSegments: %v", err)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("expected one persisted LogSegment, got %d", len(segments))
+	}
+	if segments[0].Stream != "stderr" || segments[0].Preview != "failed command\n" {
+		t.Fatalf("unexpected persisted LogSegment: %#v", segments[0])
+	}
+}
+
+func TestExecuteAgentRunCommandEnforcesRunSpecTimeout(t *testing.T) {
+	instanceStore, runID := preparedAgentRunWithOptions(t, preparedAgentRunOptions{
+		CommandTimeout: 10 * time.Millisecond,
+	})
+
+	result, err := workflow.ExecuteAgentRunCommand(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		blockUntilContextDoneRunner{},
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("execute AgentRun command: %v", err)
+	}
+	if result.AgentRun.Status != "timed_out" {
+		t.Fatalf("expected timeout to mark AgentRun timed_out, got %q", result.AgentRun.Status)
+	}
+	if result.RunnerJob.Status != "timed_out" {
+		t.Fatalf("expected timeout to mark RunnerJob timed_out, got %q", result.RunnerJob.Status)
+	}
+	if got := eventTypes(result.Events); got != "agent_command.timed_out" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+}
+
+func TestExecuteAgentRunCommandRecordsCancellationDistinctly(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result, err := workflow.ExecuteAgentRunCommand(
+		ctx,
+		instanceStore,
+		staticCommandPlanner{},
+		blockUntilContextDoneRunner{},
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("execute AgentRun command: %v", err)
+	}
+	if result.AgentRun.Status != "cancelled" {
+		t.Fatalf("expected cancellation to mark AgentRun cancelled, got %q", result.AgentRun.Status)
+	}
+	if result.RunnerJob.Status != "cancelled" {
+		t.Fatalf("expected cancellation to mark RunnerJob cancelled, got %q", result.RunnerJob.Status)
+	}
+	if got := eventTypes(result.Events); got != "agent_command.cancelled" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+}
+
+func TestExecuteAgentRunCommandRecordsPreStartCancellationDistinctly(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+
+	result, err := workflow.ExecuteAgentRunCommand(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		preStartCancelledRunner{},
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("execute AgentRun command: %v", err)
+	}
+	if result.AgentRun.Status != "cancelled" {
+		t.Fatalf("expected pre-start cancellation to mark AgentRun cancelled, got %q", result.AgentRun.Status)
+	}
+	if result.RunnerJob.Status != "cancelled" {
+		t.Fatalf("expected pre-start cancellation to mark RunnerJob cancelled, got %q", result.RunnerJob.Status)
+	}
+	if got := eventTypes(result.Events); got != "agent_command.cancelled" {
 		t.Fatalf("unexpected Event sequence %s", got)
 	}
 }
@@ -165,6 +269,42 @@ type staticCommandPlanner struct{}
 
 func (staticCommandPlanner) PlanAgentCommand(workflow.AgentCommandPlanInput) (workflow.AgentCommandPlan, error) {
 	return workflow.AgentCommandPlan{Executable: "true"}, nil
+}
+
+type successfulCommandRunner struct{}
+
+func (successfulCommandRunner) RunAgentCommand(context.Context, workflow.AgentCommandPlan) (workflow.AgentCommandRunResult, error) {
+	return workflow.AgentCommandRunResult{
+		ExitCode:       0,
+		ProcessStarted: true,
+	}, nil
+}
+
+type nonZeroExitCommandRunner struct{}
+
+func (nonZeroExitCommandRunner) RunAgentCommand(context.Context, workflow.AgentCommandPlan) (workflow.AgentCommandRunResult, error) {
+	return workflow.AgentCommandRunResult{
+		ExitCode:       2,
+		StderrBytes:    int64(len("failed command\n")),
+		LogSegments:    []workflow.LogSegmentPlan{{Stream: "stderr", Sequence: 1, ByteStart: 0, ByteEnd: int64(len("failed command\n")), Preview: "failed command\n", ArtifactPath: "logs/stderr.log"}},
+		ProcessStarted: true,
+	}, errors.New("exit status 2")
+}
+
+type blockUntilContextDoneRunner struct{}
+
+func (blockUntilContextDoneRunner) RunAgentCommand(ctx context.Context, _ workflow.AgentCommandPlan) (workflow.AgentCommandRunResult, error) {
+	<-ctx.Done()
+	return workflow.AgentCommandRunResult{
+		ExitCode:       -1,
+		ProcessStarted: true,
+	}, ctx.Err()
+}
+
+type preStartCancelledRunner struct{}
+
+func (preStartCancelledRunner) RunAgentCommand(context.Context, workflow.AgentCommandPlan) (workflow.AgentCommandRunResult, error) {
+	return workflow.AgentCommandRunResult{}, context.Canceled
 }
 
 type startedCaptureErrorRunner struct{}
@@ -185,4 +325,67 @@ func eventTypes(events []workflow.Event) string {
 		types += "," + event.Type
 	}
 	return types
+}
+
+func preparedAgentRun(t *testing.T) (*store.Store, int64) {
+	return preparedAgentRunWithOptions(t, preparedAgentRunOptions{})
+}
+
+type preparedAgentRunOptions struct {
+	CommandTimeout time.Duration
+}
+
+func preparedAgentRunWithOptions(t *testing.T, options preparedAgentRunOptions) (*store.Store, int64) {
+	t.Helper()
+
+	instanceStore, err := store.Open(filepath.Join(t.TempDir(), "forgelane.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := instanceStore.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	})
+	if err := instanceStore.Initialize(); err != nil {
+		t.Fatalf("initialize store: %v", err)
+	}
+
+	importResult, err := instanceStore.ImportWorkItem(workitems.ProviderIssue{
+		ProviderRef:         "github://github.com/owner/repo/issues/123",
+		RepositoryRef:       "github://github.com/owner/repo",
+		Provider:            "github",
+		ProviderIssueNumber: 123,
+		Title:               "Execute command",
+		Body:                "Run command.",
+		Status:              "open",
+		RawStatus:           "open",
+		URL:                 "https://github.com/owner/repo/issues/123",
+		ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("import WorkItem: %v", err)
+	}
+	createResult, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
+		WorkItem:       importResult.WorkItem,
+		CommandTimeout: options.CommandTimeout,
+	})
+	if err != nil {
+		t.Fatalf("create planned AgentRun: %v", err)
+	}
+	workspaceRoot := filepath.Join(t.TempDir(), "workspace")
+	paths := workflow.WorkspacePaths{
+		Root:      workspaceRoot,
+		Repo:      filepath.Join(workspaceRoot, "repo"),
+		Logs:      filepath.Join(workspaceRoot, "logs"),
+		Artifacts: filepath.Join(workspaceRoot, "artifacts"),
+		Tmp:       filepath.Join(workspaceRoot, "tmp"),
+	}
+	if _, err := instanceStore.AllocateWorkspace(createResult.AgentRun.ID, paths); err != nil {
+		t.Fatalf("allocate Workspace: %v", err)
+	}
+	if _, err := instanceStore.MarkWorkspaceReady(createResult.AgentRun.ID); err != nil {
+		t.Fatalf("mark Workspace ready: %v", err)
+	}
+	return instanceStore, createResult.AgentRun.ID
 }

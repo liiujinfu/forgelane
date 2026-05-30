@@ -73,6 +73,13 @@ ForgeLane is an agentic software delivery control plane.
   degrading to TargetRepository-only config.
 - ForgeLane owns run state, control actions, approvals, events, logs,
   workspaces, and artifacts.
+- AgentRun and RunnerJob command execution use explicit runtime states:
+  `running`, `completed`, `failed`, `timed_out`, and `cancelled`. Runtime
+  `cancelled` means the executing command context was cancelled; it does not by
+  itself imply that a user-facing stop ControlAction exists or was approved.
+- Command terminal Events distinguish success, failure, timeout, and runtime
+  cancellation through `agent_command.completed`, `agent_command.failed`,
+  `agent_command.timed_out`, and `agent_command.cancelled`.
 - The first-class deliverable is a PR/MR, not a chat answer.
 - Automated and privileged actions must be auditable through events.
 - Privileged actions must pass through an explicit permission or approval

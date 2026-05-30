@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -17,8 +18,9 @@ type PlannedAgentRunStore interface {
 
 // CreatePlannedAgentRunInput describes the WorkItem snapshot used to start an AgentRun.
 type CreatePlannedAgentRunInput struct {
-	WorkItem    WorkItemSnapshot
-	AgentPreset string
+	WorkItem       WorkItemSnapshot
+	AgentPreset    string
+	CommandTimeout time.Duration
 }
 
 // WorkItemSnapshot is the cached provider-owned WorkItem state captured in a RunSpec.
@@ -41,11 +43,12 @@ type WorkItemSnapshot struct {
 
 // PlannedAgentRunPlan is the workflow decision for creating a planned AgentRun.
 type PlannedAgentRunPlan struct {
-	WorkItem      WorkItemSnapshot
-	Status        string
-	Branch        string
-	AgentPreset   string
-	ControlAction ControlActionPlan
+	WorkItem       WorkItemSnapshot
+	Status         string
+	Branch         string
+	AgentPreset    string
+	CommandTimeout time.Duration
+	ControlAction  ControlActionPlan
 }
 
 // ControlActionPlan is the workflow decision for the operator action starting a run.
@@ -221,6 +224,7 @@ type AgentCommandRunner interface {
 
 // AgentCommandCompletion records terminal command execution evidence.
 type AgentCommandCompletion struct {
+	Status        string
 	ExitCode      int
 	Duration      time.Duration
 	StdoutBytes   int64
@@ -311,12 +315,31 @@ func ExecuteAgentRunCommand(ctx context.Context, store AgentCommandExecutionStor
 	if err != nil {
 		return AgentRunPrepareResult{}, err
 	}
+	timeout, err := commandTimeout(detail.RunSpec.SpecJSON)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
 	if _, err := store.MarkAgentCommandStarted(runID); err != nil {
 		return AgentRunPrepareResult{}, err
 	}
 
-	result, runErr := runner.RunAgentCommand(ctx, plan)
+	runCtx := ctx
+	cancelRunCtx := func() {}
+	if timeout > 0 {
+		runCtx, cancelRunCtx = context.WithTimeout(ctx, timeout)
+	}
+	defer cancelRunCtx()
+
+	result, runErr := runner.RunAgentCommand(runCtx, plan)
 	if runErr != nil && !result.ProcessStarted {
+		status := commandStatus(runCtx, result, runErr)
+		if status != "failed" {
+			return store.MarkAgentCommandCompleted(runID, AgentCommandCompletion{
+				Status:        status,
+				ExitCode:      commandExitCode(result, runErr),
+				FailureDetail: commandFailureDetail(runErr),
+			})
+		}
 		if _, markErr := store.MarkAgentCommandFailed(runID, compactFailure(runErr)); markErr != nil {
 			return AgentRunPrepareResult{}, fmt.Errorf("execute AgentAdapter command: %w; mark AgentRun failed: %v", runErr, markErr)
 		}
@@ -324,6 +347,7 @@ func ExecuteAgentRunCommand(ctx context.Context, store AgentCommandExecutionStor
 	}
 
 	completed, err := store.MarkAgentCommandCompleted(runID, AgentCommandCompletion{
+		Status:        commandStatus(runCtx, result, runErr),
 		ExitCode:      commandExitCode(result, runErr),
 		Duration:      result.Duration,
 		StdoutBytes:   result.StdoutBytes,
@@ -335,6 +359,21 @@ func ExecuteAgentRunCommand(ctx context.Context, store AgentCommandExecutionStor
 		return AgentRunPrepareResult{}, err
 	}
 	return completed, nil
+}
+
+func commandStatus(ctx context.Context, result AgentCommandRunResult, err error) string {
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return "timed_out"
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return "cancelled"
+		}
+	}
+	if commandExitCode(result, err) == 0 {
+		return "completed"
+	}
+	return "failed"
 }
 
 func commandExitCode(result AgentCommandRunResult, err error) int {
@@ -366,6 +405,9 @@ func CreatePlannedAgentRun(store PlannedAgentRunStore, input CreatePlannedAgentR
 	if err != nil {
 		return AgentRunCreateResult{}, err
 	}
+	if input.CommandTimeout > 0 {
+		plan.CommandTimeout = input.CommandTimeout
+	}
 	return store.CreatePlannedAgentRun(plan)
 }
 
@@ -380,10 +422,11 @@ func NewPlannedAgentRunPlan(workItem WorkItemSnapshot, agentPreset string) (Plan
 	}
 	branch := fmt.Sprintf("forgelane/issue-%d", ref.IssueNumber)
 	return PlannedAgentRunPlan{
-		WorkItem:    workItem,
-		Status:      "planned",
-		Branch:      branch,
-		AgentPreset: agentPreset,
+		WorkItem:       workItem,
+		Status:         "planned",
+		Branch:         branch,
+		AgentPreset:    agentPreset,
+		CommandTimeout: defaultCommandTimeout,
 		ControlAction: ControlActionPlan{
 			Type:        "start",
 			TargetType:  "work_item",
@@ -440,6 +483,7 @@ func (plan PlannedAgentRunPlan) EncodeRunSpec(runID int64) (string, error) {
 			EnvPolicy:        "scrubbed",
 			CredentialGrants: credentialGrantsForAgentPreset(plan.AgentPreset),
 		},
+		TimeoutMilliseconds: plan.CommandTimeout.Milliseconds(),
 	}
 	encoded, err := json.Marshal(spec)
 	if err != nil {
@@ -449,11 +493,12 @@ func (plan PlannedAgentRunPlan) EncodeRunSpec(runID int64) (string, error) {
 }
 
 type runSpecSnapshot struct {
-	RunID        string                      `json:"run_id"`
-	WorkItem     runSpecWorkItemSnapshot     `json:"work_item"`
-	Repo         runSpecRepoSnapshot         `json:"repo"`
-	Branch       string                      `json:"branch"`
-	AgentAdapter runSpecAgentAdapterSnapshot `json:"agent_adapter"`
+	RunID               string                      `json:"run_id"`
+	WorkItem            runSpecWorkItemSnapshot     `json:"work_item"`
+	Repo                runSpecRepoSnapshot         `json:"repo"`
+	Branch              string                      `json:"branch"`
+	AgentAdapter        runSpecAgentAdapterSnapshot `json:"agent_adapter"`
+	TimeoutMilliseconds int64                       `json:"timeout_milliseconds"`
 }
 
 type runSpecWorkItemSnapshot struct {
@@ -505,6 +550,21 @@ func credentialGrantsForAgentPreset(agentPreset string) []runSpecCredentialGrant
 			Env:      "OPENAI_API_KEY",
 		},
 	}
+}
+
+const defaultCommandTimeout = 30 * time.Minute
+
+func commandTimeout(specJSON string) (time.Duration, error) {
+	var spec struct {
+		TimeoutMilliseconds int64 `json:"timeout_milliseconds"`
+	}
+	if err := json.Unmarshal([]byte(specJSON), &spec); err != nil {
+		return 0, fmt.Errorf("decode RunSpec timeout: %w", err)
+	}
+	if spec.TimeoutMilliseconds <= 0 {
+		return 0, nil
+	}
+	return time.Duration(spec.TimeoutMilliseconds) * time.Millisecond, nil
 }
 
 // EventPlans returns the audit Events that must be written with the planned AgentRun state.
