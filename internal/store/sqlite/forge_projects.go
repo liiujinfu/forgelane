@@ -149,6 +149,31 @@ CREATE TABLE IF NOT EXISTS run_specs (
 	UNIQUE(agent_run_id)
 );
 
+CREATE TABLE IF NOT EXISTS runner_jobs (
+	id INTEGER PRIMARY KEY,
+	agent_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+	status TEXT NOT NULL CHECK(status IN ('preparing', 'ready', 'failed')),
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	UNIQUE(agent_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+	id INTEGER PRIMARY KEY,
+	agent_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+	runner_job_id INTEGER NOT NULL REFERENCES runner_jobs(id),
+	status TEXT NOT NULL CHECK(status IN ('allocated', 'ready', 'failed')),
+	root_path TEXT NOT NULL,
+	repo_path TEXT NOT NULL,
+	logs_path TEXT NOT NULL,
+	artifacts_path TEXT NOT NULL,
+	tmp_path TEXT NOT NULL,
+	failure_message TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	UNIQUE(agent_run_id)
+);
+
 CREATE TABLE IF NOT EXISTS control_actions (
 	id INTEGER PRIMARY KEY,
 	type TEXT NOT NULL,
@@ -191,7 +216,9 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_work_item_id ON events(work_item_id);
 CREATE INDEX IF NOT EXISTS idx_events_forge_project_id ON events(forge_project_id);
-CREATE INDEX IF NOT EXISTS idx_events_agent_run_id ON events(agent_run_id);`
+CREATE INDEX IF NOT EXISTS idx_events_agent_run_id ON events(agent_run_id);
+CREATE INDEX IF NOT EXISTS idx_runner_jobs_agent_run_id ON runner_jobs(agent_run_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_agent_run_id ON workspaces(agent_run_id);`
 
 	if _, err := store.db.Exec(schema); err != nil {
 		return fmt.Errorf("initialize ForgeLane database schema: %w", err)
@@ -253,18 +280,26 @@ type WorkItemImportResult struct {
 // AgentRun is a persisted bounded agent attempt.
 type AgentRun = workflow.AgentRun
 
+// RunnerJob is the runner-facing execution request for one AgentRun.
+type RunnerJob = workflow.RunnerJob
+
+// WorkspacePaths are the filesystem paths leased for one Workspace.
+type WorkspacePaths = workflow.WorkspacePaths
+
+// Workspace is the persisted execution filesystem lease for one AgentRun.
+type Workspace = workflow.Workspace
+
 // RunSpec is the immutable execution input snapshot for one AgentRun.
 type RunSpec = workflow.RunSpec
 
 // AgentRunCreateResult is the outcome of creating AgentRun execution state.
 type AgentRunCreateResult = workflow.AgentRunCreateResult
 
+// AgentRunPrepareResult is the outcome of preparing runner state for execution.
+type AgentRunPrepareResult = workflow.AgentRunPrepareResult
+
 // AgentRunDetail is the read model for inspecting one AgentRun.
-type AgentRunDetail struct {
-	AgentRun AgentRun
-	WorkItem WorkItem
-	RunSpec  RunSpec
-}
+type AgentRunDetail = workflow.AgentRunDetail
 
 // ControlAction is a persisted operator request to change the delivery loop.
 type ControlAction = workflow.ControlAction
@@ -562,7 +597,52 @@ WHERE agent_runs.id = ?`
 	if err != nil {
 		return AgentRunDetail{}, fmt.Errorf("query AgentRun detail: %w", err)
 	}
+	workspace, err := store.getWorkspaceForAgentRun(id)
+	if err != nil {
+		return AgentRunDetail{}, err
+	}
+	detail.Workspace = workspace
 	return detail, nil
+}
+
+func (store *Store) getWorkspaceForAgentRun(agentRunID int64) (*Workspace, error) {
+	var workspace Workspace
+	err := store.db.QueryRow(`
+SELECT
+	id,
+	agent_run_id,
+	runner_job_id,
+	status,
+	root_path,
+	repo_path,
+	logs_path,
+	artifacts_path,
+	tmp_path,
+	failure_message,
+	created_at,
+	updated_at
+FROM workspaces
+WHERE agent_run_id = ?`, agentRunID).Scan(
+		&workspace.ID,
+		&workspace.AgentRunID,
+		&workspace.RunnerJobID,
+		&workspace.Status,
+		&workspace.Paths.Root,
+		&workspace.Paths.Repo,
+		&workspace.Paths.Logs,
+		&workspace.Paths.Artifacts,
+		&workspace.Paths.Tmp,
+		&workspace.FailureMessage,
+		&workspace.CreatedAt,
+		&workspace.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query Workspace for AgentRun %d: %w", agentRunID, err)
+	}
+	return &workspace, nil
 }
 
 // ListEventsForAgentRun returns the audit timeline for one AgentRun in append order.
@@ -600,6 +680,231 @@ ORDER BY id ASC`, agentRunID)
 		return nil, fmt.Errorf("iterate Events for AgentRun %d: %w", agentRunID, err)
 	}
 	return events, nil
+}
+
+// AllocateWorkspace creates runner preparation state and records the Workspace lease.
+func (store *Store) AllocateWorkspace(agentRunID int64, paths WorkspacePaths) (AgentRunPrepareResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if detail.AgentRun.Status != "planned" {
+		return AgentRunPrepareResult{}, fmt.Errorf("AgentRun %d is %s; expected planned", agentRunID, detail.AgentRun.Status)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("begin Workspace allocation transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ?", "preparing", now, agentRunID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark AgentRun %d preparing: %w", agentRunID, err)
+	}
+
+	jobResult, err := tx.Exec(`
+INSERT INTO runner_jobs (agent_run_id, status, created_at, updated_at)
+VALUES (?, ?, ?, ?)`,
+		agentRunID,
+		"preparing",
+		now,
+		now,
+	)
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("insert RunnerJob for AgentRun %d: %w", agentRunID, err)
+	}
+	jobID, err := jobResult.LastInsertId()
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("read inserted RunnerJob id: %w", err)
+	}
+
+	workspaceResult, err := tx.Exec(`
+INSERT INTO workspaces (
+	agent_run_id,
+	runner_job_id,
+	status,
+	root_path,
+	repo_path,
+	logs_path,
+	artifacts_path,
+	tmp_path,
+	created_at,
+	updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		agentRunID,
+		jobID,
+		"allocated",
+		paths.Root,
+		paths.Repo,
+		paths.Logs,
+		paths.Artifacts,
+		paths.Tmp,
+		now,
+		now,
+	)
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("insert Workspace for AgentRun %d: %w", agentRunID, err)
+	}
+	workspaceID, err := workspaceResult.LastInsertId()
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("read inserted Workspace id: %w", err)
+	}
+
+	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:           "workspace.allocated",
+		OccurredAt:     now,
+		ForgeProjectID: detail.WorkItem.ForgeProjectID,
+		SubjectType:    "workspace",
+		SubjectRef:     fmt.Sprintf("workspace:%d", workspaceID),
+		WorkItemID:     detail.WorkItem.ID,
+		WorkItemRef:    detail.WorkItem.ProviderRef,
+		AgentRunID:     agentRunID,
+		Payload: map[string]any{
+			"agent_run_id":   agentRunID,
+			"runner_job_id":  jobID,
+			"workspace_id":   workspaceID,
+			"root_path":      paths.Root,
+			"repo_path":      paths.Repo,
+			"logs_path":      paths.Logs,
+			"artifacts_path": paths.Artifacts,
+			"tmp_path":       paths.Tmp,
+			"status":         "allocated",
+		},
+	})
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("commit Workspace allocation: %w", err)
+	}
+
+	return AgentRunPrepareResult{
+		AgentRun: AgentRun{
+			ID:         detail.AgentRun.ID,
+			WorkItemID: detail.AgentRun.WorkItemID,
+			Status:     "preparing",
+			CreatedAt:  detail.AgentRun.CreatedAt,
+			UpdatedAt:  now,
+		},
+		RunnerJob: RunnerJob{
+			ID:         jobID,
+			AgentRunID: agentRunID,
+			Status:     "preparing",
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		},
+		Workspace: Workspace{
+			ID:          workspaceID,
+			AgentRunID:  agentRunID,
+			RunnerJobID: jobID,
+			Status:      "allocated",
+			Paths:       paths,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+		Events: []Event{event},
+	}, nil
+}
+
+// MarkWorkspaceReady records successful repository preparation.
+func (store *Store) MarkWorkspaceReady(agentRunID int64) (AgentRunPrepareResult, error) {
+	return store.finishWorkspacePreparation(agentRunID, "ready", "preparing", "")
+}
+
+// MarkWorkspaceFailed records a retained failed Workspace for debugging.
+func (store *Store) MarkWorkspaceFailed(agentRunID int64, failureMessage string) (AgentRunPrepareResult, error) {
+	return store.finishWorkspacePreparation(agentRunID, "failed", "failed", failureMessage)
+}
+
+func (store *Store) finishWorkspacePreparation(agentRunID int64, workspaceStatus string, agentRunStatus string, failureMessage string) (AgentRunPrepareResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if detail.Workspace == nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("Workspace not allocated for AgentRun %d", agentRunID)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("begin Workspace preparation transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ?", agentRunStatus, now, agentRunID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark AgentRun %d %s: %w", agentRunID, agentRunStatus, err)
+	}
+	jobStatus := workspaceStatus
+	if _, err := tx.Exec("UPDATE runner_jobs SET status = ?, updated_at = ? WHERE id = ?", jobStatus, now, detail.Workspace.RunnerJobID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark RunnerJob %d %s: %w", detail.Workspace.RunnerJobID, jobStatus, err)
+	}
+	if _, err := tx.Exec(`
+UPDATE workspaces
+SET status = ?, failure_message = ?, updated_at = ?
+WHERE id = ?`,
+		workspaceStatus,
+		failureMessage,
+		now,
+		detail.Workspace.ID,
+	); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark Workspace %d %s: %w", detail.Workspace.ID, workspaceStatus, err)
+	}
+
+	eventType := "workspace.prepared"
+	if workspaceStatus == "failed" {
+		eventType = "workspace.prepare_failed"
+	}
+	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:           eventType,
+		OccurredAt:     now,
+		ForgeProjectID: detail.WorkItem.ForgeProjectID,
+		SubjectType:    "workspace",
+		SubjectRef:     fmt.Sprintf("workspace:%d", detail.Workspace.ID),
+		WorkItemID:     detail.WorkItem.ID,
+		WorkItemRef:    detail.WorkItem.ProviderRef,
+		AgentRunID:     agentRunID,
+		Payload: map[string]any{
+			"agent_run_id":     agentRunID,
+			"runner_job_id":    detail.Workspace.RunnerJobID,
+			"workspace_id":     detail.Workspace.ID,
+			"workspace_status": workspaceStatus,
+			"agent_run_status": agentRunStatus,
+			"failure_message":  failureMessage,
+		},
+	})
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("commit Workspace preparation: %w", err)
+	}
+
+	workspace := *detail.Workspace
+	workspace.Status = workspaceStatus
+	workspace.FailureMessage = failureMessage
+	workspace.UpdatedAt = now
+	return AgentRunPrepareResult{
+		AgentRun: AgentRun{
+			ID:         detail.AgentRun.ID,
+			WorkItemID: detail.AgentRun.WorkItemID,
+			Status:     agentRunStatus,
+			CreatedAt:  detail.AgentRun.CreatedAt,
+			UpdatedAt:  now,
+		},
+		RunnerJob: RunnerJob{
+			ID:         workspace.RunnerJobID,
+			AgentRunID: agentRunID,
+			Status:     jobStatus,
+			CreatedAt:  workspace.CreatedAt,
+			UpdatedAt:  now,
+		},
+		Workspace: workspace,
+		Events:    []Event{event},
+	}, nil
 }
 
 // CreatePlannedAgentRun writes one planned AgentRun, its immutable RunSpec, and matching Events.
@@ -767,6 +1072,10 @@ func appendAgentRunEventTx(tx *sql.Tx, input agentRunEventInput) (Event, error) 
 	if err != nil {
 		return Event{}, fmt.Errorf("encode %s event payload: %w", input.Type, err)
 	}
+	var controlActionID any
+	if input.ControlActionID != 0 {
+		controlActionID = input.ControlActionID
+	}
 
 	result, err := tx.Exec(`
 INSERT INTO events (
@@ -792,7 +1101,7 @@ INSERT INTO events (
 		input.WorkItemID,
 		input.WorkItemRef,
 		input.AgentRunID,
-		input.ControlActionID,
+		controlActionID,
 		input.WorkItemRef,
 		string(payload),
 	)
