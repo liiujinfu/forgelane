@@ -1,8 +1,7 @@
-// Package repositoryconfig manages ForgeLane-owned local repository defaults.
+// Package repositoryconfig manages ForgeLane-owned repository defaults.
 package repositoryconfig
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -10,9 +9,11 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	store "github.com/liiujinfu/forgelane/internal/store/sqlite"
 )
 
-const configRelativePath = ".forgelane/repository.json"
+const stateRelativePath = ".forgelane/forgelane.db"
 
 // ForgeProject identifies the default provider-backed project for local work.
 type ForgeProject struct {
@@ -21,20 +22,16 @@ type ForgeProject struct {
 	Path     string `json:"path"`
 }
 
-type repositoryConfig struct {
-	ForgeProject ForgeProject `json:"forgeProject"`
-}
-
 // InitOptions configures repository default initialization.
 type InitOptions struct {
 	WorkingDir string
+	DBPath     string
 	RepoURL    string
 	Provider   string
 	Repo       string
-	Force      bool
 }
 
-// Configure writes the local ForgeProject repository config.
+// Configure persists a ForgeProject in the instance-global state store.
 func Configure(options InitOptions) (ForgeProject, error) {
 	workingDir := options.WorkingDir
 	if workingDir == "" {
@@ -51,61 +48,29 @@ func Configure(options InitOptions) (ForgeProject, error) {
 		return ForgeProject{}, err
 	}
 
-	configPath := filepath.Join(workingDir, configRelativePath)
-	if err := verifyExistingConfig(configPath, forgeProject, options.Force); err != nil {
+	dbPath, err := stateDBPath(options.DBPath)
+	if err != nil {
 		return ForgeProject{}, err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
-		return ForgeProject{}, fmt.Errorf("create repository config directory: %w", err)
-	}
-
-	encoded, err := json.MarshalIndent(repositoryConfig{ForgeProject: forgeProject}, "", "  ")
+	instanceStore, err := store.Open(dbPath)
 	if err != nil {
-		return ForgeProject{}, fmt.Errorf("encode repository config: %w", err)
+		return ForgeProject{}, err
 	}
-	encoded = append(encoded, '\n')
+	defer instanceStore.Close()
 
-	if err := os.WriteFile(configPath, encoded, 0o644); err != nil {
-		return ForgeProject{}, fmt.Errorf("write repository config: %w", err)
+	if err := instanceStore.Initialize(); err != nil {
+		return ForgeProject{}, err
 	}
-
+	if err := instanceStore.UpsertForgeProject(store.ForgeProject{
+		Provider:       forgeProject.Provider,
+		ProviderHost:   forgeProjectHost(forgeProject),
+		RepositoryPath: forgeProject.Path,
+		ProviderRef:    ForgeProjectRef(forgeProject),
+	}); err != nil {
+		return ForgeProject{}, err
+	}
 	return forgeProject, nil
-}
-
-// ForgeProjectRef returns the canonical project reference used in CLI output.
-func ForgeProjectRef(forgeProject ForgeProject) string {
-	baseURL, err := url.Parse(forgeProject.BaseURL)
-	if err != nil || baseURL.Host == "" {
-		return forgeProject.Provider + "://" + forgeProject.Path
-	}
-	return forgeProject.Provider + "://" + baseURL.Host + "/" + forgeProject.Path
-}
-
-func verifyExistingConfig(configPath string, requested ForgeProject, force bool) error {
-	existingBytes, err := os.ReadFile(configPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read existing repository config: %w", err)
-	}
-
-	var existing repositoryConfig
-	if err := json.Unmarshal(existingBytes, &existing); err != nil {
-		return fmt.Errorf("parse existing repository config: %w", err)
-	}
-	if existing.ForgeProject == requested {
-		return nil
-	}
-	if force {
-		return nil
-	}
-
-	return fmt.Errorf(
-		"repository config already points at %s; pass --force to replace it",
-		ForgeProjectRef(existing.ForgeProject),
-	)
 }
 
 func forgeProjectFromOptions(options InitOptions) (ForgeProject, error) {
@@ -148,6 +113,38 @@ func forgeProjectFromOptions(options InitOptions) (ForgeProject, error) {
 		BaseURL:  "https://github.com",
 		Path:     repoPath,
 	}, nil
+}
+
+func stateDBPath(explicitPath string) (string, error) {
+	if explicitPath != "" {
+		return explicitPath, nil
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve ForgeLane state directory: %w", err)
+	}
+	if homeDir == "" {
+		return "", fmt.Errorf("resolve ForgeLane state directory: empty home directory")
+	}
+	return filepath.Join(homeDir, stateRelativePath), nil
+}
+
+// ForgeProjectRef returns the canonical project reference used in CLI output.
+func ForgeProjectRef(forgeProject ForgeProject) string {
+	baseURL, err := url.Parse(forgeProject.BaseURL)
+	if err != nil || baseURL.Host == "" {
+		return forgeProject.Provider + "://" + forgeProject.Path
+	}
+	return forgeProject.Provider + "://" + baseURL.Host + "/" + forgeProject.Path
+}
+
+func forgeProjectHost(forgeProject ForgeProject) string {
+	baseURL, err := url.Parse(forgeProject.BaseURL)
+	if err != nil || baseURL.Host == "" {
+		return ""
+	}
+	return baseURL.Host
 }
 
 func parseGitHubURL(raw string) (string, error) {
@@ -196,7 +193,20 @@ func parseGitHubRepo(raw string) (string, error) {
 
 func validOwnerRepo(repoPath string) bool {
 	parts := strings.Split(repoPath, "/")
-	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+	if len(parts) != 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." || strings.TrimSpace(part) != part {
+			return false
+		}
+		for _, char := range part {
+			if char < 0x21 || char > 0x7e || strings.ContainsRune(`\/?#[]@!$&'()*+,;=`, char) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func originRemoteURL(workingDir string) (string, error) {
