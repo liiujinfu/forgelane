@@ -18,3 +18,10 @@ The runner contract should describe command execution, workspace scope, logs,
 exit status, and produced commits without assuming Codex-specific session
 semantics. Codex-specific behavior can live in the preset and later be promoted
 only when the core adapter contract proves too weak.
+
+Command adapters must not rely on inheriting the operator's shell home or local
+agent login directory for authentication. The RunSpec should declare explicit
+credential grants for agent-local model access. The first Codex preset uses an
+OpenAI API key grant materialized as `OPENAI_API_KEY` through ForgeLane's
+SecretStore boundary; OAuth/access-token grants can be added later behind the
+same explicit grant boundary.

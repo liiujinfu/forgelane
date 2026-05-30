@@ -19,5 +19,5 @@ replaying the event log.
 
 All authoritative state changes must go through workflow/store code that updates
 state and appends Events atomically. Logs and large provider payloads should not
-be stored directly in Events; they should use log chunks, artifacts, provider
-refs, or compact snapshots.
+be stored directly in Events; they should use workspace log files indexed by
+`log_segments`, artifacts, provider refs, or compact snapshots.

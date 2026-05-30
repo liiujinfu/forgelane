@@ -543,6 +543,20 @@ func TestRunsCreateImportsWorkItemAndCreatesPlannedRunSpec(t *testing.T) {
 	if got := agentAdapter["kind"]; got != "command" {
 		t.Fatalf("expected generic command AgentAdapter, got %#v", got)
 	}
+	grants, ok := agentAdapter["credential_grants"].([]any)
+	if !ok || len(grants) != 1 {
+		t.Fatalf("expected default Codex RunSpec to declare one credential grant, got %#v", agentAdapter["credential_grants"])
+	}
+	grant, ok := grants[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected credential grant object, got %#v", grants[0])
+	}
+	if got := grant["kind"]; got != "openai_api_key" {
+		t.Fatalf("expected OPENAI API key credential grant, got %#v", got)
+	}
+	if got := grant["secret_id"]; got != "env:OPENAI_API_KEY" {
+		t.Fatalf("expected env-backed OPENAI_API_KEY secret id, got %#v", got)
+	}
 }
 
 func TestRunsCreateReusesWorkItemSnapshotButCreatesNewAgentRunEachTime(t *testing.T) {
@@ -985,6 +999,141 @@ func TestRunsPrepareFailureRetainsFailedWorkspaceState(t *testing.T) {
 	})
 	assertTableCount(t, homeDir, "runner_jobs", 1)
 	assertTableCount(t, homeDir, "workspaces", 1)
+}
+
+func TestRunsExecuteHarmlessPresetCapturesLogsAndScrubsEnvironment(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+	t.Setenv("GITHUB_TOKEN", "sensitive-provider-token")
+	t.Setenv("GH_TOKEN", "sensitive-gh-token")
+	t.Setenv("GITLAB_TOKEN", "sensitive-gitlab-token")
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Execute a harmless AgentAdapter preset",
+			Body:                "Run a scrubbed command inside the prepared Workspace.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	createStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	runID := extractCreatedAgentRunID(t, createStdout)
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "prepare", strconv.FormatInt(runID, 10)); err != nil {
+		t.Fatalf("expected runs prepare to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	executeStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "execute", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs execute to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Executed AgentRun 1",
+		"Status: completed",
+		"Event: agent_command.completed",
+	} {
+		if !strings.Contains(executeStdout, want) {
+			t.Fatalf("expected runs execute output to contain %q, got:\n%s", want, executeStdout)
+		}
+	}
+
+	showStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "show", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs show to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if !strings.Contains(showStdout, "Status: completed") {
+		t.Fatalf("expected completed AgentRun, got:\n%s", showStdout)
+	}
+
+	logsStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "logs", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs logs to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	workspaceRepo := filepath.Join(homeDir, ".forgelane", "workspaces", "run-1", "repo")
+	workspaceRepo, err = filepath.EvalSymlinks(workspaceRepo)
+	if err != nil {
+		t.Fatalf("resolve Workspace repo path: %v", err)
+	}
+	for _, want := range []string{
+		"forgelane harmless stdout",
+		"forgelane harmless stderr",
+		"cwd=" + workspaceRepo,
+		"provider-token=absent",
+	} {
+		if !strings.Contains(logsStdout, want) {
+			t.Fatalf("expected runs logs output to contain %q, got:\n%s", want, logsStdout)
+		}
+	}
+	for _, secret := range []string{"sensitive-provider-token", "sensitive-gh-token", "sensitive-gitlab-token"} {
+		if strings.Contains(logsStdout, secret) {
+			t.Fatalf("expected scrubbed provider token %q, got logs:\n%s", secret, logsStdout)
+		}
+	}
+	if strings.Contains(logsStdout, "provider-token=present") {
+		t.Fatalf("expected scrubbed provider token, got logs:\n%s", logsStdout)
+	}
+
+	eventsStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "events", "list", "--run", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected events list to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	assertInOrder(t, eventsStdout, []string{
+		"workspace.prepared",
+		"agent_command.started",
+		"agent_command.completed",
+	})
+	if strings.Contains(eventsStdout, "forgelane harmless stdout") {
+		t.Fatalf("expected command output to stay out of Events, got:\n%s", eventsStdout)
+	}
+
+	assertLogSegmentStreams(t, homeDir, []string{"stdout", "stderr"})
+	for _, path := range []string{
+		filepath.Join(homeDir, ".forgelane", "workspaces", "run-1", "logs", "stdout.log"),
+		filepath.Join(homeDir, ".forgelane", "workspaces", "run-1", "logs", "stderr.log"),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected log file %s: %v", path, err)
+		}
+	}
 }
 
 func TestRunReadCommandsReturnClearErrorsForInvalidAndUnknownRunIDs(t *testing.T) {
@@ -1649,6 +1798,35 @@ func assertTableCount(t *testing.T, homeDir string, table string, want int) {
 	}
 	if got != want {
 		t.Fatalf("unexpected %s count: got %d, want %d", table, got, want)
+	}
+}
+
+func assertLogSegmentStreams(t *testing.T, homeDir string, wantStreams []string) {
+	t.Helper()
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	rows, err := db.Query("SELECT DISTINCT stream FROM log_segments ORDER BY stream")
+	if err != nil {
+		t.Fatalf("query LogSegment streams: %v", err)
+	}
+	defer rows.Close()
+
+	var got []string
+	for rows.Next() {
+		var stream string
+		if err := rows.Scan(&stream); err != nil {
+			t.Fatalf("scan LogSegment stream: %v", err)
+		}
+		got = append(got, stream)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate LogSegment streams: %v", err)
+	}
+	slices.Sort(wantStreams)
+	if strings.Join(got, "\n") != strings.Join(wantStreams, "\n") {
+		t.Fatalf("unexpected LogSegment streams:\n got: %q\nwant: %q", got, wantStreams)
 	}
 }
 

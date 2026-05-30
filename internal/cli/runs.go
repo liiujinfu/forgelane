@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strconv"
 
+	commandadapter "github.com/liiujinfu/forgelane/internal/agentadapter/command"
 	githubprovider "github.com/liiujinfu/forgelane/internal/provider/github"
 	"github.com/liiujinfu/forgelane/internal/repositoryconfig"
 	"github.com/liiujinfu/forgelane/internal/runner"
+	processrunner "github.com/liiujinfu/forgelane/internal/runner/process"
 	store "github.com/liiujinfu/forgelane/internal/store/sqlite"
 	"github.com/liiujinfu/forgelane/internal/workflow"
 	"github.com/liiujinfu/forgelane/internal/workitems"
@@ -28,11 +31,14 @@ func newRunsCommand(stdout io.Writer, provider workitems.Provider) *cobra.Comman
 	cmd.AddCommand(newRunsCreateCommand(stdout, provider))
 	cmd.AddCommand(newRunsShowCommand(stdout))
 	cmd.AddCommand(newRunsPrepareCommand(stdout))
+	cmd.AddCommand(newRunsExecuteCommand(stdout))
+	cmd.AddCommand(newRunsLogsCommand(stdout))
 	return cmd
 }
 
 func newRunsCreateCommand(stdout io.Writer, provider workitems.Provider) *cobra.Command {
-	return &cobra.Command{
+	var agentPreset string
+	cmd := &cobra.Command{
 		Use:   "create <provider-ref-or-issue>",
 		Short: "Create a planned AgentRun and immutable RunSpec.",
 		Args:  cobra.ExactArgs(1),
@@ -54,7 +60,8 @@ func newRunsCreateCommand(stdout io.Writer, provider workitems.Provider) *cobra.
 			}
 
 			result, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
-				WorkItem: workItem,
+				WorkItem:    workItem,
+				AgentPreset: agentPreset,
 			})
 			if err != nil {
 				return err
@@ -64,6 +71,8 @@ func newRunsCreateCommand(stdout io.Writer, provider workitems.Provider) *cobra.
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&agentPreset, "agent-preset", "", "AgentAdapter preset for the RunSpec")
+	return cmd
 }
 
 func getOrImportWorkItem(cmd *cobra.Command, instanceStore *store.Store, provider workitems.Provider, ref workitems.ProviderRef) (store.WorkItem, error) {
@@ -132,6 +141,75 @@ func newRunsPrepareCommand(stdout io.Writer) *cobra.Command {
 	}
 }
 
+func newRunsExecuteCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "execute <run_id>",
+		Short: "Execute the AgentAdapter command for a prepared AgentRun.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+
+			instanceStore, err := openInitializedStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			result, err := workflow.ExecuteAgentRunCommand(cmd.Context(), instanceStore, commandadapter.Adapter{
+				Secrets: commandadapter.EnvSecretStore{},
+			}, processrunner.Runner{}, runID)
+			if err != nil {
+				return err
+			}
+			printExecutedAgentRun(stdout, result)
+			return nil
+		},
+	}
+}
+
+func newRunsLogsCommand(stdout io.Writer) *cobra.Command {
+	var stream string
+
+	cmd := &cobra.Command{
+		Use:   "logs <run_id>",
+		Short: "Show captured AgentRun logs.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+			if stream != "" && stream != "stdout" && stream != "stderr" {
+				return fmt.Errorf("invalid log stream %q", stream)
+			}
+
+			instanceStore, err := openReadOnlyStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			detail, err := instanceStore.GetAgentRunDetail(runID)
+			if err != nil {
+				return err
+			}
+			if detail.Workspace == nil {
+				return fmt.Errorf("Workspace not prepared for AgentRun %d", runID)
+			}
+			segments, err := instanceStore.ListLogSegmentsForAgentRun(runID, stream)
+			if err != nil {
+				return err
+			}
+			return printRunLogs(stdout, *detail.Workspace, segments)
+		},
+	}
+	cmd.Flags().StringVar(&stream, "stream", "", "Filter logs to stdout or stderr")
+	return cmd
+}
+
 func workspacePathsForRun(runID int64) (store.WorkspacePaths, error) {
 	dbPath, err := repositoryconfig.StateDBPath("")
 	if err != nil {
@@ -158,6 +236,38 @@ func printPreparedAgentRun(stdout io.Writer, result store.AgentRunPrepareResult)
 		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
 		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
 	}
+}
+
+func printExecutedAgentRun(stdout io.Writer, result store.AgentRunPrepareResult) {
+	fmt.Fprintf(stdout, "Executed AgentRun %d\n", result.AgentRun.ID)
+	fmt.Fprintf(stdout, "RunnerJob ID: %d\n", result.RunnerJob.ID)
+	fmt.Fprintf(stdout, "Status: %s\n", result.AgentRun.Status)
+	for _, event := range result.Events {
+		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
+		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
+	}
+}
+
+func printRunLogs(stdout io.Writer, workspace store.Workspace, segments []store.LogSegment) error {
+	for _, segment := range segments {
+		path := filepath.Join(workspace.Paths.Root, segment.ArtifactPath)
+		file, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("open %s log segment %d: %w", segment.Stream, segment.ID, err)
+		}
+		if _, err := file.Seek(segment.ByteStart, io.SeekStart); err != nil {
+			file.Close()
+			return fmt.Errorf("seek %s log segment %d: %w", segment.Stream, segment.ID, err)
+		}
+		if _, err := io.CopyN(stdout, file, segment.ByteEnd-segment.ByteStart); err != nil {
+			file.Close()
+			return fmt.Errorf("read %s log segment %d: %w", segment.Stream, segment.ID, err)
+		}
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("close %s log file: %w", segment.Stream, err)
+		}
+	}
+	return nil
 }
 
 func newRunsShowCommand(stdout io.Writer) *cobra.Command {
