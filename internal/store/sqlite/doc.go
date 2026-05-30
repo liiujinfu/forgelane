@@ -1,2 +1,2 @@
-// Package sqlite marks the future SQLite persistence implementation boundary.
+// Package sqlite contains the SQLite persistence implementation boundary.
 package sqlite

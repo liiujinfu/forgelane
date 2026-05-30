@@ -38,17 +38,21 @@ Teams need:
 
 The first version stays intentionally small and is tracked in
 [docs/roadmap/v0.md](docs/roadmap/v0.md). The current CLI has the first
-instance-global Forge project configuration command; workflow commands will be
-added by later slices.
+instance-global ForgeProject configuration path, WorkItem import/cache reads,
+planned AgentRun creation, local Workspace preparation, and run-scoped Event
+inspection. Agent process execution, commit materialization, branch push, and
+draft PR creation are still later v0 slices.
 
 ## Architecture Bias
 
 The planned stack is:
 
 - Go for the control plane API, workflow engine, provider integrations, and
-  event/audit service.
-- Rust for the local runner, sandbox supervisor, and performance-sensitive
-  execution pieces.
+  event/audit service. The current v0 CLI is a Go modular monolith.
+- Go for the first local Workspace preparation path, behind a runner boundary
+  that can later be replaced or supervised by a Rust runner daemon.
+- Rust later for sandbox supervision and performance-sensitive execution
+  pieces once the first local loop is proven.
 - TypeScript for web, mobile/PWA, VS Code extension, and other clients.
 
 The API should be client-neutral so web, mobile, CLI, IDE, and IM integrations
@@ -79,8 +83,9 @@ Stable core:
 ## Status
 
 This repository is currently in the early v0 CLI stage. The CLI exposes help,
-version, and local repository initialization while the issue-to-draft-PR
-workflow is built through later slices.
+version, local repository initialization, WorkItem import/show, planned
+AgentRun creation/show, Workspace preparation, and run Event listing. It does
+not yet execute an agent command, push commits, or create draft PRs.
 
 See [docs/vision.md](docs/vision.md) for the long-term product direction.
 See [docs/roadmap/v0.md](docs/roadmap/v0.md) for the first version boundary
@@ -106,6 +111,10 @@ go run ./cmd/forgelane work-items import github://github.com/owner/repo/issues/1
 go run ./cmd/forgelane work-items show github://github.com/owner/repo/issues/123
 go run ./cmd/forgelane work-items show --issue 123
 go run ./cmd/forgelane work-items show --id 1
+go run ./cmd/forgelane runs create github://github.com/owner/repo/issues/123
+go run ./cmd/forgelane runs show 1
+go run ./cmd/forgelane runs prepare 1
+go run ./cmd/forgelane events list --run 1
 ```
 
 `work-items import` records a cached provider issue snapshot in the
@@ -114,6 +123,12 @@ compact audit Event. `work-items show` reads only that local snapshot; run
 `work-items import` again to refresh provider state explicitly. The default test
 suite uses fake WorkItem providers and does not require network access or
 credentials.
+
+`runs create` creates a new planned AgentRun, a succeeded `start`
+ControlAction, and an immutable RunSpec snapshot. `runs prepare` allocates a
+RunnerJob and Workspace under `~/.forgelane/workspaces/run-<id>/`, clones the
+current repository into `repo/`, and records workspace Events. `events list
+--run` reads the AgentRun timeline from SQLite without contacting providers.
 
 ## Agent Development Workflow
 

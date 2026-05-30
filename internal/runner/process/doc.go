@@ -1,2 +1,2 @@
-// Package process marks the future local process runner implementation boundary.
+// Package process marks the local process runner implementation boundary.
 package process

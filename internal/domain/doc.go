@@ -1,2 +1,2 @@
-// Package domain will contain ForgeLane domain vocabulary as consumer slices require it.
+// Package domain is reserved for durable ForgeLane domain vocabulary.
 package domain
