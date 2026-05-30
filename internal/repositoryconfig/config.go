@@ -67,6 +67,7 @@ func Configure(options InitOptions) (ForgeProject, error) {
 		ProviderHost:   forgeProjectHost(forgeProject),
 		RepositoryPath: forgeProject.Path,
 		ProviderRef:    ForgeProjectRef(forgeProject),
+		Initialized:    true,
 	}); err != nil {
 		return ForgeProject{}, err
 	}
