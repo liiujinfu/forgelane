@@ -271,11 +271,12 @@ type ControlAction = workflow.ControlAction
 
 // ImportWorkItem persists a provider-owned issue snapshot and matching audit Event.
 func (store *Store) ImportWorkItem(issue workitems.ProviderIssue) (WorkItemImportResult, error) {
-	ref, err := workitems.ParseProviderRef(issue.ProviderRef)
+	importDecision, err := workitems.NewWorkItemImport(issue)
 	if err != nil {
 		return WorkItemImportResult{}, err
 	}
-	issue = issue.Normalize(ref)
+	issue = importDecision.Issue
+	ref := importDecision.Ref
 
 	tx, err := store.db.Begin()
 	if err != nil {
@@ -303,11 +304,11 @@ func (store *Store) ImportWorkItem(issue workitems.ProviderIssue) (WorkItemImpor
 		issue.ProviderRef,
 	).Scan(&existingID, &importedAt)
 
-	eventType := "work_item.refreshed"
+	existing := true
 	var workItemID int64
 	switch {
 	case err == sql.ErrNoRows:
-		eventType = "work_item.imported"
+		existing = false
 		importedAt = now
 		result, err := tx.Exec(`
 INSERT INTO work_items (
@@ -381,13 +382,13 @@ WHERE id = ?`,
 		}
 	}
 
-	payload, err := json.Marshal(map[string]any{
-		"provider_ref":        issue.ProviderRef,
-		"repository_ref":      issue.RepositoryRef,
-		"provider_updated_at": providerUpdatedAt,
-		"work_item_id":        workItemID,
-		"forge_project_id":    forgeProjectID,
+	eventPlan := importDecision.EventPlan(workitems.ImportEventInput{
+		Existing:          existing,
+		WorkItemID:        workItemID,
+		ForgeProjectID:    forgeProjectID,
+		ProviderUpdatedAt: providerUpdatedAt,
 	})
+	payload, err := json.Marshal(eventPlan.Payload)
 	if err != nil {
 		return WorkItemImportResult{}, fmt.Errorf("encode WorkItem event payload: %w", err)
 	}
@@ -405,15 +406,15 @@ INSERT INTO events (
 	provider_ref,
 	payload
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		eventType,
+		eventPlan.Type,
 		now,
 		"forgelane",
 		forgeProjectID,
-		"work_item",
-		issue.ProviderRef,
+		eventPlan.SubjectType,
+		eventPlan.SubjectRef,
 		workItemID,
 		issue.ProviderRef,
-		issue.ProviderRef,
+		eventPlan.ProviderRef,
 		string(payload),
 	)
 	if err != nil {
@@ -436,7 +437,7 @@ INSERT INTO events (
 		WorkItem: workItem,
 		Event: Event{
 			ID:   eventID,
-			Type: eventType,
+			Type: eventPlan.Type,
 		},
 	}, nil
 }

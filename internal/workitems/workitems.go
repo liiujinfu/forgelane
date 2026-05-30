@@ -84,6 +84,62 @@ type ProviderIssue struct {
 	ProviderUpdatedAt   time.Time
 }
 
+// WorkItemImport is the normalized WorkItem snapshot intake decision.
+type WorkItemImport struct {
+	Issue ProviderIssue
+	Ref   ProviderRef
+}
+
+// ImportEventInput supplies persistence identities assigned during an import transaction.
+type ImportEventInput struct {
+	Existing          bool
+	WorkItemID        int64
+	ForgeProjectID    int64
+	ProviderUpdatedAt string
+}
+
+// ImportEventPlan is the audit Event chosen for a WorkItem import transaction.
+type ImportEventPlan struct {
+	Type        string
+	SubjectType string
+	SubjectRef  string
+	ProviderRef string
+	Payload     map[string]any
+}
+
+// NewWorkItemImport normalizes a provider-owned issue snapshot for ForgeLane intake.
+func NewWorkItemImport(issue ProviderIssue) (WorkItemImport, error) {
+	ref, err := ParseProviderRef(issue.ProviderRef)
+	if err != nil {
+		return WorkItemImport{}, err
+	}
+	return WorkItemImport{
+		Issue: issue.Normalize(ref),
+		Ref:   ref,
+	}, nil
+}
+
+// EventPlan returns the audit Event for the import or refresh outcome.
+func (importDecision WorkItemImport) EventPlan(input ImportEventInput) ImportEventPlan {
+	eventType := "work_item.imported"
+	if input.Existing {
+		eventType = "work_item.refreshed"
+	}
+	return ImportEventPlan{
+		Type:        eventType,
+		SubjectType: "work_item",
+		SubjectRef:  importDecision.Issue.ProviderRef,
+		ProviderRef: importDecision.Issue.ProviderRef,
+		Payload: map[string]any{
+			"provider_ref":        importDecision.Issue.ProviderRef,
+			"repository_ref":      importDecision.Issue.RepositoryRef,
+			"provider_updated_at": input.ProviderUpdatedAt,
+			"work_item_id":        input.WorkItemID,
+			"forge_project_id":    input.ForgeProjectID,
+		},
+	}
+}
+
 // Normalize anchors provider data to the parsed ProviderRef identity.
 func (issue ProviderIssue) Normalize(ref ProviderRef) ProviderIssue {
 	issue.ProviderRef = ref.String()
