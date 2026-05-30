@@ -152,7 +152,15 @@ CREATE TABLE IF NOT EXISTS run_specs (
 CREATE TABLE IF NOT EXISTS runner_jobs (
 	id INTEGER PRIMARY KEY,
 	agent_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
-	status TEXT NOT NULL CHECK(status IN ('preparing', 'ready', 'failed')),
+	status TEXT NOT NULL CHECK(status IN (
+		'preparing',
+		'ready',
+		'running',
+		'completed',
+		'failed',
+		'cancelled',
+		'timed_out'
+	)),
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL,
 	UNIQUE(agent_run_id)
@@ -776,6 +784,9 @@ func (store *Store) MarkAgentCommandStarted(agentRunID int64) (Event, error) {
 	if _, err := tx.Exec("UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ?", "running", now, agentRunID); err != nil {
 		return Event{}, fmt.Errorf("mark AgentRun %d running: %w", agentRunID, err)
 	}
+	if _, err := tx.Exec("UPDATE runner_jobs SET status = ?, updated_at = ? WHERE id = ?", "running", now, detail.Workspace.RunnerJobID); err != nil {
+		return Event{}, fmt.Errorf("mark RunnerJob %d running: %w", detail.Workspace.RunnerJobID, err)
+	}
 	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
 		Type:           "agent_command.started",
 		OccurredAt:     now,
@@ -802,19 +813,36 @@ func (store *Store) MarkAgentCommandStarted(agentRunID int64) (Event, error) {
 
 // MarkAgentCommandCompleted records command output, terminal status, and completion Event.
 func (store *Store) MarkAgentCommandCompleted(agentRunID int64, completion workflow.AgentCommandCompletion) (AgentRunPrepareResult, error) {
-	status := "completed"
-	if completion.ExitCode != 0 {
-		status = "failed"
+	status := completion.Status
+	if status == "" {
+		status = "completed"
+		if completion.ExitCode != 0 {
+			status = "failed"
+		}
 	}
-	return store.finishAgentCommand(agentRunID, status, "agent_command.completed", completion)
+	return store.finishAgentCommand(agentRunID, status, agentCommandTerminalEventType(status), completion)
 }
 
 // MarkAgentCommandFailed records failure before the command process could start.
 func (store *Store) MarkAgentCommandFailed(agentRunID int64, failureMessage string) (AgentRunPrepareResult, error) {
 	return store.finishAgentCommand(agentRunID, "failed", "agent_command.failed", workflow.AgentCommandCompletion{
+		Status:        "failed",
 		ExitCode:      -1,
 		FailureDetail: failureMessage,
 	})
+}
+
+func agentCommandTerminalEventType(status string) string {
+	switch status {
+	case "failed":
+		return "agent_command.failed"
+	case "timed_out":
+		return "agent_command.timed_out"
+	case "cancelled":
+		return "agent_command.cancelled"
+	default:
+		return "agent_command.completed"
+	}
 }
 
 func (store *Store) finishAgentCommand(agentRunID int64, status string, eventType string, completion workflow.AgentCommandCompletion) (AgentRunPrepareResult, error) {
@@ -835,6 +863,9 @@ func (store *Store) finishAgentCommand(agentRunID int64, status string, eventTyp
 
 	if _, err := tx.Exec("UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ?", status, now, agentRunID); err != nil {
 		return AgentRunPrepareResult{}, fmt.Errorf("mark AgentRun %d %s: %w", agentRunID, status, err)
+	}
+	if _, err := tx.Exec("UPDATE runner_jobs SET status = ?, updated_at = ? WHERE id = ?", status, now, detail.Workspace.RunnerJobID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark RunnerJob %d %s: %w", detail.Workspace.RunnerJobID, status, err)
 	}
 	for _, segment := range completion.LogSegments {
 		if _, err := tx.Exec(`
@@ -908,7 +939,7 @@ INSERT INTO log_segments (
 		RunnerJob: RunnerJob{
 			ID:         workspace.RunnerJobID,
 			AgentRunID: agentRunID,
-			Status:     "ready",
+			Status:     status,
 			CreatedAt:  workspace.CreatedAt,
 			UpdatedAt:  now,
 		},
