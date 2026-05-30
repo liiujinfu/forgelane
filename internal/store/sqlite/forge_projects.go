@@ -18,6 +18,9 @@ import (
 // ErrWorkItemNotFound reports a missing cached WorkItem snapshot.
 var ErrWorkItemNotFound = errors.New("WorkItem not found")
 
+// ErrAgentRunNotFound reports a missing AgentRun current-state row.
+var ErrAgentRunNotFound = errors.New("AgentRun not found")
+
 // Store owns access to ForgeLane's instance-global SQLite database.
 type Store struct {
 	db *sql.DB
@@ -255,8 +258,12 @@ type WorkItem struct {
 
 // Event is a persisted audit event.
 type Event struct {
-	ID   int64
-	Type string
+	ID          int64
+	Type        string
+	OccurredAt  string
+	Actor       string
+	SubjectType string
+	SubjectRef  string
 }
 
 // WorkItemImportResult is the outcome of an atomic WorkItem import.
@@ -289,6 +296,13 @@ type AgentRunCreateResult struct {
 	RunSpec       RunSpec
 	Branch        string
 	Events        []Event
+}
+
+// AgentRunDetail is the read model for inspecting one AgentRun.
+type AgentRunDetail struct {
+	AgentRun AgentRun
+	WorkItem WorkItem
+	RunSpec  RunSpec
 }
 
 // ControlAction is a persisted operator request to change the delivery loop.
@@ -524,6 +538,110 @@ WHERE `
 		return WorkItem{}, fmt.Errorf("query WorkItem: %w", err)
 	}
 	return workItem, nil
+}
+
+// GetAgentRunDetail returns current state for one AgentRun and its immutable RunSpec.
+func (store *Store) GetAgentRunDetail(id int64) (AgentRunDetail, error) {
+	const query = `
+SELECT
+	agent_runs.id,
+	agent_runs.work_item_id,
+	agent_runs.status,
+	agent_runs.created_at,
+	agent_runs.updated_at,
+	work_items.id,
+	work_items.forge_project_id,
+	work_items.provider_ref,
+	work_items.provider,
+	work_items.repository_ref,
+	work_items.provider_issue_number,
+	work_items.title,
+	work_items.body,
+	work_items.status,
+	work_items.provider_status_raw,
+	work_items.url,
+	work_items.provider_updated_at,
+	work_items.imported_at,
+	work_items.refreshed_at,
+	run_specs.id,
+	run_specs.agent_run_id,
+	run_specs.spec_json,
+	run_specs.created_at
+FROM agent_runs
+JOIN work_items ON work_items.id = agent_runs.work_item_id
+JOIN run_specs ON run_specs.agent_run_id = agent_runs.id
+WHERE agent_runs.id = ?`
+
+	var detail AgentRunDetail
+	err := store.db.QueryRow(query, id).Scan(
+		&detail.AgentRun.ID,
+		&detail.AgentRun.WorkItemID,
+		&detail.AgentRun.Status,
+		&detail.AgentRun.CreatedAt,
+		&detail.AgentRun.UpdatedAt,
+		&detail.WorkItem.ID,
+		&detail.WorkItem.ForgeProjectID,
+		&detail.WorkItem.ProviderRef,
+		&detail.WorkItem.Provider,
+		&detail.WorkItem.RepositoryRef,
+		&detail.WorkItem.ProviderIssueNumber,
+		&detail.WorkItem.Title,
+		&detail.WorkItem.Body,
+		&detail.WorkItem.Status,
+		&detail.WorkItem.ProviderStatusRaw,
+		&detail.WorkItem.URL,
+		&detail.WorkItem.ProviderUpdatedAt,
+		&detail.WorkItem.ImportedAt,
+		&detail.WorkItem.RefreshedAt,
+		&detail.RunSpec.ID,
+		&detail.RunSpec.AgentRunID,
+		&detail.RunSpec.SpecJSON,
+		&detail.RunSpec.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return AgentRunDetail{}, fmt.Errorf("%w: %d", ErrAgentRunNotFound, id)
+	}
+	if err != nil {
+		return AgentRunDetail{}, fmt.Errorf("query AgentRun detail: %w", err)
+	}
+	return detail, nil
+}
+
+// ListEventsForAgentRun returns the audit timeline for one AgentRun in append order.
+func (store *Store) ListEventsForAgentRun(agentRunID int64) ([]Event, error) {
+	if _, err := store.GetAgentRunDetail(agentRunID); err != nil {
+		return nil, err
+	}
+
+	rows, err := store.db.Query(`
+SELECT id, type, occurred_at, actor, subject_type, subject_ref
+FROM events
+WHERE agent_run_id = ?
+ORDER BY id ASC`, agentRunID)
+	if err != nil {
+		return nil, fmt.Errorf("query Events for AgentRun %d: %w", agentRunID, err)
+	}
+	defer rows.Close()
+
+	var events []Event
+	for rows.Next() {
+		var event Event
+		if err := rows.Scan(
+			&event.ID,
+			&event.Type,
+			&event.OccurredAt,
+			&event.Actor,
+			&event.SubjectType,
+			&event.SubjectRef,
+		); err != nil {
+			return nil, fmt.Errorf("scan Event for AgentRun %d: %w", agentRunID, err)
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate Events for AgentRun %d: %w", agentRunID, err)
+	}
+	return events, nil
 }
 
 // CreateAgentRun creates one planned AgentRun and its immutable RunSpec.

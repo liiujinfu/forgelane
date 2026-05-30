@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 
 	githubprovider "github.com/liiujinfu/forgelane/internal/provider/github"
 	store "github.com/liiujinfu/forgelane/internal/store/sqlite"
@@ -20,6 +22,7 @@ func newRunsCommand(stdout io.Writer, provider workitems.Provider) *cobra.Comman
 		Short: "Create and inspect AgentRuns.",
 	}
 	cmd.AddCommand(newRunsCreateCommand(stdout, provider))
+	cmd.AddCommand(newRunsShowCommand(stdout))
 	return cmd
 }
 
@@ -89,4 +92,82 @@ func printCreatedAgentRun(stdout io.Writer, workItem store.WorkItem, result stor
 		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
 		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
 	}
+}
+
+func newRunsShowCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "show <run_id>",
+		Short: "Show AgentRun detail from local state.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+
+			instanceStore, err := openReadOnlyStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			detail, err := instanceStore.GetAgentRunDetail(runID)
+			if err != nil {
+				return err
+			}
+			return printAgentRunDetail(stdout, detail)
+		},
+	}
+}
+
+func parseAgentRunID(input string) (int64, error) {
+	runID, err := strconv.ParseInt(input, 10, 64)
+	if err != nil || runID <= 0 {
+		return 0, fmt.Errorf("invalid AgentRun id: %s", input)
+	}
+	return runID, nil
+}
+
+func printAgentRunDetail(stdout io.Writer, detail store.AgentRunDetail) error {
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(detail.RunSpec.SpecJSON), &spec); err != nil {
+		return fmt.Errorf("decode RunSpec %d: %w", detail.RunSpec.ID, err)
+	}
+
+	fmt.Fprintf(stdout, "AgentRun %d\n", detail.AgentRun.ID)
+	fmt.Fprintf(stdout, "WorkItem: %s\n", detail.WorkItem.ProviderRef)
+	fmt.Fprintf(stdout, "Status: %s\n", detail.AgentRun.Status)
+	fmt.Fprintf(stdout, "Created: %s\n", detail.AgentRun.CreatedAt)
+	fmt.Fprintf(stdout, "Updated: %s\n", detail.AgentRun.UpdatedAt)
+	fmt.Fprintf(stdout, "RunSpec ID: %d\n", detail.RunSpec.ID)
+	fmt.Fprintf(stdout, "Branch: %s\n", stringField(spec, "branch"))
+	fmt.Fprintf(stdout, "Repository: %s\n", nestedStringField(spec, "repo", "ref"))
+	fmt.Fprintf(stdout, "AgentAdapter: %s\n", agentAdapterSummary(spec))
+	return nil
+}
+
+func stringField(values map[string]any, key string) string {
+	value, _ := values[key].(string)
+	return value
+}
+
+func nestedStringField(values map[string]any, parent string, key string) string {
+	child, ok := values[parent].(map[string]any)
+	if !ok {
+		return ""
+	}
+	return stringField(child, key)
+}
+
+func agentAdapterSummary(spec map[string]any) string {
+	agentAdapter, ok := spec["agent_adapter"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	kind := stringField(agentAdapter, "kind")
+	preset := stringField(agentAdapter, "preset")
+	if preset == "" {
+		return kind
+	}
+	return fmt.Sprintf("%s preset=%s", kind, preset)
 }
