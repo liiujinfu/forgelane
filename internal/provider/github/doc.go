@@ -1,2 +1,2 @@
-// Package github marks the future GitHub provider implementation boundary.
+// Package github contains GitHub provider implementation boundaries.
 package github

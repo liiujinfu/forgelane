@@ -1,2 +1,2 @@
-// Package command marks the future generic command agent adapter boundary.
+// Package command marks the generic command agent adapter boundary.
 package command
