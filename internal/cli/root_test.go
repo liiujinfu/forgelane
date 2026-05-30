@@ -656,6 +656,196 @@ func TestRunsCreateResolvesIssueNumberThroughCurrentForgeProject(t *testing.T) {
 	assertTableCount(t, homeDir, "run_specs", 1)
 }
 
+func TestRunsShowDisplaysAgentRunDetailFromLocalState(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Show AgentRun detail",
+			Body:                "Read the AgentRun state spine from SQLite.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	createStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	runID := extractCreatedAgentRunID(t, createStdout)
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "show", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs show to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"AgentRun 1",
+		"WorkItem: github://github.com/owner/repo/issues/123",
+		"Status: planned",
+		"Created:",
+		"Updated:",
+		"RunSpec ID:",
+		"Branch: forgelane/issue-123",
+		"Repository: github://github.com/owner/repo",
+		"AgentAdapter: command",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected runs show output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if fakeProvider.calls != 1 {
+		t.Fatalf("expected runs show to read local state without provider calls, got %d calls", fakeProvider.calls)
+	}
+}
+
+func TestEventsListRunDisplaysOrderedAgentRunTimeline(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "List AgentRun events",
+			Body:                "Display the run timeline from SQLite Events.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	createStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	runID := extractCreatedAgentRunID(t, createStdout)
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "events", "list", "--run", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected events list to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Events for AgentRun 1",
+		"control_action.succeeded",
+		"agent_run.created",
+		"run_spec.created",
+		"Subject:",
+		"Occurred:",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected events list output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "work_item.imported") {
+		t.Fatalf("expected events list --run to omit WorkItem-only events, got:\n%s", stdout)
+	}
+	assertInOrder(t, stdout, []string{
+		"control_action.succeeded",
+		"agent_run.created",
+		"run_spec.created",
+	})
+	if fakeProvider.calls != 1 {
+		t.Fatalf("expected events list to read local state without provider calls, got %d calls", fakeProvider.calls)
+	}
+}
+
+func TestRunReadCommandsReturnClearErrorsForInvalidAndUnknownRunIDs(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Clear missing run errors",
+			Body:                "Missing runs should fail clearly.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected runs create to initialize state: %v\nstderr:\n%s", err, stderr)
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "runs show invalid id",
+			args: []string{"runs", "show", "abc"},
+			want: "invalid AgentRun id: abc",
+		},
+		{
+			name: "events list invalid id",
+			args: []string{"events", "list", "--run", "abc"},
+			want: "invalid AgentRun id: abc",
+		},
+		{
+			name: "runs show unknown id",
+			args: []string{"runs", "show", "999"},
+			want: "AgentRun not found: 999",
+		},
+		{
+			name: "events list unknown id",
+			args: []string{"events", "list", "--run", "999"},
+			want: "AgentRun not found: 999",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, err := executeForTestWithOptions(t, Options{
+				WorkItemProvider: fakeProvider,
+			}, tc.args...)
+			if err == nil {
+				t.Fatal("expected command to fail")
+			}
+			if stdout != "" {
+				t.Fatalf("expected no stdout, got %q", stdout)
+			}
+			if !strings.Contains(stderr, tc.want) {
+				t.Fatalf("expected stderr to contain %q, got:\n%s", tc.want, stderr)
+			}
+		})
+	}
+}
+
 func TestRunsCreateIssueNumberFailsWithoutCurrentForgeProject(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -1261,6 +1451,40 @@ func openStateDB(t *testing.T, homeDir string) *sql.DB {
 		t.Fatalf("open ForgeLane database: %v", err)
 	}
 	return db
+}
+
+func extractCreatedAgentRunID(t *testing.T, stdout string) int64 {
+	t.Helper()
+
+	for _, line := range strings.Split(stdout, "\n") {
+		idText, ok := strings.CutPrefix(line, "Created AgentRun ")
+		if !ok {
+			continue
+		}
+		id, err := strconv.ParseInt(idText, 10, 64)
+		if err != nil {
+			t.Fatalf("parse created AgentRun id from %q: %v", line, err)
+		}
+		return id
+	}
+	t.Fatalf("created AgentRun id not found in output:\n%s", stdout)
+	return 0
+}
+
+func assertInOrder(t *testing.T, text string, values []string) {
+	t.Helper()
+
+	previous := -1
+	for _, value := range values {
+		index := strings.Index(text, value)
+		if index == -1 {
+			t.Fatalf("expected %q in text:\n%s", value, text)
+		}
+		if index <= previous {
+			t.Fatalf("expected %q to appear after previous value in text:\n%s", value, text)
+		}
+		previous = index
+	}
 }
 
 type recordingWorkItemProvider struct {

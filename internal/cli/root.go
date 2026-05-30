@@ -49,6 +49,7 @@ func NewRootCommand(options Options) *cobra.Command {
 	root.AddCommand(newVersionCommand(stdout))
 	root.AddCommand(newWorkItemsCommand(stdout, options.WorkItemProvider))
 	root.AddCommand(newRunsCommand(stdout, options.WorkItemProvider))
+	root.AddCommand(newEventsCommand(stdout))
 
 	return root
 }
