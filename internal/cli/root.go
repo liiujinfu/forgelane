@@ -8,13 +8,15 @@ import (
 
 	"github.com/liiujinfu/forgelane/internal/repositoryconfig"
 	"github.com/liiujinfu/forgelane/internal/version"
+	"github.com/liiujinfu/forgelane/internal/workitems"
 	"github.com/spf13/cobra"
 )
 
 // Options configures the root command's process edges.
 type Options struct {
-	Stdout io.Writer
-	Stderr io.Writer
+	Stdout           io.Writer
+	Stderr           io.Writer
+	WorkItemProvider workitems.Provider
 }
 
 // NewRootCommand constructs the ForgeLane CLI command tree.
@@ -45,6 +47,7 @@ func NewRootCommand(options Options) *cobra.Command {
 
 	root.AddCommand(newInitCommand(stdout))
 	root.AddCommand(newVersionCommand(stdout))
+	root.AddCommand(newWorkItemsCommand(stdout, options.WorkItemProvider))
 
 	return root
 }

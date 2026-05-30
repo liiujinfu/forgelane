@@ -48,7 +48,7 @@ func Configure(options InitOptions) (ForgeProject, error) {
 		return ForgeProject{}, err
 	}
 
-	dbPath, err := stateDBPath(options.DBPath)
+	dbPath, err := StateDBPath(options.DBPath)
 	if err != nil {
 		return ForgeProject{}, err
 	}
@@ -115,7 +115,32 @@ func forgeProjectFromOptions(options InitOptions) (ForgeProject, error) {
 	}, nil
 }
 
-func stateDBPath(explicitPath string) (string, error) {
+// InferForgeProjectFromOrigin returns the ForgeProject implied by a directory's origin remote.
+func InferForgeProjectFromOrigin(workingDir string) (ForgeProject, error) {
+	if workingDir == "" {
+		var err error
+		workingDir, err = os.Getwd()
+		if err != nil {
+			return ForgeProject{}, fmt.Errorf("resolve working directory: %w", err)
+		}
+	}
+	originURL, err := originRemoteURL(workingDir)
+	if err != nil {
+		return ForgeProject{}, err
+	}
+	repoPath, err := parseGitHubURL(originURL)
+	if err != nil {
+		return ForgeProject{}, err
+	}
+	return ForgeProject{
+		Provider: "github",
+		BaseURL:  "https://github.com",
+		Path:     repoPath,
+	}, nil
+}
+
+// StateDBPath returns the ForgeLane instance-global SQLite path.
+func StateDBPath(explicitPath string) (string, error) {
 	if explicitPath != "" {
 		return explicitPath, nil
 	}

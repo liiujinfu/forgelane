@@ -102,7 +102,18 @@ Inspect the current CLI surface:
 go run ./cmd/forgelane --help
 go run ./cmd/forgelane version
 go run ./cmd/forgelane init --repo-url https://github.com/owner/repo
+go run ./cmd/forgelane work-items import github://github.com/owner/repo/issues/123
+go run ./cmd/forgelane work-items show github://github.com/owner/repo/issues/123
+go run ./cmd/forgelane work-items show --issue 123
+go run ./cmd/forgelane work-items show --id 1
 ```
+
+`work-items import` records a cached provider issue snapshot in the
+instance-global SQLite store at `~/.forgelane/forgelane.db` and appends a
+compact audit Event. `work-items show` reads only that local snapshot; run
+`work-items import` again to refresh provider state explicitly. The default test
+suite uses fake WorkItem providers and does not require network access or
+credentials.
 
 ## Agent Development Workflow
 
