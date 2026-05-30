@@ -106,11 +106,112 @@ type AgentRunCreateResult struct {
 	Events        []Event
 }
 
+// RunnerJob is the runner-facing execution request for one AgentRun.
+type RunnerJob struct {
+	ID         int64
+	AgentRunID int64
+	Status     string
+	CreatedAt  string
+	UpdatedAt  string
+}
+
+// WorkspacePaths are the filesystem paths leased for one Workspace.
+type WorkspacePaths struct {
+	Root      string
+	Repo      string
+	Logs      string
+	Artifacts string
+	Tmp       string
+}
+
+// Workspace is the persisted execution filesystem lease for one AgentRun.
+type Workspace struct {
+	ID             int64
+	AgentRunID     int64
+	RunnerJobID    int64
+	Status         string
+	Paths          WorkspacePaths
+	FailureMessage string
+	CreatedAt      string
+	UpdatedAt      string
+}
+
+// AgentRunPrepareResult is the outcome of preparing runner state for execution.
+type AgentRunPrepareResult struct {
+	AgentRun  AgentRun
+	RunnerJob RunnerJob
+	Workspace Workspace
+	Events    []Event
+}
+
+// AgentRunDetail is the read model for inspecting one AgentRun.
+type AgentRunDetail struct {
+	AgentRun  AgentRun
+	WorkItem  WorkItemSnapshot
+	RunSpec   RunSpec
+	Workspace *Workspace
+}
+
 // ControlAction is a persisted operator request to change the delivery loop.
 type ControlAction struct {
 	ID     int64
 	Type   string
 	Status string
+}
+
+// WorkspacePreparationStore persists Workspace preparation state.
+type WorkspacePreparationStore interface {
+	GetAgentRunDetail(int64) (AgentRunDetail, error)
+	AllocateWorkspace(int64, WorkspacePaths) (AgentRunPrepareResult, error)
+	MarkWorkspaceReady(int64) (AgentRunPrepareResult, error)
+	MarkWorkspaceFailed(int64, string) (AgentRunPrepareResult, error)
+}
+
+// WorkspacePreparer performs filesystem preparation after the Workspace is allocated.
+type WorkspacePreparer interface {
+	PrepareWorkspace(WorkspacePreparation) error
+}
+
+// WorkspacePreparation is the filesystem preparation request chosen by workflow.
+type WorkspacePreparation struct {
+	Paths                 WorkspacePaths
+	ExpectedRepositoryRef string
+}
+
+// PrepareAgentRunWorkspace leases and prepares the Workspace for an existing AgentRun.
+func PrepareAgentRunWorkspace(store WorkspacePreparationStore, preparer WorkspacePreparer, runID int64, paths WorkspacePaths) (AgentRunPrepareResult, error) {
+	allocated, err := store.AllocateWorkspace(runID, paths)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	detail, err := store.GetAgentRunDetail(runID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if err := preparer.PrepareWorkspace(WorkspacePreparation{
+		Paths:                 paths,
+		ExpectedRepositoryRef: detail.WorkItem.RepositoryRef,
+	}); err != nil {
+		if _, markErr := store.MarkWorkspaceFailed(runID, compactFailure(err)); markErr != nil {
+			return AgentRunPrepareResult{}, fmt.Errorf("prepare Workspace repository: %w; mark Workspace failed: %v", err, markErr)
+		}
+		return AgentRunPrepareResult{}, fmt.Errorf("prepare Workspace repository: %w", err)
+	}
+	ready, err := store.MarkWorkspaceReady(runID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	ready.Events = append(allocated.Events, ready.Events...)
+	return ready, nil
+}
+
+func compactFailure(err error) string {
+	const limit = 500
+	message := err.Error()
+	if len(message) <= limit {
+		return message
+	}
+	return message[:limit] + "..."
 }
 
 // CreatePlannedAgentRun creates a planned AgentRun through the transactional store Adapter.

@@ -777,6 +777,216 @@ func TestEventsListRunDisplaysOrderedAgentRunTimeline(t *testing.T) {
 	}
 }
 
+func TestRunsPrepareCreatesWorkspaceAndShowsState(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Prepare a Workspace",
+			Body:                "Lease an isolated workspace before agent execution.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	createStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	runID := extractCreatedAgentRunID(t, createStdout)
+
+	prepareStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "prepare", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs prepare to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+
+	workspaceRoot := filepath.Join(homeDir, ".forgelane", "workspaces", "run-1")
+	for _, want := range []string{
+		"Prepared AgentRun 1",
+		"RunnerJob ID:",
+		"Workspace ID:",
+		"Workspace: " + workspaceRoot,
+		"Status: ready",
+	} {
+		if !strings.Contains(prepareStdout, want) {
+			t.Fatalf("expected runs prepare output to contain %q, got:\n%s", want, prepareStdout)
+		}
+	}
+
+	for _, dir := range []string{"repo", "logs", "artifacts", "tmp"} {
+		path := filepath.Join(workspaceRoot, dir)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("expected workspace directory %s: %v", path, err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("expected %s to be a directory", path)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(workspaceRoot, "repo", "README.md")); err != nil {
+		t.Fatalf("expected repository preparation under repo/: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspaceRoot, "README.md")); !os.IsNotExist(err) {
+		t.Fatalf("expected repository files to stay under repo/, stat err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workingDir, ".git", "worktrees")); !os.IsNotExist(err) {
+		t.Fatalf("expected source repository metadata not to gain worktrees, stat err: %v", err)
+	}
+
+	showStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "show", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs show to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Status: preparing",
+		"Workspace status: ready",
+		"Workspace: " + workspaceRoot,
+		"Workspace repo: " + filepath.Join(workspaceRoot, "repo"),
+	} {
+		if !strings.Contains(showStdout, want) {
+			t.Fatalf("expected runs show output to contain %q, got:\n%s", want, showStdout)
+		}
+	}
+
+	eventsStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "events", "list", "--run", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected events list to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	assertInOrder(t, eventsStdout, []string{
+		"agent_run.created",
+		"workspace.allocated",
+		"workspace.prepared",
+	})
+
+	assertTableCount(t, homeDir, "runner_jobs", 1)
+	assertTableCount(t, homeDir, "workspaces", 1)
+}
+
+func TestRunsPrepareFailureRetainsFailedWorkspaceState(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Retain failed Workspace",
+			Body:                "Preparation failures should be auditable.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	createStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	runID := extractCreatedAgentRunID(t, createStdout)
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "prepare", strconv.FormatInt(runID, 10))
+	if err == nil {
+		t.Fatal("expected runs prepare to fail outside a Git repository")
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "prepare Workspace repository:") {
+		t.Fatalf("expected checkout preparation failure, got:\n%s", stderr)
+	}
+
+	workspaceRoot := filepath.Join(homeDir, ".forgelane", "workspaces", "run-1")
+	for _, dir := range []string{"logs", "artifacts", "tmp"} {
+		path := filepath.Join(workspaceRoot, dir)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("expected retained workspace directory %s: %v", path, err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("expected %s to be a directory", path)
+		}
+	}
+
+	showStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "show", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs show to succeed after failed prepare: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Status: failed",
+		"Workspace status: failed",
+		"Workspace: " + workspaceRoot,
+	} {
+		if !strings.Contains(showStdout, want) {
+			t.Fatalf("expected runs show output to contain %q, got:\n%s", want, showStdout)
+		}
+	}
+
+	eventsStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "events", "list", "--run", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected events list to succeed after failed prepare: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	assertInOrder(t, eventsStdout, []string{
+		"workspace.allocated",
+		"workspace.prepare_failed",
+	})
+	assertTableCount(t, homeDir, "runner_jobs", 1)
+	assertTableCount(t, homeDir, "workspaces", 1)
+}
+
 func TestRunReadCommandsReturnClearErrorsForInvalidAndUnknownRunIDs(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()

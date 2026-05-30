@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strconv"
 
 	githubprovider "github.com/liiujinfu/forgelane/internal/provider/github"
+	"github.com/liiujinfu/forgelane/internal/repositoryconfig"
+	"github.com/liiujinfu/forgelane/internal/runner"
 	store "github.com/liiujinfu/forgelane/internal/store/sqlite"
 	"github.com/liiujinfu/forgelane/internal/workflow"
 	"github.com/liiujinfu/forgelane/internal/workitems"
@@ -24,6 +27,7 @@ func newRunsCommand(stdout io.Writer, provider workitems.Provider) *cobra.Comman
 	}
 	cmd.AddCommand(newRunsCreateCommand(stdout, provider))
 	cmd.AddCommand(newRunsShowCommand(stdout))
+	cmd.AddCommand(newRunsPrepareCommand(stdout))
 	return cmd
 }
 
@@ -97,6 +101,65 @@ func printCreatedAgentRun(stdout io.Writer, workItem store.WorkItem, result work
 	}
 }
 
+func newRunsPrepareCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "prepare <run_id>",
+		Short: "Lease a Workspace and prepare its repository checkout.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+
+			instanceStore, err := openInitializedStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			paths, err := workspacePathsForRun(runID)
+			if err != nil {
+				return err
+			}
+			result, err := workflow.PrepareAgentRunWorkspace(instanceStore, runner.LocalWorkspacePreparer{}, runID, paths)
+			if err != nil {
+				return err
+			}
+			printPreparedAgentRun(stdout, result)
+			return nil
+		},
+	}
+}
+
+func workspacePathsForRun(runID int64) (store.WorkspacePaths, error) {
+	dbPath, err := repositoryconfig.StateDBPath("")
+	if err != nil {
+		return store.WorkspacePaths{}, err
+	}
+	root := filepath.Join(filepath.Dir(dbPath), "workspaces", fmt.Sprintf("run-%d", runID))
+	return store.WorkspacePaths{
+		Root:      root,
+		Repo:      filepath.Join(root, "repo"),
+		Logs:      filepath.Join(root, "logs"),
+		Artifacts: filepath.Join(root, "artifacts"),
+		Tmp:       filepath.Join(root, "tmp"),
+	}, nil
+}
+
+func printPreparedAgentRun(stdout io.Writer, result store.AgentRunPrepareResult) {
+	fmt.Fprintf(stdout, "Prepared AgentRun %d\n", result.AgentRun.ID)
+	fmt.Fprintf(stdout, "RunnerJob ID: %d\n", result.RunnerJob.ID)
+	fmt.Fprintf(stdout, "Workspace ID: %d\n", result.Workspace.ID)
+	fmt.Fprintf(stdout, "Workspace: %s\n", result.Workspace.Paths.Root)
+	fmt.Fprintf(stdout, "Repository: %s\n", result.Workspace.Paths.Repo)
+	fmt.Fprintf(stdout, "Status: %s\n", result.Workspace.Status)
+	for _, event := range result.Events {
+		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
+		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
+	}
+}
+
 func newRunsShowCommand(stdout io.Writer) *cobra.Command {
 	return &cobra.Command{
 		Use:   "show <run_id>",
@@ -146,6 +209,14 @@ func printAgentRunDetail(stdout io.Writer, detail store.AgentRunDetail) error {
 	fmt.Fprintf(stdout, "Branch: %s\n", stringField(spec, "branch"))
 	fmt.Fprintf(stdout, "Repository: %s\n", nestedStringField(spec, "repo", "ref"))
 	fmt.Fprintf(stdout, "AgentAdapter: %s\n", agentAdapterSummary(spec))
+	if detail.Workspace != nil {
+		fmt.Fprintf(stdout, "Workspace status: %s\n", detail.Workspace.Status)
+		fmt.Fprintf(stdout, "Workspace: %s\n", detail.Workspace.Paths.Root)
+		fmt.Fprintf(stdout, "Workspace repo: %s\n", detail.Workspace.Paths.Repo)
+		fmt.Fprintf(stdout, "Workspace logs: %s\n", detail.Workspace.Paths.Logs)
+		fmt.Fprintf(stdout, "Workspace artifacts: %s\n", detail.Workspace.Paths.Artifacts)
+		fmt.Fprintf(stdout, "Workspace tmp: %s\n", detail.Workspace.Paths.Tmp)
+	}
 	return nil
 }
 
