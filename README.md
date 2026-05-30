@@ -37,9 +37,9 @@ Teams need:
 ## v0 Direction
 
 The first version stays intentionally small and is tracked in
-[docs/roadmap/v0.md](docs/roadmap/v0.md). The current CLI has the first local
-repository configuration command; workflow commands will be added by later
-slices.
+[docs/roadmap/v0.md](docs/roadmap/v0.md). The current CLI has the first
+instance-global Forge project configuration command; workflow commands will be
+added by later slices.
 
 ## Architecture Bias
 

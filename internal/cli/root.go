@@ -69,7 +69,6 @@ func newInitCommand(stdout io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&options.RepoURL, "repo-url", "", "GitHub repository URL")
 	cmd.Flags().StringVar(&options.Provider, "provider", "", "WorkItem provider")
 	cmd.Flags().StringVar(&options.Repo, "repo", "", "Provider repository path")
-	cmd.Flags().BoolVar(&options.Force, "force", false, "Replace an existing ForgeProject config")
 
 	return cmd
 }

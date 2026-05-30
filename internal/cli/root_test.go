@@ -2,11 +2,15 @@ package cli
 
 import (
 	"bytes"
+	"database/sql"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func executeForTest(t *testing.T, args ...string) (string, string, error) {
@@ -97,7 +101,9 @@ func TestUnknownCommandWritesErrorToStderr(t *testing.T) {
 
 func TestInitWithRepoURLPersistsNormalizedGitHubForgeProject(t *testing.T) {
 	workingDir := t.TempDir()
+	homeDir := t.TempDir()
 	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
 
 	stdout, stderr, err := executeForTest(t, "init", "--repo-url", "https://github.com/owner/repo")
 	if err != nil {
@@ -110,21 +116,15 @@ func TestInitWithRepoURLPersistsNormalizedGitHubForgeProject(t *testing.T) {
 		t.Fatalf("expected init output to describe configured ForgeProject, got:\n%s", stdout)
 	}
 
-	configPath := filepath.Join(workingDir, ".forgelane", "repository.json")
-	got, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("expected repository config to be written: %v", err)
-	}
-
-	want := "{\n  \"forgeProject\": {\n    \"provider\": \"github\",\n    \"baseUrl\": \"https://github.com\",\n    \"path\": \"owner/repo\"\n  }\n}\n"
-	if string(got) != want {
-		t.Fatalf("unexpected repository config:\n%s", got)
-	}
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
 }
 
 func TestInitWithGitHubRepoShorthandPersistsSameForgeProject(t *testing.T) {
 	workingDir := t.TempDir()
+	homeDir := t.TempDir()
 	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
 
 	stdout, stderr, err := executeForTest(t, "init", "--provider", "github", "--repo", "owner/repo")
 	if err != nil {
@@ -137,23 +137,17 @@ func TestInitWithGitHubRepoShorthandPersistsSameForgeProject(t *testing.T) {
 		t.Fatalf("expected init output to describe configured ForgeProject, got:\n%s", stdout)
 	}
 
-	configPath := filepath.Join(workingDir, ".forgelane", "repository.json")
-	got, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("expected repository config to be written: %v", err)
-	}
-
-	want := "{\n  \"forgeProject\": {\n    \"provider\": \"github\",\n    \"baseUrl\": \"https://github.com\",\n    \"path\": \"owner/repo\"\n  }\n}\n"
-	if string(got) != want {
-		t.Fatalf("unexpected repository config:\n%s", got)
-	}
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
 }
 
 func TestInitInfersGitHubForgeProjectFromOriginRemote(t *testing.T) {
 	workingDir := t.TempDir()
+	homeDir := t.TempDir()
 	runGit(t, workingDir, "init")
 	runGit(t, workingDir, "remote", "add", "origin", "git@github.com:owner/repo.git")
 	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
 
 	stdout, stderr, err := executeForTest(t, "init", "--provider", "github")
 	if err != nil {
@@ -166,14 +160,8 @@ func TestInitInfersGitHubForgeProjectFromOriginRemote(t *testing.T) {
 		t.Fatalf("expected init output to describe configured ForgeProject, got:\n%s", stdout)
 	}
 
-	configPath := filepath.Join(workingDir, ".forgelane", "repository.json")
-	got, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("expected repository config to be written: %v", err)
-	}
-	if !strings.Contains(string(got), `"path": "owner/repo"`) {
-		t.Fatalf("expected origin-inferred repository config, got:\n%s", got)
-	}
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
 }
 
 func TestInitAcceptsSupportedGitHubRemoteURLForms(t *testing.T) {
@@ -191,7 +179,9 @@ func TestInitAcceptsSupportedGitHubRemoteURLForms(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			workingDir := t.TempDir()
+			homeDir := t.TempDir()
 			withWorkingDir(t, workingDir)
+			withHomeDir(t, homeDir)
 
 			_, stderr, err := executeForTest(t, "init", "--repo-url", tt.repoURL)
 			if err != nil {
@@ -201,14 +191,8 @@ func TestInitAcceptsSupportedGitHubRemoteURLForms(t *testing.T) {
 				t.Fatalf("expected no stderr, got %q", stderr)
 			}
 
-			configPath := filepath.Join(workingDir, ".forgelane", "repository.json")
-			got, err := os.ReadFile(configPath)
-			if err != nil {
-				t.Fatalf("expected repository config to be written: %v", err)
-			}
-			if !strings.Contains(string(got), `"path": "owner/repo"`) {
-				t.Fatalf("expected normalized repository path, got:\n%s", got)
-			}
+			assertNoRepoLocalConfig(t, workingDir)
+			assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
 		})
 	}
 }
@@ -228,6 +212,21 @@ func TestInitRejectsInvalidInputsWithClearErrors(t *testing.T) {
 			name:    "invalid repo ref",
 			args:    []string{"init", "--provider", "github", "--repo", "owner"},
 			wantErr: `invalid GitHub repository ref "owner"`,
+		},
+		{
+			name:    "repo ref with owner whitespace",
+			args:    []string{"init", "--provider", "github", "--repo", "bad owner/repo"},
+			wantErr: `invalid GitHub repository ref "bad owner/repo"`,
+		},
+		{
+			name:    "repo ref with repository whitespace",
+			args:    []string{"init", "--provider", "github", "--repo", "owner/bad repo"},
+			wantErr: `invalid GitHub repository ref "owner/bad repo"`,
+		},
+		{
+			name:    "repo ref with dot segment",
+			args:    []string{"init", "--provider", "github", "--repo", "owner/."},
+			wantErr: `invalid GitHub repository ref "owner/."`,
 		},
 		{
 			name:    "unsupported remote url",
@@ -254,6 +253,7 @@ func TestInitRejectsInvalidInputsWithClearErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			withWorkingDir(t, t.TempDir())
+			withHomeDir(t, t.TempDir())
 
 			stdout, stderr, err := executeForTest(t, tt.args...)
 			if err == nil {
@@ -275,6 +275,7 @@ func TestInitInferenceInspectsOnlyOrigin(t *testing.T) {
 	runGit(t, workingDir, "remote", "add", "origin", "https://gitlab.com/owner/repo")
 	runGit(t, workingDir, "remote", "add", "upstream", "https://github.com/owner/repo")
 	withWorkingDir(t, workingDir)
+	withHomeDir(t, t.TempDir())
 
 	stdout, stderr, err := executeForTest(t, "init", "--provider", "github")
 	if err == nil {
@@ -288,11 +289,35 @@ func TestInitInferenceInspectsOnlyOrigin(t *testing.T) {
 	}
 }
 
+func TestInitExplicitRepositoryWinsOverInferredOrigin(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/origin/repo")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	stdout, stderr, err := executeForTest(t, "init", "--provider", "github", "--repo", "explicit/repo")
+	if err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "Configured ForgeProject github://github.com/explicit/repo") {
+		t.Fatalf("expected init output to describe explicit ForgeProject, got:\n%s", stdout)
+	}
+
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"github://github.com/explicit/repo"})
+}
+
 func TestInitDoesNotInferOriginWithoutProvider(t *testing.T) {
 	workingDir := t.TempDir()
 	runGit(t, workingDir, "init")
 	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
 	withWorkingDir(t, workingDir)
+	withHomeDir(t, t.TempDir())
 
 	stdout, stderr, err := executeForTest(t, "init")
 	if err == nil {
@@ -308,7 +333,9 @@ func TestInitDoesNotInferOriginWithoutProvider(t *testing.T) {
 
 func TestInitIsIdempotentForMatchingForgeProject(t *testing.T) {
 	workingDir := t.TempDir()
+	homeDir := t.TempDir()
 	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
 
 	if _, stderr, err := executeForTest(t, "init", "--repo-url", "https://github.com/owner/repo"); err != nil {
 		t.Fatalf("expected first init to succeed: %v\nstderr:\n%s", err, stderr)
@@ -323,46 +350,37 @@ func TestInitIsIdempotentForMatchingForgeProject(t *testing.T) {
 	if !strings.Contains(stdout, "Configured ForgeProject github://github.com/owner/repo") {
 		t.Fatalf("expected init output to describe configured ForgeProject, got:\n%s", stdout)
 	}
+
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
 }
 
-func TestInitRejectsMismatchedExistingForgeProjectUnlessForced(t *testing.T) {
+func TestInitPersistsMultipleForgeProjectsInGlobalState(t *testing.T) {
 	workingDir := t.TempDir()
+	homeDir := t.TempDir()
 	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
 
 	if _, stderr, err := executeForTest(t, "init", "--repo-url", "https://github.com/owner/repo"); err != nil {
 		t.Fatalf("expected first init to succeed: %v\nstderr:\n%s", err, stderr)
 	}
 
 	stdout, stderr, err := executeForTest(t, "init", "--repo-url", "https://github.com/other/repo")
-	if err == nil {
-		t.Fatal("expected mismatched init to fail")
-	}
-	if stdout != "" {
-		t.Fatalf("expected no stdout, got %q", stdout)
-	}
-	if !strings.Contains(stderr, "repository config already points at github://github.com/owner/repo; pass --force to replace it") {
-		t.Fatalf("expected mismatch error, got:\n%s", stderr)
-	}
-
-	stdout, stderr, err = executeForTest(t, "init", "--repo-url", "https://github.com/other/repo", "--force")
 	if err != nil {
-		t.Fatalf("expected forced init to succeed: %v\nstderr:\n%s", err, stderr)
+		t.Fatalf("expected second ForgeProject init to succeed: %v\nstderr:\n%s", err, stderr)
 	}
 	if stderr != "" {
 		t.Fatalf("expected no stderr, got %q", stderr)
 	}
 	if !strings.Contains(stdout, "Configured ForgeProject github://github.com/other/repo") {
-		t.Fatalf("expected forced init output, got:\n%s", stdout)
+		t.Fatalf("expected second ForgeProject init output, got:\n%s", stdout)
 	}
 
-	configPath := filepath.Join(workingDir, ".forgelane", "repository.json")
-	got, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("expected repository config to be written: %v", err)
-	}
-	if !strings.Contains(string(got), `"path": "other/repo"`) {
-		t.Fatalf("expected forced replacement repository config, got:\n%s", got)
-	}
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{
+		"github://github.com/owner/repo",
+		"github://github.com/other/repo",
+	})
 }
 
 func withWorkingDir(t *testing.T, workingDir string) {
@@ -390,5 +408,56 @@ func runGit(t *testing.T, workingDir string, args ...string) {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
+	}
+}
+
+func withHomeDir(t *testing.T, homeDir string) {
+	t.Helper()
+
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+}
+
+func assertNoRepoLocalConfig(t *testing.T, workingDir string) {
+	t.Helper()
+
+	configPath := filepath.Join(workingDir, ".forgelane", "repository.json")
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Fatalf("expected no repo-local repository config at %s, stat err: %v", configPath, err)
+	}
+}
+
+func assertForgeProjects(t *testing.T, homeDir string, wantRefs []string) {
+	t.Helper()
+	wantRefs = slices.Clone(wantRefs)
+	slices.Sort(wantRefs)
+
+	dbPath := filepath.Join(homeDir, ".forgelane", "forgelane.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open ForgeLane database: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT provider_ref FROM forge_projects ORDER BY provider_ref")
+	if err != nil {
+		t.Fatalf("query ForgeProjects: %v", err)
+	}
+	defer rows.Close()
+
+	var got []string
+	for rows.Next() {
+		var providerRef string
+		if err := rows.Scan(&providerRef); err != nil {
+			t.Fatalf("scan ForgeProject: %v", err)
+		}
+		got = append(got, providerRef)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate ForgeProjects: %v", err)
+	}
+
+	if strings.Join(got, "\n") != strings.Join(wantRefs, "\n") {
+		t.Fatalf("unexpected ForgeProjects:\n got: %q\nwant: %q", got, wantRefs)
 	}
 }
