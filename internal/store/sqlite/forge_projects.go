@@ -174,6 +174,20 @@ CREATE TABLE IF NOT EXISTS workspaces (
 	UNIQUE(agent_run_id)
 );
 
+CREATE TABLE IF NOT EXISTS log_segments (
+	id INTEGER PRIMARY KEY,
+	agent_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+	stream TEXT NOT NULL CHECK(stream IN ('stdout', 'stderr')),
+	sequence INTEGER NOT NULL,
+	byte_start INTEGER NOT NULL,
+	byte_end INTEGER NOT NULL,
+	preview TEXT NOT NULL,
+	artifact_path TEXT NOT NULL,
+	truncated INTEGER NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL,
+	UNIQUE(agent_run_id, sequence)
+);
+
 CREATE TABLE IF NOT EXISTS control_actions (
 	id INTEGER PRIMARY KEY,
 	type TEXT NOT NULL,
@@ -218,7 +232,8 @@ CREATE INDEX IF NOT EXISTS idx_events_work_item_id ON events(work_item_id);
 CREATE INDEX IF NOT EXISTS idx_events_forge_project_id ON events(forge_project_id);
 CREATE INDEX IF NOT EXISTS idx_events_agent_run_id ON events(agent_run_id);
 CREATE INDEX IF NOT EXISTS idx_runner_jobs_agent_run_id ON runner_jobs(agent_run_id);
-CREATE INDEX IF NOT EXISTS idx_workspaces_agent_run_id ON workspaces(agent_run_id);`
+CREATE INDEX IF NOT EXISTS idx_workspaces_agent_run_id ON workspaces(agent_run_id);
+CREATE INDEX IF NOT EXISTS idx_log_segments_agent_run_id ON log_segments(agent_run_id, sequence);`
 
 	if _, err := store.db.Exec(schema); err != nil {
 		return fmt.Errorf("initialize ForgeLane database schema: %w", err)
@@ -288,6 +303,9 @@ type WorkspacePaths = workflow.WorkspacePaths
 
 // Workspace is the persisted execution filesystem lease for one AgentRun.
 type Workspace = workflow.Workspace
+
+// LogSegment indexes one stdout/stderr range in a Workspace log file.
+type LogSegment = workflow.LogSegment
 
 // RunSpec is the immutable execution input snapshot for one AgentRun.
 type RunSpec = workflow.RunSpec
@@ -680,6 +698,230 @@ ORDER BY id ASC`, agentRunID)
 		return nil, fmt.Errorf("iterate Events for AgentRun %d: %w", agentRunID, err)
 	}
 	return events, nil
+}
+
+// ListLogSegmentsForAgentRun returns persisted log segment indexes in stream order.
+func (store *Store) ListLogSegmentsForAgentRun(agentRunID int64, stream string) ([]LogSegment, error) {
+	if _, err := store.GetAgentRunDetail(agentRunID); err != nil {
+		return nil, err
+	}
+
+	query := `
+SELECT id, agent_run_id, stream, sequence, byte_start, byte_end, preview, artifact_path, truncated, created_at
+FROM log_segments
+WHERE agent_run_id = ?`
+	args := []any{agentRunID}
+	if stream != "" {
+		query += " AND stream = ?"
+		args = append(args, stream)
+	}
+	query += " ORDER BY sequence ASC"
+
+	rows, err := store.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query LogSegments for AgentRun %d: %w", agentRunID, err)
+	}
+	defer rows.Close()
+
+	var segments []LogSegment
+	for rows.Next() {
+		var segment LogSegment
+		var truncated int
+		if err := rows.Scan(
+			&segment.ID,
+			&segment.AgentRunID,
+			&segment.Stream,
+			&segment.Sequence,
+			&segment.ByteStart,
+			&segment.ByteEnd,
+			&segment.Preview,
+			&segment.ArtifactPath,
+			&truncated,
+			&segment.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan LogSegment for AgentRun %d: %w", agentRunID, err)
+		}
+		segment.Truncated = truncated != 0
+		segments = append(segments, segment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate LogSegments for AgentRun %d: %w", agentRunID, err)
+	}
+	return segments, nil
+}
+
+// MarkAgentCommandStarted records the transition into local command execution.
+func (store *Store) MarkAgentCommandStarted(agentRunID int64) (Event, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return Event{}, err
+	}
+	if detail.Workspace == nil {
+		return Event{}, fmt.Errorf("Workspace not prepared for AgentRun %d", agentRunID)
+	}
+	if detail.AgentRun.Status != "preparing" {
+		return Event{}, fmt.Errorf("AgentRun %d is %s; expected preparing", agentRunID, detail.AgentRun.Status)
+	}
+	if detail.Workspace.Status != "ready" {
+		return Event{}, fmt.Errorf("Workspace for AgentRun %d is %s; expected ready", agentRunID, detail.Workspace.Status)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return Event{}, fmt.Errorf("begin Agent command start transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ?", "running", now, agentRunID); err != nil {
+		return Event{}, fmt.Errorf("mark AgentRun %d running: %w", agentRunID, err)
+	}
+	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:           "agent_command.started",
+		OccurredAt:     now,
+		ForgeProjectID: detail.WorkItem.ForgeProjectID,
+		SubjectType:    "agent_run",
+		SubjectRef:     fmt.Sprintf("agent_run:%d", agentRunID),
+		WorkItemID:     detail.WorkItem.ID,
+		WorkItemRef:    detail.WorkItem.ProviderRef,
+		AgentRunID:     agentRunID,
+		Payload: map[string]any{
+			"agent_run_id":  agentRunID,
+			"runner_job_id": detail.Workspace.RunnerJobID,
+			"workspace_id":  detail.Workspace.ID,
+		},
+	})
+	if err != nil {
+		return Event{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Event{}, fmt.Errorf("commit Agent command start: %w", err)
+	}
+	return event, nil
+}
+
+// MarkAgentCommandCompleted records command output, terminal status, and completion Event.
+func (store *Store) MarkAgentCommandCompleted(agentRunID int64, completion workflow.AgentCommandCompletion) (AgentRunPrepareResult, error) {
+	status := "completed"
+	if completion.ExitCode != 0 {
+		status = "failed"
+	}
+	return store.finishAgentCommand(agentRunID, status, "agent_command.completed", completion)
+}
+
+// MarkAgentCommandFailed records failure before the command process could start.
+func (store *Store) MarkAgentCommandFailed(agentRunID int64, failureMessage string) (AgentRunPrepareResult, error) {
+	return store.finishAgentCommand(agentRunID, "failed", "agent_command.failed", workflow.AgentCommandCompletion{
+		ExitCode:      -1,
+		FailureDetail: failureMessage,
+	})
+}
+
+func (store *Store) finishAgentCommand(agentRunID int64, status string, eventType string, completion workflow.AgentCommandCompletion) (AgentRunPrepareResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if detail.Workspace == nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("Workspace not prepared for AgentRun %d", agentRunID)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("begin Agent command completion transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ?", status, now, agentRunID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark AgentRun %d %s: %w", agentRunID, status, err)
+	}
+	for _, segment := range completion.LogSegments {
+		if _, err := tx.Exec(`
+INSERT INTO log_segments (
+	agent_run_id,
+	stream,
+	sequence,
+	byte_start,
+	byte_end,
+	preview,
+	artifact_path,
+	truncated,
+	created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			agentRunID,
+			segment.Stream,
+			segment.Sequence,
+			segment.ByteStart,
+			segment.ByteEnd,
+			segment.Preview,
+			segment.ArtifactPath,
+			boolInt(segment.Truncated),
+			now,
+		); err != nil {
+			return AgentRunPrepareResult{}, fmt.Errorf("insert LogSegment for AgentRun %d: %w", agentRunID, err)
+		}
+	}
+
+	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:           eventType,
+		OccurredAt:     now,
+		ForgeProjectID: detail.WorkItem.ForgeProjectID,
+		SubjectType:    "agent_run",
+		SubjectRef:     fmt.Sprintf("agent_run:%d", agentRunID),
+		WorkItemID:     detail.WorkItem.ID,
+		WorkItemRef:    detail.WorkItem.ProviderRef,
+		AgentRunID:     agentRunID,
+		Payload: map[string]any{
+			"agent_run_id":   agentRunID,
+			"runner_job_id":  detail.Workspace.RunnerJobID,
+			"workspace_id":   detail.Workspace.ID,
+			"status":         status,
+			"exit_code":      completion.ExitCode,
+			"success":        status == "completed",
+			"duration_ms":    completion.Duration.Milliseconds(),
+			"stdout_bytes":   completion.StdoutBytes,
+			"stderr_bytes":   completion.StderrBytes,
+			"log_segments":   len(completion.LogSegments),
+			"failure_detail": completion.FailureDetail,
+			"stdout_preview": "",
+			"stderr_preview": "",
+			"provider_ref":   detail.WorkItem.ProviderRef,
+		},
+	})
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("commit Agent command completion: %w", err)
+	}
+
+	workspace := *detail.Workspace
+	return AgentRunPrepareResult{
+		AgentRun: AgentRun{
+			ID:         detail.AgentRun.ID,
+			WorkItemID: detail.AgentRun.WorkItemID,
+			Status:     status,
+			CreatedAt:  detail.AgentRun.CreatedAt,
+			UpdatedAt:  now,
+		},
+		RunnerJob: RunnerJob{
+			ID:         workspace.RunnerJobID,
+			AgentRunID: agentRunID,
+			Status:     "ready",
+			CreatedAt:  workspace.CreatedAt,
+			UpdatedAt:  now,
+		},
+		Workspace: workspace,
+		Events:    []Event{event},
+	}, nil
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // AllocateWorkspace creates runner preparation state and records the Workspace lease.

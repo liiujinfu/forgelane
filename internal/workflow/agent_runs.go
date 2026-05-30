@@ -1,9 +1,11 @@
 package workflow
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/liiujinfu/forgelane/internal/workitems"
 )
@@ -15,7 +17,8 @@ type PlannedAgentRunStore interface {
 
 // CreatePlannedAgentRunInput describes the WorkItem snapshot used to start an AgentRun.
 type CreatePlannedAgentRunInput struct {
-	WorkItem WorkItemSnapshot
+	WorkItem    WorkItemSnapshot
+	AgentPreset string
 }
 
 // WorkItemSnapshot is the cached provider-owned WorkItem state captured in a RunSpec.
@@ -41,6 +44,7 @@ type PlannedAgentRunPlan struct {
 	WorkItem      WorkItemSnapshot
 	Status        string
 	Branch        string
+	AgentPreset   string
 	ControlAction ControlActionPlan
 }
 
@@ -136,6 +140,20 @@ type Workspace struct {
 	UpdatedAt      string
 }
 
+// LogSegment indexes one contiguous stdout/stderr byte range in a Workspace log file.
+type LogSegment struct {
+	ID           int64
+	AgentRunID   int64
+	Stream       string
+	Sequence     int64
+	ByteStart    int64
+	ByteEnd      int64
+	Preview      string
+	ArtifactPath string
+	Truncated    bool
+	CreatedAt    string
+}
+
 // AgentRunPrepareResult is the outcome of preparing runner state for execution.
 type AgentRunPrepareResult struct {
 	AgentRun  AgentRun
@@ -150,6 +168,73 @@ type AgentRunDetail struct {
 	WorkItem  WorkItemSnapshot
 	RunSpec   RunSpec
 	Workspace *Workspace
+}
+
+// AgentCommandPlanInput is the immutable RunSpec and Workspace context needed to plan a command.
+type AgentCommandPlanInput struct {
+	RunSpecJSON string
+	AgentRunID  int64
+	Workspace   Workspace
+}
+
+// AgentCommandPlan is the process-level command chosen by an AgentAdapter.
+type AgentCommandPlan struct {
+	Executable       string
+	Args             []string
+	WorkingDirectory string
+	Env              []string
+	StdoutPath       string
+	StderrPath       string
+	RedactValues     []string
+}
+
+// AgentCommandPlanner translates RunSpec adapter config into a process command.
+type AgentCommandPlanner interface {
+	PlanAgentCommand(AgentCommandPlanInput) (AgentCommandPlan, error)
+}
+
+// LogSegmentPlan is a log segment ready to persist after command execution.
+type LogSegmentPlan struct {
+	Stream       string
+	Sequence     int64
+	ByteStart    int64
+	ByteEnd      int64
+	Preview      string
+	ArtifactPath string
+	Truncated    bool
+}
+
+// AgentCommandRunResult is the evidence returned by a process runner.
+type AgentCommandRunResult struct {
+	ExitCode       int
+	Duration       time.Duration
+	StdoutBytes    int64
+	StderrBytes    int64
+	LogSegments    []LogSegmentPlan
+	ProcessStarted bool
+}
+
+// AgentCommandRunner executes an AgentCommandPlan.
+type AgentCommandRunner interface {
+	RunAgentCommand(context.Context, AgentCommandPlan) (AgentCommandRunResult, error)
+}
+
+// AgentCommandCompletion records terminal command execution evidence.
+type AgentCommandCompletion struct {
+	ExitCode      int
+	Duration      time.Duration
+	StdoutBytes   int64
+	StderrBytes   int64
+	LogSegments   []LogSegmentPlan
+	FailureDetail string
+}
+
+// AgentCommandExecutionStore persists command execution state and matching Events.
+type AgentCommandExecutionStore interface {
+	GetAgentRunDetail(int64) (AgentRunDetail, error)
+	MarkAgentCommandStarted(int64) (Event, error)
+	MarkAgentCommandCompleted(int64, AgentCommandCompletion) (AgentRunPrepareResult, error)
+	MarkAgentCommandFailed(int64, string) (AgentRunPrepareResult, error)
 }
 
 // ControlAction is a persisted operator request to change the delivery loop.
@@ -205,6 +290,67 @@ func PrepareAgentRunWorkspace(store WorkspacePreparationStore, preparer Workspac
 	return ready, nil
 }
 
+// ExecuteAgentRunCommand invokes the AgentAdapter command for a prepared AgentRun.
+func ExecuteAgentRunCommand(ctx context.Context, store AgentCommandExecutionStore, planner AgentCommandPlanner, runner AgentCommandRunner, runID int64) (AgentRunPrepareResult, error) {
+	detail, err := store.GetAgentRunDetail(runID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if detail.Workspace == nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("Workspace not prepared for AgentRun %d", runID)
+	}
+	if detail.Workspace.Status != "ready" {
+		return AgentRunPrepareResult{}, fmt.Errorf("Workspace for AgentRun %d is %s; expected ready", runID, detail.Workspace.Status)
+	}
+
+	plan, err := planner.PlanAgentCommand(AgentCommandPlanInput{
+		RunSpecJSON: detail.RunSpec.SpecJSON,
+		AgentRunID:  detail.AgentRun.ID,
+		Workspace:   *detail.Workspace,
+	})
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if _, err := store.MarkAgentCommandStarted(runID); err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+
+	result, runErr := runner.RunAgentCommand(ctx, plan)
+	if runErr != nil && !result.ProcessStarted {
+		if _, markErr := store.MarkAgentCommandFailed(runID, compactFailure(runErr)); markErr != nil {
+			return AgentRunPrepareResult{}, fmt.Errorf("execute AgentAdapter command: %w; mark AgentRun failed: %v", runErr, markErr)
+		}
+		return AgentRunPrepareResult{}, fmt.Errorf("execute AgentAdapter command: %w", runErr)
+	}
+
+	completed, err := store.MarkAgentCommandCompleted(runID, AgentCommandCompletion{
+		ExitCode:      commandExitCode(result, runErr),
+		Duration:      result.Duration,
+		StdoutBytes:   result.StdoutBytes,
+		StderrBytes:   result.StderrBytes,
+		LogSegments:   result.LogSegments,
+		FailureDetail: commandFailureDetail(runErr),
+	})
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	return completed, nil
+}
+
+func commandExitCode(result AgentCommandRunResult, err error) int {
+	if err != nil && result.ExitCode == 0 {
+		return -1
+	}
+	return result.ExitCode
+}
+
+func commandFailureDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	return compactFailure(err)
+}
+
 func compactFailure(err error) string {
 	const limit = 500
 	message := err.Error()
@@ -216,7 +362,7 @@ func compactFailure(err error) string {
 
 // CreatePlannedAgentRun creates a planned AgentRun through the transactional store Adapter.
 func CreatePlannedAgentRun(store PlannedAgentRunStore, input CreatePlannedAgentRunInput) (AgentRunCreateResult, error) {
-	plan, err := NewPlannedAgentRunPlan(input.WorkItem)
+	plan, err := NewPlannedAgentRunPlan(input.WorkItem, input.AgentPreset)
 	if err != nil {
 		return AgentRunCreateResult{}, err
 	}
@@ -224,16 +370,20 @@ func CreatePlannedAgentRun(store PlannedAgentRunStore, input CreatePlannedAgentR
 }
 
 // NewPlannedAgentRunPlan captures the workflow semantics for the first planned AgentRun state.
-func NewPlannedAgentRunPlan(workItem WorkItemSnapshot) (PlannedAgentRunPlan, error) {
+func NewPlannedAgentRunPlan(workItem WorkItemSnapshot, agentPreset string) (PlannedAgentRunPlan, error) {
 	ref, err := workitems.ParseProviderRef(workItem.ProviderRef)
 	if err != nil {
 		return PlannedAgentRunPlan{}, err
 	}
+	if agentPreset == "" {
+		agentPreset = "codex"
+	}
 	branch := fmt.Sprintf("forgelane/issue-%d", ref.IssueNumber)
 	return PlannedAgentRunPlan{
-		WorkItem: workItem,
-		Status:   "planned",
-		Branch:   branch,
+		WorkItem:    workItem,
+		Status:      "planned",
+		Branch:      branch,
+		AgentPreset: agentPreset,
 		ControlAction: ControlActionPlan{
 			Type:        "start",
 			TargetType:  "work_item",
@@ -285,9 +435,10 @@ func (plan PlannedAgentRunPlan) EncodeRunSpec(runID int64) (string, error) {
 		},
 		Branch: plan.Branch,
 		AgentAdapter: runSpecAgentAdapterSnapshot{
-			Kind:      "command",
-			Preset:    "codex",
-			EnvPolicy: "scrubbed",
+			Kind:             "command",
+			Preset:           plan.AgentPreset,
+			EnvPolicy:        "scrubbed",
+			CredentialGrants: credentialGrantsForAgentPreset(plan.AgentPreset),
 		},
 	}
 	encoded, err := json.Marshal(spec)
@@ -331,9 +482,29 @@ type runSpecRepoSnapshot struct {
 }
 
 type runSpecAgentAdapterSnapshot struct {
-	Kind      string `json:"kind"`
-	Preset    string `json:"preset"`
-	EnvPolicy string `json:"env_policy"`
+	Kind             string                           `json:"kind"`
+	Preset           string                           `json:"preset"`
+	EnvPolicy        string                           `json:"env_policy"`
+	CredentialGrants []runSpecCredentialGrantSnapshot `json:"credential_grants,omitempty"`
+}
+
+type runSpecCredentialGrantSnapshot struct {
+	Kind     string `json:"kind"`
+	SecretID string `json:"secret_id"`
+	Env      string `json:"env"`
+}
+
+func credentialGrantsForAgentPreset(agentPreset string) []runSpecCredentialGrantSnapshot {
+	if agentPreset != "codex" {
+		return nil
+	}
+	return []runSpecCredentialGrantSnapshot{
+		{
+			Kind:     "openai_api_key",
+			SecretID: "env:OPENAI_API_KEY",
+			Env:      "OPENAI_API_KEY",
+		},
+	}
 }
 
 // EventPlans returns the audit Events that must be written with the planned AgentRun state.
