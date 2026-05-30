@@ -1,2 +1,2 @@
-// Package workflow will orchestrate ForgeLane-owned delivery state transitions.
+// Package workflow orchestrates ForgeLane-owned delivery state transitions.
 package workflow

@@ -8,9 +8,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/liiujinfu/forgelane/internal/workflow"
 	"github.com/liiujinfu/forgelane/internal/workitems"
 	_ "modernc.org/sqlite"
 )
@@ -239,32 +239,10 @@ func (store *Store) ensureColumn(table string, column string, definition string)
 }
 
 // WorkItem is a persisted WorkItem snapshot.
-type WorkItem struct {
-	ID                  int64
-	ForgeProjectID      int64
-	ProviderRef         string
-	Provider            string
-	RepositoryRef       string
-	ProviderIssueNumber int
-	Title               string
-	Body                string
-	Status              string
-	ProviderStatusRaw   string
-	URL                 string
-	ProviderUpdatedAt   string
-	ImportedAt          string
-	RefreshedAt         string
-}
+type WorkItem = workflow.WorkItemSnapshot
 
 // Event is a persisted audit event.
-type Event struct {
-	ID          int64
-	Type        string
-	OccurredAt  string
-	Actor       string
-	SubjectType string
-	SubjectRef  string
-}
+type Event = workflow.Event
 
 // WorkItemImportResult is the outcome of an atomic WorkItem import.
 type WorkItemImportResult struct {
@@ -273,30 +251,13 @@ type WorkItemImportResult struct {
 }
 
 // AgentRun is a persisted bounded agent attempt.
-type AgentRun struct {
-	ID         int64
-	WorkItemID int64
-	Status     string
-	CreatedAt  string
-	UpdatedAt  string
-}
+type AgentRun = workflow.AgentRun
 
 // RunSpec is the immutable execution input snapshot for one AgentRun.
-type RunSpec struct {
-	ID         int64
-	AgentRunID int64
-	SpecJSON   string
-	CreatedAt  string
-}
+type RunSpec = workflow.RunSpec
 
 // AgentRunCreateResult is the outcome of creating AgentRun execution state.
-type AgentRunCreateResult struct {
-	ControlAction ControlAction
-	AgentRun      AgentRun
-	RunSpec       RunSpec
-	Branch        string
-	Events        []Event
-}
+type AgentRunCreateResult = workflow.AgentRunCreateResult
 
 // AgentRunDetail is the read model for inspecting one AgentRun.
 type AgentRunDetail struct {
@@ -306,11 +267,7 @@ type AgentRunDetail struct {
 }
 
 // ControlAction is a persisted operator request to change the delivery loop.
-type ControlAction struct {
-	ID     int64
-	Type   string
-	Status string
-}
+type ControlAction = workflow.ControlAction
 
 // ImportWorkItem persists a provider-owned issue snapshot and matching audit Event.
 func (store *Store) ImportWorkItem(issue workitems.ProviderIssue) (WorkItemImportResult, error) {
@@ -644,27 +601,20 @@ ORDER BY id ASC`, agentRunID)
 	return events, nil
 }
 
-// CreateAgentRun creates one planned AgentRun and its immutable RunSpec.
-func (store *Store) CreateAgentRun(workItem WorkItem) (AgentRunCreateResult, error) {
-	ref, err := workitems.ParseProviderRef(workItem.ProviderRef)
-	if err != nil {
-		return AgentRunCreateResult{}, err
-	}
-
-	branch := fmt.Sprintf("forgelane/issue-%d", workItem.ProviderIssueNumber)
+// CreatePlannedAgentRun writes one planned AgentRun, its immutable RunSpec, and matching Events.
+func (store *Store) CreatePlannedAgentRun(plan workflow.PlannedAgentRunPlan) (workflow.AgentRunCreateResult, error) {
+	workItem := plan.WorkItem
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	tx, err := store.db.Begin()
 	if err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("begin AgentRun create transaction: %w", err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("begin AgentRun create transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	actionInput, err := json.Marshal(map[string]any{
-		"provider_ref": workItem.ProviderRef,
-	})
+	actionInput, err := json.Marshal(plan.ControlAction.Input)
 	if err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("encode ControlAction input: %w", err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("encode ControlAction input: %w", err)
 	}
 	actionResult, err := tx.Exec(`
 INSERT INTO control_actions (
@@ -679,44 +629,44 @@ INSERT INTO control_actions (
 	decided_at,
 	result_event_refs
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		"start",
-		"work_item",
-		workItem.ProviderRef,
-		"local",
-		"forgelane runs create",
+		plan.ControlAction.Type,
+		plan.ControlAction.TargetType,
+		plan.ControlAction.TargetRef,
+		plan.ControlAction.RequestedBy,
+		plan.ControlAction.Reason,
 		string(actionInput),
-		"succeeded",
+		plan.ControlAction.Status,
 		now,
 		now,
 		"[]",
 	)
 	if err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("insert ControlAction: %w", err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("insert ControlAction: %w", err)
 	}
 	controlActionID, err := actionResult.LastInsertId()
 	if err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("read inserted ControlAction id: %w", err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("read inserted ControlAction id: %w", err)
 	}
 
 	runResult, err := tx.Exec(`
 INSERT INTO agent_runs (work_item_id, status, created_at, updated_at)
 VALUES (?, ?, ?, ?)`,
 		workItem.ID,
-		"planned",
+		plan.Status,
 		now,
 		now,
 	)
 	if err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("insert AgentRun: %w", err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("insert AgentRun: %w", err)
 	}
 	runID, err := runResult.LastInsertId()
 	if err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("read inserted AgentRun id: %w", err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("read inserted AgentRun id: %w", err)
 	}
 
-	specJSON, err := encodeRunSpec(runID, workItem, ref, branch)
+	specJSON, err := plan.EncodeRunSpec(runID)
 	if err != nil {
-		return AgentRunCreateResult{}, err
+		return workflow.AgentRunCreateResult{}, err
 	}
 
 	specResult, err := tx.Exec(`
@@ -727,163 +677,75 @@ VALUES (?, ?, ?)`,
 		now,
 	)
 	if err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("insert RunSpec for AgentRun %d: %w", runID, err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("insert RunSpec for AgentRun %d: %w", runID, err)
 	}
 	specID, err := specResult.LastInsertId()
 	if err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("read inserted RunSpec id: %w", err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("read inserted RunSpec id: %w", err)
 	}
 
-	controlActionEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
-		Type:            "control_action.succeeded",
-		OccurredAt:      now,
-		ForgeProjectID:  workItem.ForgeProjectID,
-		SubjectType:     "control_action",
-		SubjectRef:      fmt.Sprintf("control_action:%d", controlActionID),
-		WorkItemID:      workItem.ID,
-		WorkItemRef:     workItem.ProviderRef,
-		AgentRunID:      runID,
+	var events []workflow.Event
+	for _, eventPlan := range plan.EventPlans(workflow.PlannedAgentRunIDs{
 		ControlActionID: controlActionID,
-		Payload: map[string]any{
-			"control_action_id": controlActionID,
-			"type":              "start",
-			"status":            "succeeded",
-			"agent_run_id":      runID,
-			"work_item_id":      workItem.ID,
-			"provider_ref":      workItem.ProviderRef,
-		},
-	})
-	if err != nil {
-		return AgentRunCreateResult{}, err
-	}
-
-	runEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
-		Type:            "agent_run.created",
-		OccurredAt:      now,
-		ForgeProjectID:  workItem.ForgeProjectID,
-		SubjectType:     "agent_run",
-		SubjectRef:      fmt.Sprintf("agent_run:%d", runID),
-		WorkItemID:      workItem.ID,
-		WorkItemRef:     workItem.ProviderRef,
 		AgentRunID:      runID,
-		ControlActionID: controlActionID,
-		Payload: map[string]any{
-			"agent_run_id": runID,
-			"work_item_id": workItem.ID,
-			"provider_ref": workItem.ProviderRef,
-			"status":       "planned",
-		},
-	})
-	if err != nil {
-		return AgentRunCreateResult{}, err
+		RunSpecID:       specID,
+	}) {
+		event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+			Type:            eventPlan.Type,
+			OccurredAt:      now,
+			ForgeProjectID:  workItem.ForgeProjectID,
+			SubjectType:     eventPlan.SubjectType,
+			SubjectRef:      eventPlan.SubjectRef,
+			WorkItemID:      workItem.ID,
+			WorkItemRef:     workItem.ProviderRef,
+			AgentRunID:      runID,
+			ControlActionID: controlActionID,
+			Payload:         eventPlan.Payload,
+		})
+		if err != nil {
+			return workflow.AgentRunCreateResult{}, err
+		}
+		events = append(events, event)
 	}
 
-	specEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
-		Type:            "run_spec.created",
-		OccurredAt:      now,
-		ForgeProjectID:  workItem.ForgeProjectID,
-		SubjectType:     "run_spec",
-		SubjectRef:      fmt.Sprintf("run_spec:%d", specID),
-		WorkItemID:      workItem.ID,
-		WorkItemRef:     workItem.ProviderRef,
-		AgentRunID:      runID,
-		ControlActionID: controlActionID,
-		Payload: map[string]any{
-			"agent_run_id": runID,
-			"run_spec_id":  specID,
-			"branch":       branch,
-		},
-	})
-	if err != nil {
-		return AgentRunCreateResult{}, err
+	resultEventIDs := make([]int64, 0, len(events))
+	for _, event := range events {
+		resultEventIDs = append(resultEventIDs, event.ID)
 	}
-
-	resultEventRefs, err := json.Marshal([]int64{controlActionEvent.ID, runEvent.ID, specEvent.ID})
+	resultEventRefs, err := json.Marshal(resultEventIDs)
 	if err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("encode ControlAction result Event refs: %w", err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("encode ControlAction result Event refs: %w", err)
 	}
 	if _, err := tx.Exec("UPDATE control_actions SET result_event_refs = ? WHERE id = ?", string(resultEventRefs), controlActionID); err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("update ControlAction result Event refs: %w", err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("update ControlAction result Event refs: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return AgentRunCreateResult{}, fmt.Errorf("commit AgentRun create: %w", err)
+		return workflow.AgentRunCreateResult{}, fmt.Errorf("commit AgentRun create: %w", err)
 	}
 
-	return AgentRunCreateResult{
-		ControlAction: ControlAction{
+	return workflow.AgentRunCreateResult{
+		ControlAction: workflow.ControlAction{
 			ID:     controlActionID,
-			Type:   "start",
-			Status: "succeeded",
+			Type:   plan.ControlAction.Type,
+			Status: plan.ControlAction.Status,
 		},
-		AgentRun: AgentRun{
+		AgentRun: workflow.AgentRun{
 			ID:         runID,
 			WorkItemID: workItem.ID,
-			Status:     "planned",
+			Status:     plan.Status,
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		},
-		RunSpec: RunSpec{
+		RunSpec: workflow.RunSpec{
 			ID:         specID,
 			AgentRunID: runID,
 			SpecJSON:   specJSON,
 			CreatedAt:  now,
 		},
-		Branch: branch,
-		Events: []Event{controlActionEvent, runEvent, specEvent},
+		Branch: plan.Branch,
+		Events: events,
 	}, nil
-}
-
-func encodeRunSpec(runID int64, workItem WorkItem, ref workitems.ProviderRef, branch string) (string, error) {
-	owner, name, err := splitRepositoryPath(ref.RepositoryPath)
-	if err != nil {
-		return "", err
-	}
-	spec := map[string]any{
-		"run_id": fmt.Sprintf("run_%d", runID),
-		"work_item": map[string]any{
-			"id":                  workItem.ID,
-			"provider":            workItem.Provider,
-			"provider_ref":        workItem.ProviderRef,
-			"repository_ref":      workItem.RepositoryRef,
-			"provider_issue":      workItem.ProviderIssueNumber,
-			"title":               workItem.Title,
-			"body_snapshot":       workItem.Body,
-			"status":              workItem.Status,
-			"provider_status_raw": workItem.ProviderStatusRaw,
-			"url":                 workItem.URL,
-			"provider_updated_at": workItem.ProviderUpdatedAt,
-			"imported_at":         workItem.ImportedAt,
-			"refreshed_at":        workItem.RefreshedAt,
-		},
-		"repo": map[string]any{
-			"provider":    ref.Provider,
-			"host":        ref.ProviderHost,
-			"owner":       owner,
-			"name":        name,
-			"ref":         ref.RepositoryRef(),
-			"base_branch": "main",
-		},
-		"branch": branch,
-		"agent_adapter": map[string]any{
-			"kind":       "command",
-			"preset":     "codex",
-			"env_policy": "scrubbed",
-		},
-	}
-	encoded, err := json.Marshal(spec)
-	if err != nil {
-		return "", fmt.Errorf("encode RunSpec JSON: %w", err)
-	}
-	return string(encoded), nil
-}
-
-func splitRepositoryPath(repositoryPath string) (string, string, error) {
-	parts := strings.Split(repositoryPath, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("invalid repository path %q", repositoryPath)
-	}
-	return parts[0], parts[1], nil
 }
 
 type agentRunEventInput struct {

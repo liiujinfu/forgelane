@@ -9,6 +9,7 @@ import (
 
 	githubprovider "github.com/liiujinfu/forgelane/internal/provider/github"
 	store "github.com/liiujinfu/forgelane/internal/store/sqlite"
+	"github.com/liiujinfu/forgelane/internal/workflow"
 	"github.com/liiujinfu/forgelane/internal/workitems"
 	"github.com/spf13/cobra"
 )
@@ -48,7 +49,9 @@ func newRunsCreateCommand(stdout io.Writer, provider workitems.Provider) *cobra.
 				return err
 			}
 
-			result, err := instanceStore.CreateAgentRun(workItem)
+			result, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
+				WorkItem: workItem,
+			})
 			if err != nil {
 				return err
 			}
@@ -81,7 +84,7 @@ func getOrImportWorkItem(cmd *cobra.Command, instanceStore *store.Store, provide
 	return result.WorkItem, nil
 }
 
-func printCreatedAgentRun(stdout io.Writer, workItem store.WorkItem, result store.AgentRunCreateResult) {
+func printCreatedAgentRun(stdout io.Writer, workItem store.WorkItem, result workflow.AgentRunCreateResult) {
 	fmt.Fprintf(stdout, "Created AgentRun %d\n", result.AgentRun.ID)
 	fmt.Fprintf(stdout, "WorkItem: %s\n", workItem.ProviderRef)
 	fmt.Fprintf(stdout, "Status: %s\n", result.AgentRun.Status)
