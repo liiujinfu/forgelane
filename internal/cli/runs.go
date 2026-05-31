@@ -261,6 +261,9 @@ func printExecutedAgentRun(stdout io.Writer, result store.AgentRunPrepareResult)
 	for _, ref := range result.CommitRefs {
 		fmt.Fprintf(stdout, "Commit: %s@%s %s\n", ref.RepositoryRef, ref.SHA, ref.Subject)
 	}
+	if result.ChangeSet != nil {
+		fmt.Fprintf(stdout, "ChangeSet: %d %s %s\n", result.ChangeSet.ID, result.ChangeSet.Status, result.ChangeSet.BranchRef)
+	}
 	for _, event := range result.Events {
 		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
 		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
@@ -354,6 +357,11 @@ func printAgentRunDetail(stdout io.Writer, detail store.AgentRunDetail) error {
 		for _, ref := range detail.CommitRefs {
 			fmt.Fprintf(stdout, "- %s@%s %s\n", ref.RepositoryRef, ref.SHA, ref.Subject)
 		}
+	}
+	if detail.ChangeSet != nil {
+		fmt.Fprintf(stdout, "ChangeSet: %d %s %s\n", detail.ChangeSet.ID, detail.ChangeSet.Status, detail.ChangeSet.BranchRef)
+		fmt.Fprintf(stdout, "ChangeSet active run: %d\n", detail.ChangeSet.ActiveRunID)
+		fmt.Fprintf(stdout, "ChangeSet commits: %d\n", len(detail.ChangeSet.CommitRefs))
 	}
 	return nil
 }

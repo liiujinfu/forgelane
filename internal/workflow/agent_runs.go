@@ -161,12 +161,44 @@ type LogSegment struct {
 type CommitRef struct {
 	ID            int64
 	AgentRunID    int64
+	ChangeSetID   int64
 	RepositoryRef string
 	SHA           string
 	Subject       string
 	AuthorName    string
 	AuthorEmail   string
 	CreatedAt     string
+}
+
+// ChangeSet records one ForgeLane-owned delivery artifact for a WorkItem.
+type ChangeSet struct {
+	ID             int64
+	WorkItemID     int64
+	WorkItemRef    string
+	Provider       string
+	RepositoryRef  string
+	BaseBranch     string
+	BranchRef      string
+	ChangeRef      string
+	Status         string
+	CreatedByRunID int64
+	ActiveRunID    int64
+	CommitRefs     []CommitRef
+	CreatedAt      string
+	UpdatedAt      string
+}
+
+// ChangeSetPlan is the provider-neutral delivery state chosen after local commits exist.
+type ChangeSetPlan struct {
+	WorkItemID     int64
+	WorkItemRef    string
+	Provider       string
+	RepositoryRef  string
+	BaseBranch     string
+	BranchRef      string
+	Status         string
+	CreatedByRunID int64
+	ActiveRunID    int64
 }
 
 // CommitRefPlan is a local commit ref ready to persist after repository materialization.
@@ -195,6 +227,7 @@ type AgentRunPrepareResult struct {
 	RunnerJob  RunnerJob
 	Workspace  Workspace
 	CommitRefs []CommitRef
+	ChangeSet  *ChangeSet
 	Events     []Event
 }
 
@@ -205,6 +238,7 @@ type AgentRunDetail struct {
 	RunSpec            RunSpec
 	Workspace          *Workspace
 	CommitRefs         []CommitRef
+	ChangeSet          *ChangeSet
 	DeliverySkipped    bool
 	DeliverySkipReason string
 }
@@ -273,6 +307,7 @@ type AgentCommandCompletion struct {
 	StderrBytes        int64
 	LogSegments        []LogSegmentPlan
 	CommitRefs         []CommitRefPlan
+	ChangeSet          *ChangeSetPlan
 	DeliverySkipped    bool
 	DeliverySkipReason string
 	FailureDetail      string
@@ -428,6 +463,14 @@ func ExecuteAgentRunCommandAndMaterialize(ctx context.Context, store AgentComman
 		deliverySkipReason = materialized.DeliverySkipReason
 	}
 
+	var changeSet *ChangeSetPlan
+	if commandStatus(runCtx, result, runErr) == "completed" && len(commitRefs) > 0 {
+		changeSet, err = NewChangeSetPlan(detail)
+		if err != nil {
+			return AgentRunPrepareResult{}, err
+		}
+	}
+
 	completed, err := store.MarkAgentCommandCompleted(runID, AgentCommandCompletion{
 		Status:             commandStatus(runCtx, result, runErr),
 		ExitCode:           commandExitCode(result, runErr),
@@ -436,6 +479,7 @@ func ExecuteAgentRunCommandAndMaterialize(ctx context.Context, store AgentComman
 		StderrBytes:        result.StderrBytes,
 		LogSegments:        result.LogSegments,
 		CommitRefs:         commitRefs,
+		ChangeSet:          changeSet,
 		DeliverySkipped:    deliverySkipped,
 		DeliverySkipReason: deliverySkipReason,
 		FailureDetail:      commandFailureDetail(runErr),
@@ -444,6 +488,31 @@ func ExecuteAgentRunCommandAndMaterialize(ctx context.Context, store AgentComman
 		return AgentRunPrepareResult{}, err
 	}
 	return completed, nil
+}
+
+// NewChangeSetPlan derives the active ChangeSet identity from the immutable RunSpec.
+func NewChangeSetPlan(detail AgentRunDetail) (*ChangeSetPlan, error) {
+	var spec runSpecSnapshot
+	if err := json.Unmarshal([]byte(detail.RunSpec.SpecJSON), &spec); err != nil {
+		return nil, fmt.Errorf("decode RunSpec ChangeSet fields: %w", err)
+	}
+	if spec.Repo.BaseBranch == "" {
+		return nil, fmt.Errorf("RunSpec %d missing repo.base_branch", detail.RunSpec.ID)
+	}
+	if spec.Branch == "" {
+		return nil, fmt.Errorf("RunSpec %d missing branch", detail.RunSpec.ID)
+	}
+	return &ChangeSetPlan{
+		WorkItemID:     detail.WorkItem.ID,
+		WorkItemRef:    detail.WorkItem.ProviderRef,
+		Provider:       detail.WorkItem.Provider,
+		RepositoryRef:  detail.WorkItem.RepositoryRef,
+		BaseBranch:     spec.Repo.BaseBranch,
+		BranchRef:      spec.Branch,
+		Status:         "planned",
+		CreatedByRunID: detail.AgentRun.ID,
+		ActiveRunID:    detail.AgentRun.ID,
+	}, nil
 }
 
 type noopRepositoryChangeMaterializer struct{}
