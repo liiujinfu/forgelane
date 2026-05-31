@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/liiujinfu/forgelane/internal/workflow"
 	"github.com/liiujinfu/forgelane/internal/workitems"
 	_ "modernc.org/sqlite"
 )
@@ -1136,6 +1137,128 @@ func TestRunsExecuteHarmlessPresetCapturesLogsAndScrubsEnvironment(t *testing.T)
 	}
 }
 
+func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Materialize repository changes",
+			Body:                "Commit local Workspace repository changes.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	createStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+	}, "runs", "create", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	runID := extractCreatedAgentRunID(t, createStdout)
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+	}, "runs", "prepare", strconv.FormatInt(runID, 10)); err != nil {
+		t.Fatalf("expected runs prepare to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	workspaceRoot := filepath.Join(homeDir, ".forgelane", "workspaces", "run-1")
+	if err := os.WriteFile(filepath.Join(workspaceRoot, "artifacts", "outside-repo.txt"), []byte("artifact\n"), 0o644); err != nil {
+		t.Fatalf("write workspace artifact: %v", err)
+	}
+
+	executeStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+	}, "runs", "execute", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs execute to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Executed AgentRun 1",
+		"Status: completed",
+		"Event: repository_commit.materialized",
+		"Event: agent_command.completed",
+	} {
+		if !strings.Contains(executeStdout, want) {
+			t.Fatalf("expected runs execute output to contain %q, got:\n%s", want, executeStdout)
+		}
+	}
+
+	workspaceRepo := filepath.Join(workspaceRoot, "repo")
+	commitSubject := gitOutput(t, workspaceRepo, "log", "-1", "--pretty=%s")
+	if strings.TrimSpace(commitSubject) != "Materialize AgentRun 1 repository changes" {
+		t.Fatalf("unexpected materialized commit subject %q", commitSubject)
+	}
+	commitAuthor := gitOutput(t, workspaceRepo, "log", "-1", "--pretty=%an <%ae>")
+	if strings.TrimSpace(commitAuthor) != "ForgeLane <forgelane@localhost>" {
+		t.Fatalf("unexpected materialized commit author %q", commitAuthor)
+	}
+	tree := gitOutput(t, workspaceRepo, "ls-tree", "-r", "--name-only", "HEAD")
+	if !strings.Contains(tree, "forgelane-agent-output.txt\n") {
+		t.Fatalf("expected committed agent output file, got:\n%s", tree)
+	}
+	if strings.Contains(tree, "artifacts/outside-repo.txt\n") {
+		t.Fatalf("expected workspace artifact outside repo to stay out of commit, got:\n%s", tree)
+	}
+
+	showStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+	}, "runs", "show", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs show to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	for _, want := range []string{
+		"Commit refs:",
+		"github://github.com/owner/repo@",
+		"Materialize AgentRun 1 repository changes",
+	} {
+		if !strings.Contains(showStdout, want) {
+			t.Fatalf("expected runs show output to contain %q, got:\n%s", want, showStdout)
+		}
+	}
+
+	eventsStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+	}, "events", "list", "--run", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected events list to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	assertInOrder(t, eventsStdout, []string{
+		"agent_command.started",
+		"repository_commit.materialized",
+		"agent_command.completed",
+	})
+
+	assertTableCount(t, homeDir, "commit_refs", 1)
+}
+
 func TestRunReadCommandsReturnClearErrorsForInvalidAndUnknownRunIDs(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -1664,6 +1787,31 @@ func runGit(t *testing.T, workingDir string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
 	}
+}
+
+type changingCommandPlanner struct{}
+
+func (changingCommandPlanner) PlanAgentCommand(input workflow.AgentCommandPlanInput) (workflow.AgentCommandPlan, error) {
+	return workflow.AgentCommandPlan{
+		Executable:       "sh",
+		Args:             []string{"-c", "printf 'forgelane test change\\n' > forgelane-agent-output.txt"},
+		WorkingDirectory: input.Workspace.Paths.Repo,
+		Env:              []string{"PATH=" + os.Getenv("PATH")},
+		StdoutPath:       filepath.Join(input.Workspace.Paths.Logs, "stdout.log"),
+		StderrPath:       filepath.Join(input.Workspace.Paths.Logs, "stderr.log"),
+	}, nil
+}
+
+func gitOutput(t *testing.T, workingDir string, args ...string) string {
+	t.Helper()
+
+	cmd := exec.Command("git", args...)
+	cmd.Dir = workingDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return string(output)
 }
 
 func withHomeDir(t *testing.T, homeDir string) {

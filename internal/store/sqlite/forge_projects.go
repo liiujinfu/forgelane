@@ -196,6 +196,18 @@ CREATE TABLE IF NOT EXISTS log_segments (
 	UNIQUE(agent_run_id, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS commit_refs (
+	id INTEGER PRIMARY KEY,
+	agent_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+	repository_ref TEXT NOT NULL,
+	sha TEXT NOT NULL,
+	subject TEXT NOT NULL,
+	author_name TEXT NOT NULL,
+	author_email TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	UNIQUE(agent_run_id, sha)
+);
+
 CREATE TABLE IF NOT EXISTS control_actions (
 	id INTEGER PRIMARY KEY,
 	type TEXT NOT NULL,
@@ -241,7 +253,8 @@ CREATE INDEX IF NOT EXISTS idx_events_forge_project_id ON events(forge_project_i
 CREATE INDEX IF NOT EXISTS idx_events_agent_run_id ON events(agent_run_id);
 CREATE INDEX IF NOT EXISTS idx_runner_jobs_agent_run_id ON runner_jobs(agent_run_id);
 CREATE INDEX IF NOT EXISTS idx_workspaces_agent_run_id ON workspaces(agent_run_id);
-CREATE INDEX IF NOT EXISTS idx_log_segments_agent_run_id ON log_segments(agent_run_id, sequence);`
+CREATE INDEX IF NOT EXISTS idx_log_segments_agent_run_id ON log_segments(agent_run_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_commit_refs_agent_run_id ON commit_refs(agent_run_id);`
 
 	if _, err := store.db.Exec(schema); err != nil {
 		return fmt.Errorf("initialize ForgeLane database schema: %w", err)
@@ -250,6 +263,9 @@ CREATE INDEX IF NOT EXISTS idx_log_segments_agent_run_id ON log_segments(agent_r
 		return err
 	}
 	if err := store.ensureColumn("events", "control_action_id", "INTEGER REFERENCES control_actions(id)"); err != nil {
+		return err
+	}
+	if err := store.ensureColumn("commit_refs", "repository_ref", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if _, err := store.db.Exec("CREATE INDEX IF NOT EXISTS idx_events_control_action_id ON events(control_action_id)"); err != nil {
@@ -314,6 +330,9 @@ type Workspace = workflow.Workspace
 
 // LogSegment indexes one stdout/stderr range in a Workspace log file.
 type LogSegment = workflow.LogSegment
+
+// CommitRef records one local repository commit produced by an AgentRun.
+type CommitRef = workflow.CommitRef
 
 // RunSpec is the immutable execution input snapshot for one AgentRun.
 type RunSpec = workflow.RunSpec
@@ -628,6 +647,11 @@ WHERE agent_runs.id = ?`
 		return AgentRunDetail{}, err
 	}
 	detail.Workspace = workspace
+	commitRefs, err := store.listCommitRefsForAgentRun(id)
+	if err != nil {
+		return AgentRunDetail{}, err
+	}
+	detail.CommitRefs = commitRefs
 	return detail, nil
 }
 
@@ -669,6 +693,40 @@ WHERE agent_run_id = ?`, agentRunID).Scan(
 		return nil, fmt.Errorf("query Workspace for AgentRun %d: %w", agentRunID, err)
 	}
 	return &workspace, nil
+}
+
+func (store *Store) listCommitRefsForAgentRun(agentRunID int64) ([]CommitRef, error) {
+	rows, err := store.db.Query(`
+SELECT id, agent_run_id, repository_ref, sha, subject, author_name, author_email, created_at
+FROM commit_refs
+WHERE agent_run_id = ?
+ORDER BY id ASC`, agentRunID)
+	if err != nil {
+		return nil, fmt.Errorf("query CommitRefs for AgentRun %d: %w", agentRunID, err)
+	}
+	defer rows.Close()
+
+	var refs []CommitRef
+	for rows.Next() {
+		var ref CommitRef
+		if err := rows.Scan(
+			&ref.ID,
+			&ref.AgentRunID,
+			&ref.RepositoryRef,
+			&ref.SHA,
+			&ref.Subject,
+			&ref.AuthorName,
+			&ref.AuthorEmail,
+			&ref.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan CommitRef for AgentRun %d: %w", agentRunID, err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate CommitRefs for AgentRun %d: %w", agentRunID, err)
+	}
+	return refs, nil
 }
 
 // ListEventsForAgentRun returns the audit timeline for one AgentRun in append order.
@@ -893,6 +951,70 @@ INSERT INTO log_segments (
 			return AgentRunPrepareResult{}, fmt.Errorf("insert LogSegment for AgentRun %d: %w", agentRunID, err)
 		}
 	}
+	var commitRefs []CommitRef
+	var materializationEvents []Event
+	for _, ref := range completion.CommitRefs {
+		result, err := tx.Exec(`
+INSERT INTO commit_refs (
+	agent_run_id,
+	repository_ref,
+	sha,
+	subject,
+	author_name,
+	author_email,
+	created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			agentRunID,
+			detail.WorkItem.RepositoryRef,
+			ref.SHA,
+			ref.Subject,
+			ref.AuthorName,
+			ref.AuthorEmail,
+			now,
+		)
+		if err != nil {
+			return AgentRunPrepareResult{}, fmt.Errorf("insert CommitRef for AgentRun %d: %w", agentRunID, err)
+		}
+		refID, err := result.LastInsertId()
+		if err != nil {
+			return AgentRunPrepareResult{}, fmt.Errorf("read inserted CommitRef id: %w", err)
+		}
+		commitRefs = append(commitRefs, CommitRef{
+			ID:            refID,
+			AgentRunID:    agentRunID,
+			RepositoryRef: detail.WorkItem.RepositoryRef,
+			SHA:           ref.SHA,
+			Subject:       ref.Subject,
+			AuthorName:    ref.AuthorName,
+			AuthorEmail:   ref.AuthorEmail,
+			CreatedAt:     now,
+		})
+		materializationEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+			Type:           "repository_commit.materialized",
+			OccurredAt:     now,
+			ForgeProjectID: detail.WorkItem.ForgeProjectID,
+			SubjectType:    "commit_ref",
+			SubjectRef:     fmt.Sprintf("commit_ref:%d", refID),
+			WorkItemID:     detail.WorkItem.ID,
+			WorkItemRef:    detail.WorkItem.ProviderRef,
+			AgentRunID:     agentRunID,
+			Payload: map[string]any{
+				"agent_run_id":   agentRunID,
+				"runner_job_id":  detail.Workspace.RunnerJobID,
+				"workspace_id":   detail.Workspace.ID,
+				"commit_ref_id":  refID,
+				"repository_ref": detail.WorkItem.RepositoryRef,
+				"sha":            ref.SHA,
+				"subject":        ref.Subject,
+				"author_name":    ref.AuthorName,
+				"author_email":   ref.AuthorEmail,
+			},
+		})
+		if err != nil {
+			return AgentRunPrepareResult{}, err
+		}
+		materializationEvents = append(materializationEvents, materializationEvent)
+	}
 
 	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
 		Type:           eventType,
@@ -917,6 +1039,7 @@ INSERT INTO log_segments (
 			"failure_detail": completion.FailureDetail,
 			"stdout_preview": "",
 			"stderr_preview": "",
+			"commit_refs":    len(completion.CommitRefs),
 			"provider_ref":   detail.WorkItem.ProviderRef,
 		},
 	})
@@ -943,8 +1066,9 @@ INSERT INTO log_segments (
 			CreatedAt:  workspace.CreatedAt,
 			UpdatedAt:  now,
 		},
-		Workspace: workspace,
-		Events:    []Event{event},
+		Workspace:  workspace,
+		CommitRefs: commitRefs,
+		Events:     append(materializationEvents, event),
 	}, nil
 }
 

@@ -154,6 +154,45 @@ func TestExecuteAgentRunCommandRecordsSuccessfulTerminalOutcome(t *testing.T) {
 	}
 }
 
+func TestExecuteAgentRunCommandPersistsMaterializedCommitRefs(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+
+	result, err := workflow.ExecuteAgentRunCommandAndMaterialize(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("execute AgentRun command: %v", err)
+	}
+	if result.AgentRun.Status != "completed" {
+		t.Fatalf("expected successful command to complete AgentRun, got %q", result.AgentRun.Status)
+	}
+	if len(result.CommitRefs) != 1 {
+		t.Fatalf("expected one commit ref in execution result, got %#v", result.CommitRefs)
+	}
+	if result.CommitRefs[0].RepositoryRef != "github://github.com/owner/repo" || result.CommitRefs[0].SHA != "abc123" || result.CommitRefs[0].Subject != "Materialize AgentRun 1 repository changes" {
+		t.Fatalf("unexpected execution commit ref: %#v", result.CommitRefs[0])
+	}
+	if got := eventTypes(result.Events); got != "repository_commit.materialized,agent_command.completed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	detail, err := instanceStore.GetAgentRunDetail(runID)
+	if err != nil {
+		t.Fatalf("get AgentRun detail: %v", err)
+	}
+	if len(detail.CommitRefs) != 1 {
+		t.Fatalf("expected one persisted commit ref in run detail, got %#v", detail.CommitRefs)
+	}
+	if detail.CommitRefs[0].RepositoryRef != "github://github.com/owner/repo" || detail.CommitRefs[0].SHA != "abc123" || detail.CommitRefs[0].AuthorEmail != "forgelane@localhost" {
+		t.Fatalf("unexpected persisted commit ref: %#v", detail.CommitRefs[0])
+	}
+}
+
 func TestExecuteAgentRunCommandRecordsNonZeroExitAsFailedWithLogs(t *testing.T) {
 	instanceStore, runID := preparedAgentRun(t)
 
@@ -277,6 +316,25 @@ func (successfulCommandRunner) RunAgentCommand(context.Context, workflow.AgentCo
 	return workflow.AgentCommandRunResult{
 		ExitCode:       0,
 		ProcessStarted: true,
+	}, nil
+}
+
+type staticRepositoryChangeMaterializer struct{}
+
+func (staticRepositoryChangeMaterializer) SnapshotRepository(context.Context, workflow.Workspace) (workflow.RepositorySnapshot, error) {
+	return workflow.RepositorySnapshot{HeadSHA: "before"}, nil
+}
+
+func (staticRepositoryChangeMaterializer) MaterializeRepositoryChanges(context.Context, workflow.Workspace, workflow.RepositorySnapshot) (workflow.RepositoryChangeMaterialization, error) {
+	return workflow.RepositoryChangeMaterialization{
+		CommitRefs: []workflow.CommitRefPlan{
+			{
+				SHA:         "abc123",
+				Subject:     "Materialize AgentRun 1 repository changes",
+				AuthorName:  "ForgeLane",
+				AuthorEmail: "forgelane@localhost",
+			},
+		},
 	}, nil
 }
 

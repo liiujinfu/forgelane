@@ -20,18 +20,18 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func newRunsCommand(stdout io.Writer, provider workitems.Provider) *cobra.Command {
-	if provider == nil {
-		provider = githubprovider.NewIssueProvider(githubprovider.Options{})
+func newRunsCommand(stdout io.Writer, options Options) *cobra.Command {
+	if options.WorkItemProvider == nil {
+		options.WorkItemProvider = githubprovider.NewIssueProvider(githubprovider.Options{})
 	}
 	cmd := &cobra.Command{
 		Use:   "runs",
 		Short: "Create and inspect AgentRuns.",
 	}
-	cmd.AddCommand(newRunsCreateCommand(stdout, provider))
+	cmd.AddCommand(newRunsCreateCommand(stdout, options.WorkItemProvider))
 	cmd.AddCommand(newRunsShowCommand(stdout))
 	cmd.AddCommand(newRunsPrepareCommand(stdout))
-	cmd.AddCommand(newRunsExecuteCommand(stdout))
+	cmd.AddCommand(newRunsExecuteCommand(stdout, options))
 	cmd.AddCommand(newRunsLogsCommand(stdout))
 	return cmd
 }
@@ -141,7 +141,7 @@ func newRunsPrepareCommand(stdout io.Writer) *cobra.Command {
 	}
 }
 
-func newRunsExecuteCommand(stdout io.Writer) *cobra.Command {
+func newRunsExecuteCommand(stdout io.Writer, options Options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "execute <run_id>",
 		Short: "Execute the AgentAdapter command for a prepared AgentRun.",
@@ -158,9 +158,22 @@ func newRunsExecuteCommand(stdout io.Writer) *cobra.Command {
 			}
 			defer instanceStore.Close()
 
-			result, err := workflow.ExecuteAgentRunCommand(cmd.Context(), instanceStore, commandadapter.Adapter{
-				Secrets: commandadapter.EnvSecretStore{},
-			}, processrunner.Runner{}, runID)
+			planner := options.AgentCommandPlanner
+			if planner == nil {
+				planner = commandadapter.Adapter{
+					Secrets: commandadapter.EnvSecretStore{},
+				}
+			}
+			commandRunner := options.AgentCommandRunner
+			if commandRunner == nil {
+				commandRunner = processrunner.Runner{}
+			}
+			materializer := options.RepositoryChangeMaterializer
+			if materializer == nil {
+				materializer = runner.GitCommitMaterializer{}
+			}
+
+			result, err := workflow.ExecuteAgentRunCommandAndMaterialize(cmd.Context(), instanceStore, planner, commandRunner, materializer, runID)
 			if err != nil {
 				return err
 			}
@@ -242,6 +255,9 @@ func printExecutedAgentRun(stdout io.Writer, result store.AgentRunPrepareResult)
 	fmt.Fprintf(stdout, "Executed AgentRun %d\n", result.AgentRun.ID)
 	fmt.Fprintf(stdout, "RunnerJob ID: %d\n", result.RunnerJob.ID)
 	fmt.Fprintf(stdout, "Status: %s\n", result.AgentRun.Status)
+	for _, ref := range result.CommitRefs {
+		fmt.Fprintf(stdout, "Commit: %s@%s %s\n", ref.RepositoryRef, ref.SHA, ref.Subject)
+	}
 	for _, event := range result.Events {
 		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
 		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
@@ -326,6 +342,12 @@ func printAgentRunDetail(stdout io.Writer, detail store.AgentRunDetail) error {
 		fmt.Fprintf(stdout, "Workspace logs: %s\n", detail.Workspace.Paths.Logs)
 		fmt.Fprintf(stdout, "Workspace artifacts: %s\n", detail.Workspace.Paths.Artifacts)
 		fmt.Fprintf(stdout, "Workspace tmp: %s\n", detail.Workspace.Paths.Tmp)
+	}
+	if len(detail.CommitRefs) > 0 {
+		fmt.Fprintln(stdout, "Commit refs:")
+		for _, ref := range detail.CommitRefs {
+			fmt.Fprintf(stdout, "- %s@%s %s\n", ref.RepositoryRef, ref.SHA, ref.Subject)
+		}
 	}
 	return nil
 }
