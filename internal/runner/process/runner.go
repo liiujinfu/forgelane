@@ -64,8 +64,8 @@ func (Runner) RunAgentCommand(ctx context.Context, plan workflow.AgentCommandPla
 		stderrErr = capture.captureStream("stderr", "logs/stderr.log", plan.StderrPath, stderr)
 	}()
 
-	waitErr := cmd.Wait()
 	wg.Wait()
+	waitErr := cmd.Wait()
 
 	result := workflow.AgentCommandRunResult{
 		ExitCode:       exitCode(waitErr),
