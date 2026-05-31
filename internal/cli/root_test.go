@@ -1214,7 +1214,9 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 	for _, want := range []string{
 		"Executed AgentRun 1",
 		"Status: completed",
+		"ChangeSet: 1 planned forgelane/issue-123",
 		"Event: repository_commit.materialized",
+		"Event: change_set.created",
 		"Event: agent_command.completed",
 	} {
 		if !strings.Contains(executeStdout, want) {
@@ -1247,6 +1249,9 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 		t.Fatalf("expected runs show to succeed: %v\nstderr:\n%s", err, stderr)
 	}
 	for _, want := range []string{
+		"ChangeSet: 1 planned forgelane/issue-123",
+		"ChangeSet active run: 1",
+		"ChangeSet commits: 1",
 		"Commit refs:",
 		"github://github.com/owner/repo@",
 		"Materialize AgentRun 1 repository changes",
@@ -1266,9 +1271,11 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 	assertInOrder(t, eventsStdout, []string{
 		"agent_command.started",
 		"repository_commit.materialized",
+		"change_set.created",
 		"agent_command.completed",
 	})
 
+	assertTableCount(t, homeDir, "change_sets", 1)
 	assertTableCount(t, homeDir, "commit_refs", 1)
 }
 

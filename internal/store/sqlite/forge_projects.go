@@ -196,9 +196,36 @@ CREATE TABLE IF NOT EXISTS log_segments (
 	UNIQUE(agent_run_id, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS change_sets (
+	id INTEGER PRIMARY KEY,
+	work_item_id INTEGER NOT NULL REFERENCES work_items(id),
+	work_item_ref TEXT NOT NULL,
+	provider TEXT NOT NULL,
+	repository_ref TEXT NOT NULL,
+	base_branch TEXT NOT NULL,
+	branch_ref TEXT NOT NULL,
+	change_ref TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL CHECK(status IN (
+		'planned',
+		'branch_ready',
+		'draft_open',
+		'under_review',
+		'changes_requested',
+		'approved',
+		'merged',
+		'closed',
+		'abandoned'
+	)),
+	created_by_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+	active_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS commit_refs (
 	id INTEGER PRIMARY KEY,
 	agent_run_id INTEGER NOT NULL REFERENCES agent_runs(id),
+	change_set_id INTEGER REFERENCES change_sets(id),
 	repository_ref TEXT NOT NULL,
 	sha TEXT NOT NULL,
 	subject TEXT NOT NULL,
@@ -254,6 +281,10 @@ CREATE INDEX IF NOT EXISTS idx_events_agent_run_id ON events(agent_run_id);
 CREATE INDEX IF NOT EXISTS idx_runner_jobs_agent_run_id ON runner_jobs(agent_run_id);
 CREATE INDEX IF NOT EXISTS idx_workspaces_agent_run_id ON workspaces(agent_run_id);
 CREATE INDEX IF NOT EXISTS idx_log_segments_agent_run_id ON log_segments(agent_run_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_change_sets_work_item_id ON change_sets(work_item_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_change_sets_one_active_per_work_item
+ON change_sets(work_item_id)
+WHERE status NOT IN ('merged', 'closed', 'abandoned');
 CREATE INDEX IF NOT EXISTS idx_commit_refs_agent_run_id ON commit_refs(agent_run_id);`
 
 	if _, err := store.db.Exec(schema); err != nil {
@@ -268,16 +299,36 @@ CREATE INDEX IF NOT EXISTS idx_commit_refs_agent_run_id ON commit_refs(agent_run
 	if err := store.ensureColumn("commit_refs", "repository_ref", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := store.ensureColumn("commit_refs", "change_set_id", "INTEGER REFERENCES change_sets(id)"); err != nil {
+		return err
+	}
 	if _, err := store.db.Exec("CREATE INDEX IF NOT EXISTS idx_events_control_action_id ON events(control_action_id)"); err != nil {
 		return fmt.Errorf("initialize ControlAction event index: %w", err)
+	}
+	if _, err := store.db.Exec("CREATE INDEX IF NOT EXISTS idx_commit_refs_change_set_id ON commit_refs(change_set_id)"); err != nil {
+		return fmt.Errorf("initialize CommitRef ChangeSet index: %w", err)
 	}
 	return nil
 }
 
 func (store *Store) ensureColumn(table string, column string, definition string) error {
+	hasColumn, err := store.tableHasColumn(table, column)
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	if _, err := store.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition); err != nil {
+		return fmt.Errorf("add %s.%s column: %w", table, column, err)
+	}
+	return nil
+}
+
+func (store *Store) tableHasColumn(table string, column string) (bool, error) {
 	rows, err := store.db.Query("PRAGMA table_info(" + table + ")")
 	if err != nil {
-		return fmt.Errorf("inspect %s schema: %w", table, err)
+		return false, fmt.Errorf("inspect %s schema: %w", table, err)
 	}
 	defer rows.Close()
 
@@ -289,19 +340,16 @@ func (store *Store) ensureColumn(table string, column string, definition string)
 		var defaultValue sql.NullString
 		var primaryKey int
 		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
-			return fmt.Errorf("scan %s schema: %w", table, err)
+			return false, fmt.Errorf("scan %s schema: %w", table, err)
 		}
 		if name == column {
-			return nil
+			return true, nil
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate %s schema: %w", table, err)
+		return false, fmt.Errorf("iterate %s schema: %w", table, err)
 	}
-	if _, err := store.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition); err != nil {
-		return fmt.Errorf("add %s.%s column: %w", table, column, err)
-	}
-	return nil
+	return false, nil
 }
 
 // WorkItem is a persisted WorkItem snapshot.
@@ -333,6 +381,9 @@ type LogSegment = workflow.LogSegment
 
 // CommitRef records one local repository commit produced by an AgentRun.
 type CommitRef = workflow.CommitRef
+
+// ChangeSet records one ForgeLane-owned delivery artifact for a WorkItem.
+type ChangeSet = workflow.ChangeSet
 
 // RunSpec is the immutable execution input snapshot for one AgentRun.
 type RunSpec = workflow.RunSpec
@@ -652,6 +703,11 @@ WHERE agent_runs.id = ?`
 		return AgentRunDetail{}, err
 	}
 	detail.CommitRefs = commitRefs
+	changeSet, err := store.getChangeSetForAgentRun(id)
+	if err != nil {
+		return AgentRunDetail{}, err
+	}
+	detail.ChangeSet = changeSet
 	deliverySkipped, deliverySkipReason, err := store.getDeliverySkipForAgentRun(id)
 	if err != nil {
 		return AgentRunDetail{}, err
@@ -730,6 +786,49 @@ WHERE agent_run_id = ?`, agentRunID).Scan(
 }
 
 func (store *Store) listCommitRefsForAgentRun(agentRunID int64) ([]CommitRef, error) {
+	hasChangeSetID, err := store.tableHasColumn("commit_refs", "change_set_id")
+	if err != nil {
+		return nil, err
+	}
+	if !hasChangeSetID {
+		return store.listLegacyCommitRefsForAgentRun(agentRunID)
+	}
+
+	rows, err := store.db.Query(`
+SELECT id, agent_run_id, COALESCE(change_set_id, 0), repository_ref, sha, subject, author_name, author_email, created_at
+FROM commit_refs
+WHERE agent_run_id = ?
+ORDER BY id ASC`, agentRunID)
+	if err != nil {
+		return nil, fmt.Errorf("query CommitRefs for AgentRun %d: %w", agentRunID, err)
+	}
+	defer rows.Close()
+
+	var refs []CommitRef
+	for rows.Next() {
+		var ref CommitRef
+		if err := rows.Scan(
+			&ref.ID,
+			&ref.AgentRunID,
+			&ref.ChangeSetID,
+			&ref.RepositoryRef,
+			&ref.SHA,
+			&ref.Subject,
+			&ref.AuthorName,
+			&ref.AuthorEmail,
+			&ref.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan CommitRef for AgentRun %d: %w", agentRunID, err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate CommitRefs for AgentRun %d: %w", agentRunID, err)
+	}
+	return refs, nil
+}
+
+func (store *Store) listLegacyCommitRefsForAgentRun(agentRunID int64) ([]CommitRef, error) {
 	rows, err := store.db.Query(`
 SELECT id, agent_run_id, repository_ref, sha, subject, author_name, author_email, created_at
 FROM commit_refs
@@ -759,6 +858,112 @@ ORDER BY id ASC`, agentRunID)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate CommitRefs for AgentRun %d: %w", agentRunID, err)
+	}
+	return refs, nil
+}
+
+func (store *Store) getChangeSetForAgentRun(agentRunID int64) (*ChangeSet, error) {
+	hasChangeSetID, err := store.tableHasColumn("change_sets", "id")
+	if err != nil {
+		return nil, err
+	}
+	if !hasChangeSetID {
+		return nil, nil
+	}
+	hasCommitChangeSetID, err := store.tableHasColumn("commit_refs", "change_set_id")
+	if err != nil {
+		return nil, err
+	}
+	if !hasCommitChangeSetID {
+		return nil, nil
+	}
+
+	var changeSet ChangeSet
+	err = store.db.QueryRow(`
+SELECT
+	c.id,
+	c.work_item_id,
+	c.work_item_ref,
+	c.provider,
+	c.repository_ref,
+	c.base_branch,
+	c.branch_ref,
+	c.change_ref,
+	c.status,
+	c.created_by_run_id,
+	c.active_run_id,
+	c.created_at,
+	c.updated_at
+FROM change_sets c
+WHERE c.active_run_id = ?
+	OR EXISTS (
+		SELECT 1
+		FROM commit_refs r
+		WHERE r.agent_run_id = ?
+			AND r.change_set_id = c.id
+	)
+ORDER BY CASE WHEN c.active_run_id = ? THEN 0 ELSE 1 END, c.id DESC
+LIMIT 1`, agentRunID, agentRunID, agentRunID).Scan(
+		&changeSet.ID,
+		&changeSet.WorkItemID,
+		&changeSet.WorkItemRef,
+		&changeSet.Provider,
+		&changeSet.RepositoryRef,
+		&changeSet.BaseBranch,
+		&changeSet.BranchRef,
+		&changeSet.ChangeRef,
+		&changeSet.Status,
+		&changeSet.CreatedByRunID,
+		&changeSet.ActiveRunID,
+		&changeSet.CreatedAt,
+		&changeSet.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query ChangeSet for AgentRun %d: %w", agentRunID, err)
+	}
+
+	commitRefs, err := store.listCommitRefsForChangeSet(changeSet.ID)
+	if err != nil {
+		return nil, err
+	}
+	changeSet.CommitRefs = commitRefs
+	return &changeSet, nil
+}
+
+func (store *Store) listCommitRefsForChangeSet(changeSetID int64) ([]CommitRef, error) {
+	rows, err := store.db.Query(`
+SELECT id, agent_run_id, COALESCE(change_set_id, 0), repository_ref, sha, subject, author_name, author_email, created_at
+FROM commit_refs
+WHERE change_set_id = ?
+ORDER BY id ASC`, changeSetID)
+	if err != nil {
+		return nil, fmt.Errorf("query CommitRefs for ChangeSet %d: %w", changeSetID, err)
+	}
+	defer rows.Close()
+
+	var refs []CommitRef
+	for rows.Next() {
+		var ref CommitRef
+		if err := rows.Scan(
+			&ref.ID,
+			&ref.AgentRunID,
+			&ref.ChangeSetID,
+			&ref.RepositoryRef,
+			&ref.SHA,
+			&ref.Subject,
+			&ref.AuthorName,
+			&ref.AuthorEmail,
+			&ref.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan CommitRef for ChangeSet %d: %w", changeSetID, err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate CommitRefs for ChangeSet %d: %w", changeSetID, err)
 	}
 	return refs, nil
 }
@@ -1079,6 +1284,19 @@ INSERT INTO commit_refs (
 		materializationEvents = append(materializationEvents, skippedEvent)
 	}
 
+	var changeSet *ChangeSet
+	if completion.ChangeSet != nil && len(commitRefs) > 0 {
+		var changeSetEvent Event
+		changeSet, changeSetEvent, err = store.createOrClaimChangeSetTx(tx, detail, *completion.ChangeSet, commitRefs, now)
+		if err != nil {
+			return AgentRunPrepareResult{}, err
+		}
+		for i := range commitRefs {
+			commitRefs[i].ChangeSetID = changeSet.ID
+		}
+		materializationEvents = append(materializationEvents, changeSetEvent)
+	}
+
 	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
 		Type:           eventType,
 		OccurredAt:     now,
@@ -1131,8 +1349,228 @@ INSERT INTO commit_refs (
 		},
 		Workspace:  workspace,
 		CommitRefs: commitRefs,
+		ChangeSet:  changeSet,
 		Events:     append(materializationEvents, event),
 	}, nil
+}
+
+func (store *Store) createOrClaimChangeSetTx(tx *sql.Tx, detail AgentRunDetail, plan workflow.ChangeSetPlan, commitRefs []CommitRef, now string) (*ChangeSet, Event, error) {
+	changeSet, found, err := scanActiveChangeSetTx(tx, plan.WorkItemID)
+	if err != nil {
+		return nil, Event{}, err
+	}
+
+	eventType := "change_set.claimed"
+	if found {
+		if err := validateChangeSetClaim(changeSet, plan); err != nil {
+			return nil, Event{}, err
+		}
+		if _, err := tx.Exec(`
+UPDATE change_sets
+SET active_run_id = ?, updated_at = ?
+WHERE id = ?`, plan.ActiveRunID, now, changeSet.ID); err != nil {
+			return nil, Event{}, fmt.Errorf("claim ChangeSet %d for AgentRun %d: %w", changeSet.ID, plan.ActiveRunID, err)
+		}
+		changeSet.ActiveRunID = plan.ActiveRunID
+		changeSet.UpdatedAt = now
+	} else {
+		if plan.Status == "" {
+			plan.Status = "planned"
+		}
+		result, err := tx.Exec(`
+INSERT INTO change_sets (
+	work_item_id,
+	work_item_ref,
+	provider,
+	repository_ref,
+	base_branch,
+	branch_ref,
+	status,
+	created_by_run_id,
+	active_run_id,
+	created_at,
+	updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			plan.WorkItemID,
+			plan.WorkItemRef,
+			plan.Provider,
+			plan.RepositoryRef,
+			plan.BaseBranch,
+			plan.BranchRef,
+			plan.Status,
+			plan.CreatedByRunID,
+			plan.ActiveRunID,
+			now,
+			now,
+		)
+		if err != nil {
+			return nil, Event{}, fmt.Errorf("insert ChangeSet for WorkItem %d: %w", plan.WorkItemID, err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			return nil, Event{}, fmt.Errorf("read inserted ChangeSet id: %w", err)
+		}
+		changeSet = ChangeSet{
+			ID:             id,
+			WorkItemID:     plan.WorkItemID,
+			WorkItemRef:    plan.WorkItemRef,
+			Provider:       plan.Provider,
+			RepositoryRef:  plan.RepositoryRef,
+			BaseBranch:     plan.BaseBranch,
+			BranchRef:      plan.BranchRef,
+			Status:         plan.Status,
+			CreatedByRunID: plan.CreatedByRunID,
+			ActiveRunID:    plan.ActiveRunID,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		eventType = "change_set.created"
+	}
+
+	for _, ref := range commitRefs {
+		if _, err := tx.Exec(`
+UPDATE commit_refs
+SET change_set_id = ?
+WHERE id = ?`, changeSet.ID, ref.ID); err != nil {
+			return nil, Event{}, fmt.Errorf("link CommitRef %d to ChangeSet %d: %w", ref.ID, changeSet.ID, err)
+		}
+	}
+	linkedRefs, err := listCommitRefsForChangeSetTx(tx, changeSet.ID)
+	if err != nil {
+		return nil, Event{}, err
+	}
+	changeSet.CommitRefs = linkedRefs
+
+	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:           eventType,
+		OccurredAt:     now,
+		ForgeProjectID: detail.WorkItem.ForgeProjectID,
+		SubjectType:    "change_set",
+		SubjectRef:     fmt.Sprintf("change_set:%d", changeSet.ID),
+		WorkItemID:     detail.WorkItem.ID,
+		WorkItemRef:    detail.WorkItem.ProviderRef,
+		AgentRunID:     detail.AgentRun.ID,
+		ChangeSetID:    changeSet.ID,
+		Payload: map[string]any{
+			"change_set_id":     changeSet.ID,
+			"work_item_id":      changeSet.WorkItemID,
+			"work_item_ref":     changeSet.WorkItemRef,
+			"provider":          changeSet.Provider,
+			"repository_ref":    changeSet.RepositoryRef,
+			"base_branch":       changeSet.BaseBranch,
+			"branch_ref":        changeSet.BranchRef,
+			"status":            changeSet.Status,
+			"created_by_run_id": changeSet.CreatedByRunID,
+			"active_run_id":     changeSet.ActiveRunID,
+			"commit_refs":       len(linkedRefs),
+		},
+	})
+	if err != nil {
+		return nil, Event{}, err
+	}
+	return &changeSet, event, nil
+}
+
+func validateChangeSetClaim(changeSet ChangeSet, plan workflow.ChangeSetPlan) error {
+	if changeSet.Provider != plan.Provider ||
+		changeSet.RepositoryRef != plan.RepositoryRef ||
+		changeSet.BaseBranch != plan.BaseBranch ||
+		changeSet.BranchRef != plan.BranchRef {
+		return fmt.Errorf(
+			"ChangeSet claim for AgentRun %d does not match active ChangeSet %d: got provider=%q repository_ref=%q base_branch=%q branch_ref=%q; active provider=%q repository_ref=%q base_branch=%q branch_ref=%q",
+			plan.ActiveRunID,
+			changeSet.ID,
+			plan.Provider,
+			plan.RepositoryRef,
+			plan.BaseBranch,
+			plan.BranchRef,
+			changeSet.Provider,
+			changeSet.RepositoryRef,
+			changeSet.BaseBranch,
+			changeSet.BranchRef,
+		)
+	}
+	return nil
+}
+
+func listCommitRefsForChangeSetTx(tx *sql.Tx, changeSetID int64) ([]CommitRef, error) {
+	rows, err := tx.Query(`
+SELECT id, agent_run_id, COALESCE(change_set_id, 0), repository_ref, sha, subject, author_name, author_email, created_at
+FROM commit_refs
+WHERE change_set_id = ?
+ORDER BY id ASC`, changeSetID)
+	if err != nil {
+		return nil, fmt.Errorf("query CommitRefs for ChangeSet %d: %w", changeSetID, err)
+	}
+	defer rows.Close()
+
+	var refs []CommitRef
+	for rows.Next() {
+		var ref CommitRef
+		if err := rows.Scan(
+			&ref.ID,
+			&ref.AgentRunID,
+			&ref.ChangeSetID,
+			&ref.RepositoryRef,
+			&ref.SHA,
+			&ref.Subject,
+			&ref.AuthorName,
+			&ref.AuthorEmail,
+			&ref.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan CommitRef for ChangeSet %d: %w", changeSetID, err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate CommitRefs for ChangeSet %d: %w", changeSetID, err)
+	}
+	return refs, nil
+}
+
+func scanActiveChangeSetTx(tx *sql.Tx, workItemID int64) (ChangeSet, bool, error) {
+	var changeSet ChangeSet
+	err := tx.QueryRow(`
+SELECT
+	id,
+	work_item_id,
+	work_item_ref,
+	provider,
+	repository_ref,
+	base_branch,
+	branch_ref,
+	change_ref,
+	status,
+	created_by_run_id,
+	active_run_id,
+	created_at,
+	updated_at
+FROM change_sets
+WHERE work_item_id = ?
+	AND status NOT IN ('merged', 'closed', 'abandoned')
+ORDER BY id DESC
+LIMIT 1`, workItemID).Scan(
+		&changeSet.ID,
+		&changeSet.WorkItemID,
+		&changeSet.WorkItemRef,
+		&changeSet.Provider,
+		&changeSet.RepositoryRef,
+		&changeSet.BaseBranch,
+		&changeSet.BranchRef,
+		&changeSet.ChangeRef,
+		&changeSet.Status,
+		&changeSet.CreatedByRunID,
+		&changeSet.ActiveRunID,
+		&changeSet.CreatedAt,
+		&changeSet.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return ChangeSet{}, false, nil
+	}
+	if err != nil {
+		return ChangeSet{}, false, fmt.Errorf("query active ChangeSet for WorkItem %d: %w", workItemID, err)
+	}
+	return changeSet, true, nil
 }
 
 func boolInt(value bool) int {
@@ -1524,6 +1962,7 @@ type agentRunEventInput struct {
 	WorkItemRef     string
 	AgentRunID      int64
 	ControlActionID int64
+	ChangeSetID     int64
 	Payload         map[string]any
 }
 
@@ -1535,6 +1974,10 @@ func appendAgentRunEventTx(tx *sql.Tx, input agentRunEventInput) (Event, error) 
 	var controlActionID any
 	if input.ControlActionID != 0 {
 		controlActionID = input.ControlActionID
+	}
+	var changeSetID any
+	if input.ChangeSetID != 0 {
+		changeSetID = input.ChangeSetID
 	}
 
 	result, err := tx.Exec(`
@@ -1549,9 +1992,10 @@ INSERT INTO events (
 	work_item_ref,
 	agent_run_id,
 	control_action_id,
+	change_set_id,
 	provider_ref,
 	payload
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		input.Type,
 		input.OccurredAt,
 		"forgelane",
@@ -1562,6 +2006,7 @@ INSERT INTO events (
 		input.WorkItemRef,
 		input.AgentRunID,
 		controlActionID,
+		changeSetID,
 		input.WorkItemRef,
 		string(payload),
 	)

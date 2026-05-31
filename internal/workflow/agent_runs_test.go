@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,7 +178,7 @@ func TestExecuteAgentRunCommandPersistsMaterializedCommitRefs(t *testing.T) {
 	if result.CommitRefs[0].RepositoryRef != "github://github.com/owner/repo" || result.CommitRefs[0].SHA != "abc123" || result.CommitRefs[0].Subject != "Materialize AgentRun 1 repository changes" {
 		t.Fatalf("unexpected execution commit ref: %#v", result.CommitRefs[0])
 	}
-	if got := eventTypes(result.Events); got != "repository_commit.materialized,agent_command.completed" {
+	if got := eventTypes(result.Events); got != "repository_commit.materialized,change_set.created,agent_command.completed" {
 		t.Fatalf("unexpected Event sequence %s", got)
 	}
 
@@ -190,6 +191,154 @@ func TestExecuteAgentRunCommandPersistsMaterializedCommitRefs(t *testing.T) {
 	}
 	if detail.CommitRefs[0].RepositoryRef != "github://github.com/owner/repo" || detail.CommitRefs[0].SHA != "abc123" || detail.CommitRefs[0].AuthorEmail != "forgelane@localhost" {
 		t.Fatalf("unexpected persisted commit ref: %#v", detail.CommitRefs[0])
+	}
+}
+
+func TestExecuteAgentRunCommandCreatesActiveChangeSetFromLocalCommitRefs(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+
+	result, err := workflow.ExecuteAgentRunCommandAndMaterialize(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("execute AgentRun command: %v", err)
+	}
+	if result.ChangeSet == nil {
+		t.Fatalf("expected execution result to include active ChangeSet")
+	}
+	if result.ChangeSet.Provider != "github" ||
+		result.ChangeSet.RepositoryRef != "github://github.com/owner/repo" ||
+		result.ChangeSet.BaseBranch != "main" ||
+		result.ChangeSet.BranchRef != "forgelane/issue-123" ||
+		result.ChangeSet.CreatedByRunID != runID ||
+		result.ChangeSet.ActiveRunID != runID ||
+		len(result.ChangeSet.CommitRefs) != 1 ||
+		result.ChangeSet.CommitRefs[0].SHA != "abc123" {
+		t.Fatalf("unexpected execution ChangeSet: %#v", result.ChangeSet)
+	}
+	if got := eventTypes(result.Events); got != "repository_commit.materialized,change_set.created,agent_command.completed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	detail, err := instanceStore.GetAgentRunDetail(runID)
+	if err != nil {
+		t.Fatalf("get AgentRun detail: %v", err)
+	}
+	if detail.ChangeSet == nil {
+		t.Fatalf("expected run detail to include active ChangeSet")
+	}
+	if detail.ChangeSet.ID != result.ChangeSet.ID ||
+		detail.ChangeSet.Status != "planned" ||
+		len(detail.ChangeSet.CommitRefs) != 1 ||
+		detail.ChangeSet.CommitRefs[0].SHA != "abc123" {
+		t.Fatalf("unexpected detail ChangeSet: %#v", detail.ChangeSet)
+	}
+}
+
+func TestExecuteAgentRunCommandClaimsExistingActiveChangeSetFromLocalCommitRefs(t *testing.T) {
+	instanceStore, firstRunID := preparedAgentRun(t)
+
+	firstResult, err := workflow.ExecuteAgentRunCommandAndMaterialize(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		firstRunID,
+	)
+	if err != nil {
+		t.Fatalf("execute first AgentRun command: %v", err)
+	}
+	if firstResult.ChangeSet == nil {
+		t.Fatalf("expected first AgentRun to create ChangeSet")
+	}
+
+	secondRunID := createRetryAgentRunForExistingWorkItem(t, instanceStore, firstRunID)
+	secondResult, err := workflow.ExecuteAgentRunCommandAndMaterialize(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		secondCommitRepositoryChangeMaterializer{},
+		secondRunID,
+	)
+	if err != nil {
+		t.Fatalf("execute second AgentRun command: %v", err)
+	}
+	if secondResult.ChangeSet == nil {
+		t.Fatalf("expected second AgentRun to claim ChangeSet")
+	}
+	if secondResult.ChangeSet.ID != firstResult.ChangeSet.ID ||
+		secondResult.ChangeSet.CreatedByRunID != firstRunID ||
+		secondResult.ChangeSet.ActiveRunID != secondRunID ||
+		len(secondResult.ChangeSet.CommitRefs) != 2 ||
+		secondResult.ChangeSet.CommitRefs[0].SHA != "abc123" ||
+		secondResult.ChangeSet.CommitRefs[1].SHA != "def456" {
+		t.Fatalf("unexpected claimed ChangeSet: %#v", secondResult.ChangeSet)
+	}
+	if got := eventTypes(secondResult.Events); got != "repository_commit.materialized,change_set.claimed,agent_command.completed" {
+		t.Fatalf("unexpected second Event sequence %s", got)
+	}
+
+	secondDetail, err := instanceStore.GetAgentRunDetail(secondRunID)
+	if err != nil {
+		t.Fatalf("get second AgentRun detail: %v", err)
+	}
+	if secondDetail.ChangeSet == nil ||
+		secondDetail.ChangeSet.ID != firstResult.ChangeSet.ID ||
+		secondDetail.ChangeSet.ActiveRunID != secondRunID ||
+		len(secondDetail.ChangeSet.CommitRefs) != 2 {
+		t.Fatalf("unexpected second detail ChangeSet: %#v", secondDetail.ChangeSet)
+	}
+}
+
+func TestStoreRejectsMismatchedActiveChangeSetClaim(t *testing.T) {
+	instanceStore, firstRunID := preparedAgentRun(t)
+
+	if _, err := workflow.ExecuteAgentRunCommandAndMaterialize(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		firstRunID,
+	); err != nil {
+		t.Fatalf("execute first AgentRun command: %v", err)
+	}
+
+	secondRunID := createRetryAgentRunForExistingWorkItem(t, instanceStore, firstRunID)
+	_, err := instanceStore.MarkAgentCommandCompleted(secondRunID, workflow.AgentCommandCompletion{
+		Status: "completed",
+		CommitRefs: []workflow.CommitRefPlan{
+			{
+				SHA:         "def456",
+				Subject:     "Materialize AgentRun 2 repository changes",
+				AuthorName:  "ForgeLane",
+				AuthorEmail: "forgelane@localhost",
+			},
+		},
+		ChangeSet: &workflow.ChangeSetPlan{
+			WorkItemID:     1,
+			WorkItemRef:    "github://github.com/owner/repo/issues/123",
+			Provider:       "github",
+			RepositoryRef:  "github://github.com/owner/repo",
+			BaseBranch:     "main",
+			BranchRef:      "forgelane/alternate-branch",
+			Status:         "planned",
+			CreatedByRunID: secondRunID,
+			ActiveRunID:    secondRunID,
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected mismatched ChangeSet claim to fail")
+	}
+	if !strings.Contains(err.Error(), "does not match active ChangeSet") {
+		t.Fatalf("expected ChangeSet invariant error, got %v", err)
 	}
 }
 
@@ -378,6 +527,25 @@ func (staticRepositoryChangeMaterializer) MaterializeRepositoryChanges(context.C
 	}, nil
 }
 
+type secondCommitRepositoryChangeMaterializer struct{}
+
+func (secondCommitRepositoryChangeMaterializer) SnapshotRepository(context.Context, workflow.Workspace) (workflow.RepositorySnapshot, error) {
+	return workflow.RepositorySnapshot{HeadSHA: "abc123"}, nil
+}
+
+func (secondCommitRepositoryChangeMaterializer) MaterializeRepositoryChanges(context.Context, workflow.Workspace, workflow.RepositorySnapshot) (workflow.RepositoryChangeMaterialization, error) {
+	return workflow.RepositoryChangeMaterialization{
+		CommitRefs: []workflow.CommitRefPlan{
+			{
+				SHA:         "def456",
+				Subject:     "Materialize AgentRun 2 repository changes",
+				AuthorName:  "ForgeLane",
+				AuthorEmail: "forgelane@localhost",
+			},
+		},
+	}, nil
+}
+
 type noChangeRepositoryMaterializer struct{}
 
 func (noChangeRepositoryMaterializer) SnapshotRepository(context.Context, workflow.Workspace) (workflow.RepositorySnapshot, error) {
@@ -499,4 +667,34 @@ func preparedAgentRunWithOptions(t *testing.T, options preparedAgentRunOptions) 
 		t.Fatalf("mark Workspace ready: %v", err)
 	}
 	return instanceStore, createResult.AgentRun.ID
+}
+
+func createRetryAgentRunForExistingWorkItem(t *testing.T, instanceStore *store.Store, priorRunID int64) int64 {
+	t.Helper()
+
+	priorDetail, err := instanceStore.GetAgentRunDetail(priorRunID)
+	if err != nil {
+		t.Fatalf("get prior AgentRun detail: %v", err)
+	}
+	createResult, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
+		WorkItem: priorDetail.WorkItem,
+	})
+	if err != nil {
+		t.Fatalf("create retry AgentRun: %v", err)
+	}
+	workspaceRoot := filepath.Join(t.TempDir(), "retry-workspace")
+	paths := workflow.WorkspacePaths{
+		Root:      workspaceRoot,
+		Repo:      filepath.Join(workspaceRoot, "repo"),
+		Logs:      filepath.Join(workspaceRoot, "logs"),
+		Artifacts: filepath.Join(workspaceRoot, "artifacts"),
+		Tmp:       filepath.Join(workspaceRoot, "tmp"),
+	}
+	if _, err := instanceStore.AllocateWorkspace(createResult.AgentRun.ID, paths); err != nil {
+		t.Fatalf("allocate retry Workspace: %v", err)
+	}
+	if _, err := instanceStore.MarkWorkspaceReady(createResult.AgentRun.ID); err != nil {
+		t.Fatalf("mark retry Workspace ready: %v", err)
+	}
+	return createResult.AgentRun.ID
 }
