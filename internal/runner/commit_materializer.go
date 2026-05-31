@@ -61,7 +61,12 @@ func (GitCommitMaterializer) MaterializeRepositoryChanges(ctx context.Context, w
 	if err != nil {
 		return workflow.RepositoryChangeMaterialization{}, err
 	}
-	return workflow.RepositoryChangeMaterialization{CommitRefs: commitRefs}, nil
+	materialization := workflow.RepositoryChangeMaterialization{CommitRefs: commitRefs}
+	if len(commitRefs) == 0 {
+		materialization.DeliverySkipped = true
+		materialization.DeliverySkipReason = "no_repository_changes"
+	}
+	return materialization, nil
 }
 
 func commitRefsAfter(ctx context.Context, repo string, baseSHA string) ([]workflow.CommitRefPlan, error) {

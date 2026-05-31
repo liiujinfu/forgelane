@@ -80,6 +80,11 @@ ForgeLane is an agentic software delivery control plane.
 - Command terminal Events distinguish success, failure, timeout, and runtime
   cancellation through `agent_command.completed`, `agent_command.failed`,
   `agent_command.timed_out`, and `agent_command.cancelled`.
+- No-change delivery is an explicit successful terminal result: when an
+  AgentAdapter completes and `repo/` has no tracked or untracked changes,
+  ForgeLane records `repository_delivery.skipped` with reason
+  `no_repository_changes` and does not create commit refs, a ChangeSet, branch
+  push, or draft PR.
 - The first-class deliverable is a PR/MR, not a chat answer.
 - Automated and privileged actions must be auditable through events.
 - Privileged actions must pass through an explicit permission or approval

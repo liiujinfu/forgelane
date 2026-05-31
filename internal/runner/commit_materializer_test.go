@@ -94,6 +94,31 @@ func TestGitCommitMaterializerReportsAgentCreatedCommits(t *testing.T) {
 	}
 }
 
+func TestGitCommitMaterializerSkipsDeliveryForCleanRepository(t *testing.T) {
+	workspace := newWorkspaceRepo(t)
+	materializer := runner.GitCommitMaterializer{}
+	snapshot, err := materializer.SnapshotRepository(context.Background(), workspace)
+	if err != nil {
+		t.Fatalf("snapshot repository: %v", err)
+	}
+	before := strings.TrimSpace(gitOutput(t, workspace.Paths.Repo, "rev-parse", "HEAD"))
+
+	result, err := materializer.MaterializeRepositoryChanges(context.Background(), workspace, snapshot)
+	if err != nil {
+		t.Fatalf("materialize repository changes: %v", err)
+	}
+	if len(result.CommitRefs) != 0 {
+		t.Fatalf("expected no commit refs for clean repository, got %#v", result.CommitRefs)
+	}
+	if !result.DeliverySkipped || result.DeliverySkipReason != "no_repository_changes" {
+		t.Fatalf("expected no-change delivery skip, got %#v", result)
+	}
+	after := strings.TrimSpace(gitOutput(t, workspace.Paths.Repo, "rev-parse", "HEAD"))
+	if after != before {
+		t.Fatalf("expected no local commit for clean repository, before %s after %s", before, after)
+	}
+}
+
 func TestGitCommitMaterializerRejectsWorkspaceMetadataInsideRepo(t *testing.T) {
 	workspace := newWorkspaceRepo(t)
 	workspace.Paths.Logs = filepath.Join(workspace.Paths.Repo, "logs")

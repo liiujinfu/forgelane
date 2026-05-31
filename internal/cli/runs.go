@@ -255,6 +255,9 @@ func printExecutedAgentRun(stdout io.Writer, result store.AgentRunPrepareResult)
 	fmt.Fprintf(stdout, "Executed AgentRun %d\n", result.AgentRun.ID)
 	fmt.Fprintf(stdout, "RunnerJob ID: %d\n", result.RunnerJob.ID)
 	fmt.Fprintf(stdout, "Status: %s\n", result.AgentRun.Status)
+	if hasEventType(result.Events, "repository_delivery.skipped") {
+		fmt.Fprintln(stdout, "Delivery: skipped (no repository changes)")
+	}
 	for _, ref := range result.CommitRefs {
 		fmt.Fprintf(stdout, "Commit: %s@%s %s\n", ref.RepositoryRef, ref.SHA, ref.Subject)
 	}
@@ -343,6 +346,9 @@ func printAgentRunDetail(stdout io.Writer, detail store.AgentRunDetail) error {
 		fmt.Fprintf(stdout, "Workspace artifacts: %s\n", detail.Workspace.Paths.Artifacts)
 		fmt.Fprintf(stdout, "Workspace tmp: %s\n", detail.Workspace.Paths.Tmp)
 	}
+	if detail.DeliverySkipped {
+		fmt.Fprintln(stdout, "Delivery: skipped (no repository changes)")
+	}
 	if len(detail.CommitRefs) > 0 {
 		fmt.Fprintln(stdout, "Commit refs:")
 		for _, ref := range detail.CommitRefs {
@@ -350,6 +356,15 @@ func printAgentRunDetail(stdout io.Writer, detail store.AgentRunDetail) error {
 		}
 	}
 	return nil
+}
+
+func hasEventType(events []store.Event, eventType string) bool {
+	for _, event := range events {
+		if event.Type == eventType {
+			return true
+		}
+	}
+	return false
 }
 
 func stringField(values map[string]any, key string) string {

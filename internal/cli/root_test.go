@@ -1061,6 +1061,8 @@ func TestRunsExecuteHarmlessPresetCapturesLogsAndScrubsEnvironment(t *testing.T)
 	for _, want := range []string{
 		"Executed AgentRun 1",
 		"Status: completed",
+		"Delivery: skipped (no repository changes)",
+		"Event: repository_delivery.skipped",
 		"Event: agent_command.completed",
 	} {
 		if !strings.Contains(executeStdout, want) {
@@ -1076,6 +1078,9 @@ func TestRunsExecuteHarmlessPresetCapturesLogsAndScrubsEnvironment(t *testing.T)
 	}
 	if !strings.Contains(showStdout, "Status: completed") {
 		t.Fatalf("expected completed AgentRun, got:\n%s", showStdout)
+	}
+	if !strings.Contains(showStdout, "Delivery: skipped (no repository changes)") {
+		t.Fatalf("expected run detail to show skipped delivery, got:\n%s", showStdout)
 	}
 
 	logsStdout, stderr, err := executeForTestWithOptions(t, Options{
@@ -1120,6 +1125,7 @@ func TestRunsExecuteHarmlessPresetCapturesLogsAndScrubsEnvironment(t *testing.T)
 	assertInOrder(t, eventsStdout, []string{
 		"workspace.prepared",
 		"agent_command.started",
+		"repository_delivery.skipped",
 		"agent_command.completed",
 	})
 	if strings.Contains(eventsStdout, "forgelane harmless stdout") {
@@ -1134,6 +1140,13 @@ func TestRunsExecuteHarmlessPresetCapturesLogsAndScrubsEnvironment(t *testing.T)
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected log file %s: %v", path, err)
 		}
+	}
+	if got := strings.TrimSpace(gitOutput(t, workspaceRepo, "rev-list", "--count", "HEAD")); got != "1" {
+		t.Fatalf("expected no local delivery commit, got %s commits", got)
+	}
+	assertTableCount(t, homeDir, "commit_refs", 0)
+	if fakeProvider.calls != 1 {
+		t.Fatalf("expected no provider calls after initial WorkItem import, got %d calls", fakeProvider.calls)
 	}
 }
 
