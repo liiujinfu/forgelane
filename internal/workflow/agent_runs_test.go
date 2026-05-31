@@ -193,6 +193,46 @@ func TestExecuteAgentRunCommandPersistsMaterializedCommitRefs(t *testing.T) {
 	}
 }
 
+func TestExecuteAgentRunCommandRecordsSkippedDeliveryWhenNoRepositoryChanges(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+
+	result, err := workflow.ExecuteAgentRunCommandAndMaterialize(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		noChangeRepositoryMaterializer{},
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("execute AgentRun command: %v", err)
+	}
+	if result.AgentRun.Status != "completed" {
+		t.Fatalf("expected successful command to complete AgentRun, got %q", result.AgentRun.Status)
+	}
+	if len(result.CommitRefs) != 0 {
+		t.Fatalf("expected no CommitRefs for no-change delivery, got %#v", result.CommitRefs)
+	}
+	if got := eventTypes(result.Events); got != "repository_delivery.skipped,agent_command.completed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	events, err := instanceStore.ListEventsForAgentRun(runID)
+	if err != nil {
+		t.Fatalf("list Events: %v", err)
+	}
+	if got := eventTypes(events); got != "control_action.succeeded,agent_run.created,run_spec.created,workspace.allocated,workspace.prepared,agent_command.started,repository_delivery.skipped,agent_command.completed" {
+		t.Fatalf("unexpected persisted Event sequence %s", got)
+	}
+	detail, err := instanceStore.GetAgentRunDetail(runID)
+	if err != nil {
+		t.Fatalf("get AgentRun detail: %v", err)
+	}
+	if !detail.DeliverySkipped || detail.DeliverySkipReason != "no_repository_changes" {
+		t.Fatalf("expected explicit no-change delivery outcome in run detail, got %#v", detail)
+	}
+}
+
 func TestExecuteAgentRunCommandRecordsNonZeroExitAsFailedWithLogs(t *testing.T) {
 	instanceStore, runID := preparedAgentRun(t)
 
@@ -335,6 +375,19 @@ func (staticRepositoryChangeMaterializer) MaterializeRepositoryChanges(context.C
 				AuthorEmail: "forgelane@localhost",
 			},
 		},
+	}, nil
+}
+
+type noChangeRepositoryMaterializer struct{}
+
+func (noChangeRepositoryMaterializer) SnapshotRepository(context.Context, workflow.Workspace) (workflow.RepositorySnapshot, error) {
+	return workflow.RepositorySnapshot{HeadSHA: "before"}, nil
+}
+
+func (noChangeRepositoryMaterializer) MaterializeRepositoryChanges(context.Context, workflow.Workspace, workflow.RepositorySnapshot) (workflow.RepositoryChangeMaterialization, error) {
+	return workflow.RepositoryChangeMaterialization{
+		DeliverySkipped:    true,
+		DeliverySkipReason: "no_repository_changes",
 	}, nil
 }
 

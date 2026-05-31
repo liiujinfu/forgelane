@@ -184,7 +184,9 @@ type RepositorySnapshot struct {
 
 // RepositoryChangeMaterialization is the result of turning Workspace repo changes into local commits.
 type RepositoryChangeMaterialization struct {
-	CommitRefs []CommitRefPlan
+	CommitRefs         []CommitRefPlan
+	DeliverySkipped    bool
+	DeliverySkipReason string
 }
 
 // AgentRunPrepareResult is the outcome of preparing runner state for execution.
@@ -198,11 +200,13 @@ type AgentRunPrepareResult struct {
 
 // AgentRunDetail is the read model for inspecting one AgentRun.
 type AgentRunDetail struct {
-	AgentRun   AgentRun
-	WorkItem   WorkItemSnapshot
-	RunSpec    RunSpec
-	Workspace  *Workspace
-	CommitRefs []CommitRef
+	AgentRun           AgentRun
+	WorkItem           WorkItemSnapshot
+	RunSpec            RunSpec
+	Workspace          *Workspace
+	CommitRefs         []CommitRef
+	DeliverySkipped    bool
+	DeliverySkipReason string
 }
 
 // AgentCommandPlanInput is the immutable RunSpec and Workspace context needed to plan a command.
@@ -262,14 +266,16 @@ type RepositoryChangeMaterializer interface {
 
 // AgentCommandCompletion records terminal command execution evidence.
 type AgentCommandCompletion struct {
-	Status        string
-	ExitCode      int
-	Duration      time.Duration
-	StdoutBytes   int64
-	StderrBytes   int64
-	LogSegments   []LogSegmentPlan
-	CommitRefs    []CommitRefPlan
-	FailureDetail string
+	Status             string
+	ExitCode           int
+	Duration           time.Duration
+	StdoutBytes        int64
+	StderrBytes        int64
+	LogSegments        []LogSegmentPlan
+	CommitRefs         []CommitRefPlan
+	DeliverySkipped    bool
+	DeliverySkipReason string
+	FailureDetail      string
 }
 
 // AgentCommandExecutionStore persists command execution state and matching Events.
@@ -398,6 +404,8 @@ func ExecuteAgentRunCommandAndMaterialize(ctx context.Context, store AgentComman
 	}
 
 	var commitRefs []CommitRefPlan
+	var deliverySkipped bool
+	var deliverySkipReason string
 	if commandStatus(runCtx, result, runErr) == "completed" {
 		materialized, err := materializer.MaterializeRepositoryChanges(ctx, *detail.Workspace, repositorySnapshot)
 		if err != nil {
@@ -416,17 +424,21 @@ func ExecuteAgentRunCommandAndMaterialize(ctx context.Context, store AgentComman
 			return AgentRunPrepareResult{}, fmt.Errorf("materialize Workspace repository changes: %w", err)
 		}
 		commitRefs = materialized.CommitRefs
+		deliverySkipped = materialized.DeliverySkipped
+		deliverySkipReason = materialized.DeliverySkipReason
 	}
 
 	completed, err := store.MarkAgentCommandCompleted(runID, AgentCommandCompletion{
-		Status:        commandStatus(runCtx, result, runErr),
-		ExitCode:      commandExitCode(result, runErr),
-		Duration:      result.Duration,
-		StdoutBytes:   result.StdoutBytes,
-		StderrBytes:   result.StderrBytes,
-		LogSegments:   result.LogSegments,
-		CommitRefs:    commitRefs,
-		FailureDetail: commandFailureDetail(runErr),
+		Status:             commandStatus(runCtx, result, runErr),
+		ExitCode:           commandExitCode(result, runErr),
+		Duration:           result.Duration,
+		StdoutBytes:        result.StdoutBytes,
+		StderrBytes:        result.StderrBytes,
+		LogSegments:        result.LogSegments,
+		CommitRefs:         commitRefs,
+		DeliverySkipped:    deliverySkipped,
+		DeliverySkipReason: deliverySkipReason,
+		FailureDetail:      commandFailureDetail(runErr),
 	})
 	if err != nil {
 		return AgentRunPrepareResult{}, err

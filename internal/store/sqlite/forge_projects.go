@@ -652,7 +652,41 @@ WHERE agent_runs.id = ?`
 		return AgentRunDetail{}, err
 	}
 	detail.CommitRefs = commitRefs
+	deliverySkipped, deliverySkipReason, err := store.getDeliverySkipForAgentRun(id)
+	if err != nil {
+		return AgentRunDetail{}, err
+	}
+	detail.DeliverySkipped = deliverySkipped
+	detail.DeliverySkipReason = deliverySkipReason
 	return detail, nil
+}
+
+func (store *Store) getDeliverySkipForAgentRun(agentRunID int64) (bool, string, error) {
+	var payloadJSON string
+	err := store.db.QueryRow(`
+SELECT payload
+FROM events
+WHERE agent_run_id = ?
+	AND type = 'repository_delivery.skipped'
+ORDER BY id DESC
+LIMIT 1`, agentRunID).Scan(&payloadJSON)
+	if err == sql.ErrNoRows {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("query delivery skip Event for AgentRun %d: %w", agentRunID, err)
+	}
+
+	var payload struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		return false, "", fmt.Errorf("decode delivery skip Event for AgentRun %d: %w", agentRunID, err)
+	}
+	if payload.Reason == "" {
+		payload.Reason = "no_repository_changes"
+	}
+	return true, payload.Reason, nil
 }
 
 func (store *Store) getWorkspaceForAgentRun(agentRunID int64) (*Workspace, error) {
@@ -1014,6 +1048,35 @@ INSERT INTO commit_refs (
 			return AgentRunPrepareResult{}, err
 		}
 		materializationEvents = append(materializationEvents, materializationEvent)
+	}
+	if completion.DeliverySkipped {
+		reason := completion.DeliverySkipReason
+		if reason == "" {
+			reason = "no_repository_changes"
+		}
+		skippedEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+			Type:           "repository_delivery.skipped",
+			OccurredAt:     now,
+			ForgeProjectID: detail.WorkItem.ForgeProjectID,
+			SubjectType:    "agent_run",
+			SubjectRef:     fmt.Sprintf("agent_run:%d", agentRunID),
+			WorkItemID:     detail.WorkItem.ID,
+			WorkItemRef:    detail.WorkItem.ProviderRef,
+			AgentRunID:     agentRunID,
+			Payload: map[string]any{
+				"agent_run_id":   agentRunID,
+				"runner_job_id":  detail.Workspace.RunnerJobID,
+				"workspace_id":   detail.Workspace.ID,
+				"repository_ref": detail.WorkItem.RepositoryRef,
+				"reason":         reason,
+				"commit_refs":    len(completion.CommitRefs),
+				"provider_ref":   detail.WorkItem.ProviderRef,
+			},
+		})
+		if err != nil {
+			return AgentRunPrepareResult{}, err
+		}
+		materializationEvents = append(materializationEvents, skippedEvent)
 	}
 
 	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
