@@ -240,6 +240,110 @@ func TestExecuteAgentRunCommandCreatesActiveChangeSetFromLocalCommitRefs(t *test
 	}
 }
 
+func TestExecuteAgentRunCommandPushesChangeSetBranchThroughChangeProvider(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+	changeProvider := &recordingChangeProvider{
+		result: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+	}
+
+	result, err := workflow.ExecuteAgentRunCommandAndDeliver(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		changeProvider,
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("execute AgentRun command and deliver: %v", err)
+	}
+	if len(changeProvider.calls) != 1 {
+		t.Fatalf("expected one Change Provider push, got %#v", changeProvider.calls)
+	}
+	call := changeProvider.calls[0]
+	if call.ChangeSetID != result.ChangeSet.ID ||
+		call.RepositoryRef != "github://github.com/owner/repo" ||
+		call.BranchRef != "forgelane/issue-123" ||
+		call.CommitSHAs[0] != "abc123" {
+		t.Fatalf("unexpected Change Provider push plan: %#v", call)
+	}
+	if result.ChangeSet == nil ||
+		result.ChangeSet.Status != "branch_ready" ||
+		result.ChangeSet.ChangeRef != "github://github.com/owner/repo/branches/forgelane/issue-123" {
+		t.Fatalf("expected branch-ready ChangeSet, got %#v", result.ChangeSet)
+	}
+	if got := eventTypes(result.Events); got != "repository_commit.materialized,change_set.created,agent_command.completed,control_action.executing,change_set.branch_push_started,change_set.branch_push_succeeded" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	detail, err := instanceStore.GetAgentRunDetail(runID)
+	if err != nil {
+		t.Fatalf("get AgentRun detail: %v", err)
+	}
+	if detail.ChangeSet == nil ||
+		detail.ChangeSet.Status != "branch_ready" ||
+		detail.ChangeSet.ChangeRef != "github://github.com/owner/repo/branches/forgelane/issue-123" ||
+		len(detail.ChangeSet.CommitRefs) != 1 {
+		t.Fatalf("unexpected persisted branch-ready ChangeSet: %#v", detail.ChangeSet)
+	}
+}
+
+func TestExecuteAgentRunCommandRecordsRecoverableChangeProviderPushFailure(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+	changeProvider := &recordingChangeProvider{err: errors.New("provider rejected branch update with token SECRET_VALUE")}
+
+	result, err := workflow.ExecuteAgentRunCommandAndDeliver(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		changeProvider,
+		runID,
+	)
+	if err == nil {
+		t.Fatal("expected branch push failure")
+	}
+	if !strings.Contains(err.Error(), "push ChangeSet branch") {
+		t.Fatalf("expected branch push error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "SECRET_VALUE") {
+		t.Fatalf("expected provider error detail to be sanitized, got %v", err)
+	}
+	if result.ChangeSet == nil ||
+		result.ChangeSet.Status != "branch_push_failed" ||
+		result.ChangeSet.ChangeRef != "" ||
+		len(result.ChangeSet.CommitRefs) != 1 {
+		t.Fatalf("expected recoverable branch-push-failed ChangeSet in result, got %#v", result.ChangeSet)
+	}
+	if got := eventTypes(result.Events); got != "repository_commit.materialized,change_set.created,agent_command.completed,control_action.executing,change_set.branch_push_started,change_set.branch_push_failed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	detail, err := instanceStore.GetAgentRunDetail(runID)
+	if err != nil {
+		t.Fatalf("get AgentRun detail: %v", err)
+	}
+	if detail.ChangeSet == nil ||
+		detail.ChangeSet.Status != "branch_push_failed" ||
+		detail.ChangeSet.ChangeRef != "" ||
+		len(detail.ChangeSet.CommitRefs) != 1 {
+		t.Fatalf("expected persisted ChangeSet to remain recoverable, got %#v", detail.ChangeSet)
+	}
+	events, err := instanceStore.ListEventsForAgentRun(runID)
+	if err != nil {
+		t.Fatalf("list Events: %v", err)
+	}
+	if got := eventTypes(events); !strings.Contains(got, "change_set.branch_push_failed") {
+		t.Fatalf("expected branch push failure Event, got %s", got)
+	}
+}
+
 func TestExecuteAgentRunCommandClaimsExistingActiveChangeSetFromLocalCommitRefs(t *testing.T) {
 	instanceStore, firstRunID := preparedAgentRun(t)
 
@@ -557,6 +661,20 @@ func (noChangeRepositoryMaterializer) MaterializeRepositoryChanges(context.Conte
 		DeliverySkipped:    true,
 		DeliverySkipReason: "no_repository_changes",
 	}, nil
+}
+
+type recordingChangeProvider struct {
+	result workflow.ChangeBranchPushResult
+	err    error
+	calls  []workflow.ChangeBranchPushPlan
+}
+
+func (provider *recordingChangeProvider) PushChangeSetBranch(_ context.Context, plan workflow.ChangeBranchPushPlan) (workflow.ChangeBranchPushResult, error) {
+	provider.calls = append(provider.calls, plan)
+	if provider.err != nil {
+		return workflow.ChangeBranchPushResult{}, provider.err
+	}
+	return provider.result, nil
 }
 
 type nonZeroExitCommandRunner struct{}

@@ -1179,7 +1179,6 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
 		},
 	}
-
 	createStdout, stderr, err := executeForTestWithOptions(t, Options{
 		WorkItemProvider:    fakeProvider,
 		AgentCommandPlanner: changingCommandPlanner{},
@@ -1277,6 +1276,96 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 
 	assertTableCount(t, homeDir, "change_sets", 1)
 	assertTableCount(t, homeDir, "commit_refs", 1)
+	assertTableCount(t, homeDir, "control_actions", 1)
+}
+
+func TestRunsExecutePushesBranchThroughChangeProviderWithoutAgentProviderCredentials(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "sensitive-provider-token")
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Push ForgeLane branch",
+			Body:                "Push the ChangeSet branch through the Change Provider.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		result: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+	}
+
+	createStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: tokenCheckingChangingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "create", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	runID := extractCreatedAgentRunID(t, createStdout)
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: tokenCheckingChangingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "prepare", strconv.FormatInt(runID, 10)); err != nil {
+		t.Fatalf("expected runs prepare to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	executeStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: tokenCheckingChangingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "execute", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs execute to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	for _, want := range []string{
+		"ChangeSet: 1 branch_ready forgelane/issue-123",
+		"Event: control_action.executing",
+		"Event: change_set.branch_push_started",
+		"Event: change_set.branch_push_succeeded",
+	} {
+		if !strings.Contains(executeStdout, want) {
+			t.Fatalf("expected runs execute output to contain %q, got:\n%s", want, executeStdout)
+		}
+	}
+	if len(changeProvider.calls) != 1 {
+		t.Fatalf("expected one fake Change Provider push, got %#v", changeProvider.calls)
+	}
+
+	logsStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "logs", strconv.FormatInt(runID, 10), "--stream", "stdout")
+	if err != nil {
+		t.Fatalf("expected runs logs to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if !strings.Contains(logsStdout, "provider-token=absent") {
+		t.Fatalf("expected AgentAdapter log to prove provider token was absent, got:\n%s", logsStdout)
+	}
 }
 
 func TestRunReadCommandsReturnClearErrorsForInvalidAndUnknownRunIDs(t *testing.T) {
@@ -1820,6 +1909,40 @@ func (changingCommandPlanner) PlanAgentCommand(input workflow.AgentCommandPlanIn
 		StdoutPath:       filepath.Join(input.Workspace.Paths.Logs, "stdout.log"),
 		StderrPath:       filepath.Join(input.Workspace.Paths.Logs, "stderr.log"),
 	}, nil
+}
+
+type tokenCheckingChangingCommandPlanner struct{}
+
+func (tokenCheckingChangingCommandPlanner) PlanAgentCommand(input workflow.AgentCommandPlanInput) (workflow.AgentCommandPlan, error) {
+	script := `if [ -n "${GITHUB_TOKEN:-}" ] || [ -n "${GH_TOKEN:-}" ] || [ -n "${GITLAB_TOKEN:-}" ]; then
+  printf 'provider-token=present\n'
+else
+  printf 'provider-token=absent\n'
+fi
+printf 'forgelane test change\n' > forgelane-agent-output.txt
+`
+	return workflow.AgentCommandPlan{
+		Executable:       "sh",
+		Args:             []string{"-c", script},
+		WorkingDirectory: input.Workspace.Paths.Repo,
+		Env:              []string{"PATH=" + os.Getenv("PATH")},
+		StdoutPath:       filepath.Join(input.Workspace.Paths.Logs, "stdout.log"),
+		StderrPath:       filepath.Join(input.Workspace.Paths.Logs, "stderr.log"),
+	}, nil
+}
+
+type recordingChangeProvider struct {
+	result workflow.ChangeBranchPushResult
+	err    error
+	calls  []workflow.ChangeBranchPushPlan
+}
+
+func (provider *recordingChangeProvider) PushChangeSetBranch(_ context.Context, plan workflow.ChangeBranchPushPlan) (workflow.ChangeBranchPushResult, error) {
+	provider.calls = append(provider.calls, plan)
+	if provider.err != nil {
+		return workflow.ChangeBranchPushResult{}, provider.err
+	}
+	return provider.result, nil
 }
 
 func gitOutput(t *testing.T, workingDir string, args ...string) string {

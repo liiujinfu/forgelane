@@ -201,6 +201,24 @@ type ChangeSetPlan struct {
 	ActiveRunID    int64
 }
 
+// ChangeBranchPushPlan is the workflow request to publish a ChangeSet branch.
+type ChangeBranchPushPlan struct {
+	ChangeSetID         int64
+	WorkItemRef         string
+	Provider            string
+	RepositoryRef       string
+	LocalRepositoryPath string
+	BranchRef           string
+	CommitSHAs          []string
+}
+
+// ChangeBranchPushResult is the provider evidence from a successful branch push.
+type ChangeBranchPushResult struct {
+	ChangeSetID       int64
+	BranchProviderRef string
+	PushedCommitSHAs  []string
+}
+
 // CommitRefPlan is a local commit ref ready to persist after repository materialization.
 type CommitRefPlan struct {
 	SHA         string
@@ -298,6 +316,17 @@ type RepositoryChangeMaterializer interface {
 	MaterializeRepositoryChanges(context.Context, Workspace, RepositorySnapshot) (RepositoryChangeMaterialization, error)
 }
 
+// ChangeProvider mutates provider-owned change state outside the AgentAdapter process.
+type ChangeProvider interface {
+	PushChangeSetBranch(context.Context, ChangeBranchPushPlan) (ChangeBranchPushResult, error)
+}
+
+// BranchPushStartResult records the auditable permission boundary for provider branch mutation.
+type BranchPushStartResult struct {
+	ControlAction ControlAction
+	Events        []Event
+}
+
 // AgentCommandCompletion records terminal command execution evidence.
 type AgentCommandCompletion struct {
 	Status             string
@@ -319,6 +348,9 @@ type AgentCommandExecutionStore interface {
 	MarkAgentCommandStarted(int64) (Event, error)
 	MarkAgentCommandCompleted(int64, AgentCommandCompletion) (AgentRunPrepareResult, error)
 	MarkAgentCommandFailed(int64, string) (AgentRunPrepareResult, error)
+	MarkChangeSetBranchPushStarted(int64, int64) (BranchPushStartResult, error)
+	MarkChangeSetBranchPushSucceeded(int64, ChangeBranchPushResult, int64) (AgentRunPrepareResult, error)
+	MarkChangeSetBranchPushFailed(int64, int64, int64, string) (AgentRunPrepareResult, error)
 }
 
 // ControlAction is a persisted operator request to change the delivery loop.
@@ -488,6 +520,58 @@ func ExecuteAgentRunCommandAndMaterialize(ctx context.Context, store AgentComman
 		return AgentRunPrepareResult{}, err
 	}
 	return completed, nil
+}
+
+// ExecuteAgentRunCommandAndDeliver materializes local commits, creates or claims a ChangeSet, then pushes its branch through the Change Provider.
+func ExecuteAgentRunCommandAndDeliver(ctx context.Context, store AgentCommandExecutionStore, planner AgentCommandPlanner, runner AgentCommandRunner, materializer RepositoryChangeMaterializer, changeProvider ChangeProvider, runID int64) (AgentRunPrepareResult, error) {
+	completed, err := ExecuteAgentRunCommandAndMaterialize(ctx, store, planner, runner, materializer, runID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if changeProvider == nil || completed.ChangeSet == nil || len(completed.CommitRefs) == 0 {
+		return completed, nil
+	}
+
+	pushPlan := NewChangeBranchPushPlan(completed.Workspace, *completed.ChangeSet)
+	started, err := store.MarkChangeSetBranchPushStarted(runID, completed.ChangeSet.ID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	completed.Events = append(completed.Events, started.Events...)
+
+	pushResult, err := changeProvider.PushChangeSetBranch(ctx, pushPlan)
+	if err != nil {
+		failed, markErr := store.MarkChangeSetBranchPushFailed(runID, completed.ChangeSet.ID, started.ControlAction.ID, "provider branch push failed")
+		if markErr != nil {
+			return AgentRunPrepareResult{}, fmt.Errorf("push ChangeSet branch failed; mark branch push failed: %v", markErr)
+		}
+		failed.Events = append(completed.Events, failed.Events...)
+		return failed, fmt.Errorf("push ChangeSet branch failed")
+	}
+
+	delivered, err := store.MarkChangeSetBranchPushSucceeded(runID, pushResult, started.ControlAction.ID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	delivered.Events = append(completed.Events, delivered.Events...)
+	return delivered, nil
+}
+
+// NewChangeBranchPushPlan derives provider branch-push input from a persisted ChangeSet.
+func NewChangeBranchPushPlan(workspace Workspace, changeSet ChangeSet) ChangeBranchPushPlan {
+	commitSHAs := make([]string, 0, len(changeSet.CommitRefs))
+	for _, ref := range changeSet.CommitRefs {
+		commitSHAs = append(commitSHAs, ref.SHA)
+	}
+	return ChangeBranchPushPlan{
+		ChangeSetID:         changeSet.ID,
+		WorkItemRef:         changeSet.WorkItemRef,
+		Provider:            changeSet.Provider,
+		RepositoryRef:       changeSet.RepositoryRef,
+		LocalRepositoryPath: workspace.Paths.Repo,
+		BranchRef:           changeSet.BranchRef,
+		CommitSHAs:          commitSHAs,
+	}
 }
 
 // NewChangeSetPlan derives the active ChangeSet identity from the immutable RunSpec.

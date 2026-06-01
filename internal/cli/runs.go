@@ -172,8 +172,9 @@ func newRunsExecuteCommand(stdout io.Writer, options Options) *cobra.Command {
 			if materializer == nil {
 				materializer = runner.GitCommitMaterializer{}
 			}
+			changeProvider := options.ChangeProvider
 
-			result, err := workflow.ExecuteAgentRunCommandAndMaterialize(cmd.Context(), instanceStore, planner, commandRunner, materializer, runID)
+			result, err := workflow.ExecuteAgentRunCommandAndDeliver(cmd.Context(), instanceStore, planner, commandRunner, materializer, changeProvider, runID)
 			if err != nil {
 				return err
 			}

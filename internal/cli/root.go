@@ -21,6 +21,7 @@ type Options struct {
 	AgentCommandPlanner          workflow.AgentCommandPlanner
 	AgentCommandRunner           workflow.AgentCommandRunner
 	RepositoryChangeMaterializer workflow.RepositoryChangeMaterializer
+	ChangeProvider               workflow.ChangeProvider
 }
 
 // NewRootCommand constructs the ForgeLane CLI command tree.

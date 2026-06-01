@@ -208,6 +208,7 @@ CREATE TABLE IF NOT EXISTS change_sets (
 	status TEXT NOT NULL CHECK(status IN (
 		'planned',
 		'branch_ready',
+		'branch_push_failed',
 		'draft_open',
 		'under_review',
 		'changes_requested',
@@ -1142,6 +1143,287 @@ func agentCommandTerminalEventType(status string) string {
 	}
 }
 
+// MarkChangeSetBranchPushStarted records the explicit provider mutation boundary.
+func (store *Store) MarkChangeSetBranchPushStarted(agentRunID int64, changeSetID int64) (workflow.BranchPushStartResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return workflow.BranchPushStartResult{}, err
+	}
+	if detail.ChangeSet == nil || detail.ChangeSet.ID != changeSetID {
+		return workflow.BranchPushStartResult{}, fmt.Errorf("ChangeSet %d not active for AgentRun %d", changeSetID, agentRunID)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return workflow.BranchPushStartResult{}, fmt.Errorf("begin ChangeSet branch push start transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	actionInput, err := json.Marshal(map[string]any{
+		"change_set_id":  changeSetID,
+		"agent_run_id":   agentRunID,
+		"provider":       detail.ChangeSet.Provider,
+		"repository_ref": detail.ChangeSet.RepositoryRef,
+		"branch_ref":     detail.ChangeSet.BranchRef,
+		"commit_refs":    len(detail.ChangeSet.CommitRefs),
+	})
+	if err != nil {
+		return workflow.BranchPushStartResult{}, fmt.Errorf("encode branch push ControlAction input: %w", err)
+	}
+	actionResult, err := tx.Exec(`
+INSERT INTO control_actions (
+	type,
+	target_type,
+	target_ref,
+	requested_by,
+	reason,
+	input,
+	status,
+	created_at,
+	decided_at,
+	result_event_refs
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"push_branch",
+		"change_set",
+		fmt.Sprintf("change_set:%d", changeSetID),
+		"local",
+		"forgelane runs execute",
+		string(actionInput),
+		"executing",
+		now,
+		now,
+		"[]",
+	)
+	if err != nil {
+		return workflow.BranchPushStartResult{}, fmt.Errorf("insert branch push ControlAction: %w", err)
+	}
+	controlActionID, err := actionResult.LastInsertId()
+	if err != nil {
+		return workflow.BranchPushStartResult{}, fmt.Errorf("read branch push ControlAction id: %w", err)
+	}
+
+	controlEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "control_action.executing",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "control_action",
+		SubjectRef:      fmt.Sprintf("control_action:%d", controlActionID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		ChangeSetID:     changeSetID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"change_set_id":     changeSetID,
+			"action_type":       "push_branch",
+			"status":            "executing",
+		},
+	})
+	if err != nil {
+		return workflow.BranchPushStartResult{}, err
+	}
+	branchEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "change_set.branch_push_started",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "change_set",
+		SubjectRef:      fmt.Sprintf("change_set:%d", changeSetID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		ChangeSetID:     changeSetID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"change_set_id":     changeSetID,
+			"agent_run_id":      agentRunID,
+			"provider":          detail.ChangeSet.Provider,
+			"repository_ref":    detail.ChangeSet.RepositoryRef,
+			"branch_ref":        detail.ChangeSet.BranchRef,
+			"commit_refs":       len(detail.ChangeSet.CommitRefs),
+		},
+	})
+	if err != nil {
+		return workflow.BranchPushStartResult{}, err
+	}
+	resultEventRefs, err := json.Marshal([]int64{controlEvent.ID, branchEvent.ID})
+	if err != nil {
+		return workflow.BranchPushStartResult{}, fmt.Errorf("encode branch push ControlAction result Event refs: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE control_actions SET result_event_refs = ? WHERE id = ?", string(resultEventRefs), controlActionID); err != nil {
+		return workflow.BranchPushStartResult{}, fmt.Errorf("update branch push ControlAction result Event refs: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return workflow.BranchPushStartResult{}, fmt.Errorf("commit ChangeSet branch push start: %w", err)
+	}
+	return workflow.BranchPushStartResult{
+		ControlAction: workflow.ControlAction{
+			ID:     controlActionID,
+			Type:   "push_branch",
+			Status: "executing",
+		},
+		Events: []Event{controlEvent, branchEvent},
+	}, nil
+}
+
+// MarkChangeSetBranchPushSucceeded marks a ChangeSet branch as provider-ready.
+func (store *Store) MarkChangeSetBranchPushSucceeded(agentRunID int64, push workflow.ChangeBranchPushResult, controlActionID int64) (AgentRunPrepareResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if detail.ChangeSet == nil || detail.ChangeSet.ID != push.ChangeSetID {
+		return AgentRunPrepareResult{}, fmt.Errorf("ChangeSet %d not active for AgentRun %d", push.ChangeSetID, agentRunID)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("begin ChangeSet branch push success transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`
+UPDATE change_sets
+SET status = ?, change_ref = ?, updated_at = ?
+WHERE id = ?`, "branch_ready", push.BranchProviderRef, now, push.ChangeSetID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark ChangeSet %d branch_ready: %w", push.ChangeSetID, err)
+	}
+	if _, err := tx.Exec(`
+UPDATE control_actions
+SET status = ?, decided_at = ?
+WHERE id = ?`, "succeeded", now, controlActionID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark branch push ControlAction %d succeeded: %w", controlActionID, err)
+	}
+	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "change_set.branch_push_succeeded",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "change_set",
+		SubjectRef:      fmt.Sprintf("change_set:%d", push.ChangeSetID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		ChangeSetID:     push.ChangeSetID,
+		Payload: map[string]any{
+			"control_action_id":   controlActionID,
+			"change_set_id":       push.ChangeSetID,
+			"agent_run_id":        agentRunID,
+			"provider":            detail.ChangeSet.Provider,
+			"repository_ref":      detail.ChangeSet.RepositoryRef,
+			"branch_ref":          detail.ChangeSet.BranchRef,
+			"branch_provider_ref": push.BranchProviderRef,
+			"pushed_commits":      len(push.PushedCommitSHAs),
+		},
+	})
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, event.ID); err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("commit ChangeSet branch push success: %w", err)
+	}
+
+	updated, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	return agentRunPrepareResultFromDetail(updated, []Event{event}), nil
+}
+
+// MarkChangeSetBranchPushFailed records a recoverable provider mutation failure.
+func (store *Store) MarkChangeSetBranchPushFailed(agentRunID int64, changeSetID int64, controlActionID int64, failureMessage string) (AgentRunPrepareResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if detail.ChangeSet == nil || detail.ChangeSet.ID != changeSetID {
+		return AgentRunPrepareResult{}, fmt.Errorf("ChangeSet %d not active for AgentRun %d", changeSetID, agentRunID)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("begin ChangeSet branch push failure transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`
+UPDATE change_sets
+SET status = ?, updated_at = ?
+WHERE id = ?`, "branch_push_failed", now, changeSetID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark ChangeSet %d branch_push_failed: %w", changeSetID, err)
+	}
+	if _, err := tx.Exec(`
+UPDATE control_actions
+SET status = ?, decided_at = ?
+WHERE id = ?`, "failed", now, controlActionID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark branch push ControlAction %d failed: %w", controlActionID, err)
+	}
+	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "change_set.branch_push_failed",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "change_set",
+		SubjectRef:      fmt.Sprintf("change_set:%d", changeSetID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		ChangeSetID:     changeSetID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"change_set_id":     changeSetID,
+			"agent_run_id":      agentRunID,
+			"provider":          detail.ChangeSet.Provider,
+			"repository_ref":    detail.ChangeSet.RepositoryRef,
+			"branch_ref":        detail.ChangeSet.BranchRef,
+			"failure_detail":    failureMessage,
+			"recoverable":       true,
+		},
+	})
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, event.ID); err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("commit ChangeSet branch push failure: %w", err)
+	}
+
+	updated, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	return agentRunPrepareResultFromDetail(updated, []Event{event}), nil
+}
+
+func agentRunPrepareResultFromDetail(detail AgentRunDetail, events []Event) AgentRunPrepareResult {
+	result := AgentRunPrepareResult{
+		AgentRun:   detail.AgentRun,
+		CommitRefs: detail.CommitRefs,
+		ChangeSet:  detail.ChangeSet,
+		Events:     events,
+	}
+	if detail.Workspace != nil {
+		result.Workspace = *detail.Workspace
+		result.RunnerJob = RunnerJob{
+			ID:         detail.Workspace.RunnerJobID,
+			AgentRunID: detail.AgentRun.ID,
+			Status:     detail.AgentRun.Status,
+			CreatedAt:  detail.Workspace.CreatedAt,
+			UpdatedAt:  detail.AgentRun.UpdatedAt,
+		}
+	}
+	return result
+}
+
 func (store *Store) finishAgentCommand(agentRunID int64, status string, eventType string, completion workflow.AgentCommandCompletion) (AgentRunPrepareResult, error) {
 	detail, err := store.GetAgentRunDetail(agentRunID)
 	if err != nil {
@@ -2018,6 +2300,28 @@ INSERT INTO events (
 		return Event{}, fmt.Errorf("read inserted %s Event id: %w", input.Type, err)
 	}
 	return Event{ID: id, Type: input.Type}, nil
+}
+
+func appendControlActionEventRefTx(tx *sql.Tx, controlActionID int64, eventID int64) error {
+	var refsJSON string
+	if err := tx.QueryRow("SELECT result_event_refs FROM control_actions WHERE id = ?", controlActionID).Scan(&refsJSON); err != nil {
+		return fmt.Errorf("read ControlAction %d result Event refs: %w", controlActionID, err)
+	}
+	var refs []int64
+	if refsJSON != "" {
+		if err := json.Unmarshal([]byte(refsJSON), &refs); err != nil {
+			return fmt.Errorf("decode ControlAction %d result Event refs: %w", controlActionID, err)
+		}
+	}
+	refs = append(refs, eventID)
+	updatedRefs, err := json.Marshal(refs)
+	if err != nil {
+		return fmt.Errorf("encode ControlAction %d result Event refs: %w", controlActionID, err)
+	}
+	if _, err := tx.Exec("UPDATE control_actions SET result_event_refs = ? WHERE id = ?", string(updatedRefs), controlActionID); err != nil {
+		return fmt.Errorf("update ControlAction %d result Event refs: %w", controlActionID, err)
+	}
+	return nil
 }
 
 // GetForgeProjectByRef returns a persisted ForgeProject by canonical ref.
