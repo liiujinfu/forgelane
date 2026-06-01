@@ -264,6 +264,7 @@ func printExecutedAgentRun(stdout io.Writer, result store.AgentRunPrepareResult)
 	}
 	if result.ChangeSet != nil {
 		fmt.Fprintf(stdout, "ChangeSet: %d %s %s\n", result.ChangeSet.ID, result.ChangeSet.Status, result.ChangeSet.BranchRef)
+		printChangeSetProviderRefs(stdout, *result.ChangeSet)
 	}
 	for _, event := range result.Events {
 		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
@@ -363,8 +364,19 @@ func printAgentRunDetail(stdout io.Writer, detail store.AgentRunDetail) error {
 		fmt.Fprintf(stdout, "ChangeSet: %d %s %s\n", detail.ChangeSet.ID, detail.ChangeSet.Status, detail.ChangeSet.BranchRef)
 		fmt.Fprintf(stdout, "ChangeSet active run: %d\n", detail.ChangeSet.ActiveRunID)
 		fmt.Fprintf(stdout, "ChangeSet commits: %d\n", len(detail.ChangeSet.CommitRefs))
+		printChangeSetProviderRefs(stdout, *detail.ChangeSet)
 	}
 	return nil
+}
+
+func printChangeSetProviderRefs(stdout io.Writer, changeSet store.ChangeSet) {
+	if changeSet.BranchProviderRef != "" {
+		fmt.Fprintf(stdout, "ChangeSet provider branch: %s\n", changeSet.BranchProviderRef)
+	}
+	if changeSet.ChangeRef != "" {
+		fmt.Fprintf(stdout, "ChangeSet provider change: %s\n", changeSet.ChangeRef)
+		fmt.Fprintf(stdout, "ChangeSet draft: %t\n", changeSet.ChangeDraft)
+	}
 }
 
 func hasEventType(events []store.Event, eventType string) bool {

@@ -204,7 +204,10 @@ CREATE TABLE IF NOT EXISTS change_sets (
 	repository_ref TEXT NOT NULL,
 	base_branch TEXT NOT NULL,
 	branch_ref TEXT NOT NULL,
+	branch_provider_ref TEXT NOT NULL DEFAULT '',
 	change_ref TEXT NOT NULL DEFAULT '',
+	change_draft INTEGER NOT NULL DEFAULT 0,
+	provider_snapshot TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL CHECK(status IN (
 		'planned',
 		'branch_ready',
@@ -301,6 +304,15 @@ CREATE INDEX IF NOT EXISTS idx_commit_refs_agent_run_id ON commit_refs(agent_run
 		return err
 	}
 	if err := store.ensureColumn("commit_refs", "change_set_id", "INTEGER REFERENCES change_sets(id)"); err != nil {
+		return err
+	}
+	if err := store.ensureColumn("change_sets", "branch_provider_ref", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := store.ensureColumn("change_sets", "change_draft", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := store.ensureColumn("change_sets", "provider_snapshot", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if _, err := store.db.Exec("CREATE INDEX IF NOT EXISTS idx_events_control_action_id ON events(control_action_id)"); err != nil {
@@ -889,7 +901,10 @@ SELECT
 	c.repository_ref,
 	c.base_branch,
 	c.branch_ref,
+	c.branch_provider_ref,
 	c.change_ref,
+	c.change_draft,
+	c.provider_snapshot,
 	c.status,
 	c.created_by_run_id,
 	c.active_run_id,
@@ -912,7 +927,10 @@ LIMIT 1`, agentRunID, agentRunID, agentRunID).Scan(
 		&changeSet.RepositoryRef,
 		&changeSet.BaseBranch,
 		&changeSet.BranchRef,
+		&changeSet.BranchProviderRef,
 		&changeSet.ChangeRef,
+		&changeSet.ChangeDraft,
+		&changeSet.ProviderSnapshot,
 		&changeSet.Status,
 		&changeSet.CreatedByRunID,
 		&changeSet.ActiveRunID,
@@ -1287,7 +1305,7 @@ func (store *Store) MarkChangeSetBranchPushSucceeded(agentRunID int64, push work
 
 	if _, err := tx.Exec(`
 UPDATE change_sets
-SET status = ?, change_ref = ?, updated_at = ?
+SET status = ?, branch_provider_ref = ?, updated_at = ?
 WHERE id = ?`, "branch_ready", push.BranchProviderRef, now, push.ChangeSetID); err != nil {
 		return AgentRunPrepareResult{}, fmt.Errorf("mark ChangeSet %d branch_ready: %w", push.ChangeSetID, err)
 	}
@@ -1395,6 +1413,274 @@ WHERE id = ?`, "failed", now, controlActionID); err != nil {
 	}
 	if err := tx.Commit(); err != nil {
 		return AgentRunPrepareResult{}, fmt.Errorf("commit ChangeSet branch push failure: %w", err)
+	}
+
+	updated, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	return agentRunPrepareResultFromDetail(updated, []Event{event}), nil
+}
+
+// MarkChangeSetDraftPRStarted records the explicit provider mutation boundary for draft PR creation or update.
+func (store *Store) MarkChangeSetDraftPRStarted(agentRunID int64, changeSetID int64) (workflow.DraftPRStartResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return workflow.DraftPRStartResult{}, err
+	}
+	if detail.ChangeSet == nil || detail.ChangeSet.ID != changeSetID {
+		return workflow.DraftPRStartResult{}, fmt.Errorf("ChangeSet %d not active for AgentRun %d", changeSetID, agentRunID)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return workflow.DraftPRStartResult{}, fmt.Errorf("begin ChangeSet draft PR start transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	actionInput, err := json.Marshal(map[string]any{
+		"change_set_id":       changeSetID,
+		"agent_run_id":        agentRunID,
+		"provider":            detail.ChangeSet.Provider,
+		"repository_ref":      detail.ChangeSet.RepositoryRef,
+		"branch_ref":          detail.ChangeSet.BranchRef,
+		"branch_provider_ref": detail.ChangeSet.BranchProviderRef,
+		"existing_change_ref": detail.ChangeSet.ChangeRef,
+		"commit_refs":         len(detail.ChangeSet.CommitRefs),
+	})
+	if err != nil {
+		return workflow.DraftPRStartResult{}, fmt.Errorf("encode draft PR ControlAction input: %w", err)
+	}
+	actionResult, err := tx.Exec(`
+INSERT INTO control_actions (
+	type,
+	target_type,
+	target_ref,
+	requested_by,
+	reason,
+	input,
+	status,
+	created_at,
+	decided_at,
+	result_event_refs
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"create_or_update_draft_pr",
+		"change_set",
+		fmt.Sprintf("change_set:%d", changeSetID),
+		"local",
+		"forgelane runs execute",
+		string(actionInput),
+		"executing",
+		now,
+		now,
+		"[]",
+	)
+	if err != nil {
+		return workflow.DraftPRStartResult{}, fmt.Errorf("insert draft PR ControlAction: %w", err)
+	}
+	controlActionID, err := actionResult.LastInsertId()
+	if err != nil {
+		return workflow.DraftPRStartResult{}, fmt.Errorf("read draft PR ControlAction id: %w", err)
+	}
+
+	controlEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "control_action.executing",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "control_action",
+		SubjectRef:      fmt.Sprintf("control_action:%d", controlActionID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		ChangeSetID:     changeSetID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"change_set_id":     changeSetID,
+			"action_type":       "create_or_update_draft_pr",
+			"status":            "executing",
+		},
+	})
+	if err != nil {
+		return workflow.DraftPRStartResult{}, err
+	}
+	draftEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "change_set.draft_pr_started",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "change_set",
+		SubjectRef:      fmt.Sprintf("change_set:%d", changeSetID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		ChangeSetID:     changeSetID,
+		Payload: map[string]any{
+			"control_action_id":   controlActionID,
+			"change_set_id":       changeSetID,
+			"agent_run_id":        agentRunID,
+			"provider":            detail.ChangeSet.Provider,
+			"repository_ref":      detail.ChangeSet.RepositoryRef,
+			"branch_ref":          detail.ChangeSet.BranchRef,
+			"existing_change_ref": detail.ChangeSet.ChangeRef,
+			"commit_refs":         len(detail.ChangeSet.CommitRefs),
+		},
+	})
+	if err != nil {
+		return workflow.DraftPRStartResult{}, err
+	}
+	resultEventRefs, err := json.Marshal([]int64{controlEvent.ID, draftEvent.ID})
+	if err != nil {
+		return workflow.DraftPRStartResult{}, fmt.Errorf("encode draft PR ControlAction result Event refs: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE control_actions SET result_event_refs = ? WHERE id = ?", string(resultEventRefs), controlActionID); err != nil {
+		return workflow.DraftPRStartResult{}, fmt.Errorf("update draft PR ControlAction result Event refs: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return workflow.DraftPRStartResult{}, fmt.Errorf("commit ChangeSet draft PR start: %w", err)
+	}
+	return workflow.DraftPRStartResult{
+		ControlAction: workflow.ControlAction{
+			ID:     controlActionID,
+			Type:   "create_or_update_draft_pr",
+			Status: "executing",
+		},
+		Events: []Event{controlEvent, draftEvent},
+	}, nil
+}
+
+// MarkChangeSetDraftPRSucceeded marks a ChangeSet draft PR as provider-ready.
+func (store *Store) MarkChangeSetDraftPRSucceeded(agentRunID int64, draftPR workflow.ChangeDraftPRResult, controlActionID int64) (AgentRunPrepareResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if detail.ChangeSet == nil || detail.ChangeSet.ID != draftPR.ChangeSetID {
+		return AgentRunPrepareResult{}, fmt.Errorf("ChangeSet %d not active for AgentRun %d", draftPR.ChangeSetID, agentRunID)
+	}
+	providerSnapshot, err := json.Marshal(draftPR.ProviderSnapshot)
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("encode draft PR provider snapshot: %w", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("begin ChangeSet draft PR success transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`
+UPDATE change_sets
+SET status = ?, change_ref = ?, change_draft = ?, provider_snapshot = ?, updated_at = ?
+WHERE id = ?`, "draft_open", draftPR.ChangeRef, boolInt(draftPR.Draft), string(providerSnapshot), now, draftPR.ChangeSetID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark ChangeSet %d draft_open: %w", draftPR.ChangeSetID, err)
+	}
+	if _, err := tx.Exec(`
+UPDATE control_actions
+SET status = ?, decided_at = ?
+WHERE id = ?`, "succeeded", now, controlActionID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark draft PR ControlAction %d succeeded: %w", controlActionID, err)
+	}
+	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "change_set.draft_pr_succeeded",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "change_set",
+		SubjectRef:      fmt.Sprintf("change_set:%d", draftPR.ChangeSetID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		ChangeSetID:     draftPR.ChangeSetID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"change_set_id":     draftPR.ChangeSetID,
+			"agent_run_id":      agentRunID,
+			"provider":          detail.ChangeSet.Provider,
+			"repository_ref":    detail.ChangeSet.RepositoryRef,
+			"branch_ref":        detail.ChangeSet.BranchRef,
+			"change_ref":        draftPR.ChangeRef,
+			"draft":             draftPR.Draft,
+		},
+	})
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, event.ID); err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("commit ChangeSet draft PR success: %w", err)
+	}
+
+	updated, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	return agentRunPrepareResultFromDetail(updated, []Event{event}), nil
+}
+
+// MarkChangeSetDraftPRFailed records a recoverable draft PR provider mutation failure.
+func (store *Store) MarkChangeSetDraftPRFailed(agentRunID int64, changeSetID int64, controlActionID int64, failureMessage string) (AgentRunPrepareResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if detail.ChangeSet == nil || detail.ChangeSet.ID != changeSetID {
+		return AgentRunPrepareResult{}, fmt.Errorf("ChangeSet %d not active for AgentRun %d", changeSetID, agentRunID)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("begin ChangeSet draft PR failure transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`
+UPDATE change_sets
+SET status = ?, updated_at = ?
+WHERE id = ?`, "branch_ready", now, changeSetID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark ChangeSet %d branch_ready after draft PR failure: %w", changeSetID, err)
+	}
+	if _, err := tx.Exec(`
+UPDATE control_actions
+SET status = ?, decided_at = ?
+WHERE id = ?`, "failed", now, controlActionID); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("mark draft PR ControlAction %d failed: %w", controlActionID, err)
+	}
+	event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "change_set.draft_pr_failed",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "change_set",
+		SubjectRef:      fmt.Sprintf("change_set:%d", changeSetID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		ChangeSetID:     changeSetID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"change_set_id":     changeSetID,
+			"agent_run_id":      agentRunID,
+			"provider":          detail.ChangeSet.Provider,
+			"repository_ref":    detail.ChangeSet.RepositoryRef,
+			"branch_ref":        detail.ChangeSet.BranchRef,
+			"failure_detail":    failureMessage,
+			"recoverable":       true,
+		},
+	})
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, event.ID); err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentRunPrepareResult{}, fmt.Errorf("commit ChangeSet draft PR failure: %w", err)
 	}
 
 	updated, err := store.GetAgentRunDetail(agentRunID)
@@ -1821,7 +2107,10 @@ SELECT
 	repository_ref,
 	base_branch,
 	branch_ref,
+	branch_provider_ref,
 	change_ref,
+	change_draft,
+	provider_snapshot,
 	status,
 	created_by_run_id,
 	active_run_id,
@@ -1839,7 +2128,10 @@ LIMIT 1`, workItemID).Scan(
 		&changeSet.RepositoryRef,
 		&changeSet.BaseBranch,
 		&changeSet.BranchRef,
+		&changeSet.BranchProviderRef,
 		&changeSet.ChangeRef,
+		&changeSet.ChangeDraft,
+		&changeSet.ProviderSnapshot,
 		&changeSet.Status,
 		&changeSet.CreatedByRunID,
 		&changeSet.ActiveRunID,
