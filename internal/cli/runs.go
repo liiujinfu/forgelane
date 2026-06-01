@@ -29,6 +29,7 @@ func newRunsCommand(stdout io.Writer, options Options) *cobra.Command {
 		Short: "Create and inspect AgentRuns.",
 	}
 	cmd.AddCommand(newRunsCreateCommand(stdout, options.WorkItemProvider))
+	cmd.AddCommand(newRunsStartCommand(stdout, options))
 	cmd.AddCommand(newRunsShowCommand(stdout))
 	cmd.AddCommand(newRunsPrepareCommand(stdout))
 	cmd.AddCommand(newRunsExecuteCommand(stdout, options))
@@ -70,6 +71,68 @@ func newRunsCreateCommand(stdout io.Writer, provider workitems.Provider) *cobra.
 			}
 
 			printCreatedAgentRun(stdout, workItem, result)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&agentPreset, "agent-preset", "", "AgentAdapter preset for the RunSpec")
+	return cmd
+}
+
+func newRunsStartCommand(stdout io.Writer, options Options) *cobra.Command {
+	var agentPreset string
+	cmd := &cobra.Command{
+		Use:   "start <provider-ref-or-issue>",
+		Short: "Start an AgentRun and deliver its draft PR path.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			instanceStore, err := openInitializedStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			ref, err := resolveWorkItemRef(args[0], instanceStore)
+			if err != nil {
+				return err
+			}
+			workItem, err := getOrImportWorkItem(cmd, instanceStore, options.WorkItemProvider, ref)
+			if err != nil {
+				return err
+			}
+
+			created, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
+				WorkItem:    workItem,
+				AgentPreset: agentPreset,
+			})
+			if err != nil {
+				return err
+			}
+
+			paths, err := workspacePathsForRun(created.AgentRun.ID)
+			if err != nil {
+				return err
+			}
+			if _, err := workflow.PrepareAgentRunWorkspace(instanceStore, runner.LocalWorkspacePreparer{}, created.AgentRun.ID, paths); err != nil {
+				return err
+			}
+
+			result, err := workflow.ExecuteAgentRunCommandAndDeliver(
+				cmd.Context(),
+				instanceStore,
+				agentCommandPlanner(options),
+				agentCommandRunner(options),
+				repositoryChangeMaterializer(options),
+				options.ChangeProvider,
+				created.AgentRun.ID,
+			)
+			if err != nil {
+				if result.AgentRun.ID != 0 {
+					printStartedAgentRun(stdout, workItem, created.Branch, result, err)
+				}
+				return err
+			}
+
+			printStartedAgentRun(stdout, workItem, created.Branch, result, nil)
 			return nil
 		},
 	}
@@ -160,23 +223,15 @@ func newRunsExecuteCommand(stdout io.Writer, options Options) *cobra.Command {
 			}
 			defer instanceStore.Close()
 
-			planner := options.AgentCommandPlanner
-			if planner == nil {
-				planner = commandadapter.Adapter{
-					Secrets: commandadapter.EnvSecretStore{},
-				}
-			}
-			commandRunner := options.AgentCommandRunner
-			if commandRunner == nil {
-				commandRunner = processrunner.Runner{}
-			}
-			materializer := options.RepositoryChangeMaterializer
-			if materializer == nil {
-				materializer = runner.GitCommitMaterializer{}
-			}
-			changeProvider := options.ChangeProvider
-
-			result, err := workflow.ExecuteAgentRunCommandAndDeliver(cmd.Context(), instanceStore, planner, commandRunner, materializer, changeProvider, runID)
+			result, err := workflow.ExecuteAgentRunCommandAndDeliver(
+				cmd.Context(),
+				instanceStore,
+				agentCommandPlanner(options),
+				agentCommandRunner(options),
+				repositoryChangeMaterializer(options),
+				options.ChangeProvider,
+				runID,
+			)
 			if err != nil {
 				return err
 			}
@@ -280,6 +335,29 @@ func newRunsLogsCommand(stdout io.Writer) *cobra.Command {
 	return cmd
 }
 
+func agentCommandPlanner(options Options) workflow.AgentCommandPlanner {
+	if options.AgentCommandPlanner != nil {
+		return options.AgentCommandPlanner
+	}
+	return commandadapter.Adapter{
+		Secrets: commandadapter.EnvSecretStore{},
+	}
+}
+
+func agentCommandRunner(options Options) workflow.AgentCommandRunner {
+	if options.AgentCommandRunner != nil {
+		return options.AgentCommandRunner
+	}
+	return processrunner.Runner{}
+}
+
+func repositoryChangeMaterializer(options Options) workflow.RepositoryChangeMaterializer {
+	if options.RepositoryChangeMaterializer != nil {
+		return options.RepositoryChangeMaterializer
+	}
+	return runner.GitCommitMaterializer{}
+}
+
 func workspacePathsForRun(runID int64) (store.WorkspacePaths, error) {
 	dbPath, err := repositoryconfig.StateDBPath("")
 	if err != nil {
@@ -306,6 +384,40 @@ func printPreparedAgentRun(stdout io.Writer, result store.AgentRunPrepareResult)
 		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
 		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
 	}
+}
+
+func printStartedAgentRun(stdout io.Writer, workItem store.WorkItem, branch string, result store.AgentRunPrepareResult, deliveryErr error) {
+	fmt.Fprintf(stdout, "Started AgentRun %d\n", result.AgentRun.ID)
+	fmt.Fprintf(stdout, "WorkItem: %s\n", workItem.ProviderRef)
+	fmt.Fprintf(stdout, "Status: %s\n", result.AgentRun.Status)
+	fmt.Fprintf(stdout, "Branch: %s\n", branch)
+	if deliveryErr != nil {
+		fmt.Fprintf(stdout, "Delivery: failed (%s)\n", deliveryErr)
+	} else if hasEventType(result.Events, "repository_delivery.skipped") {
+		fmt.Fprintln(stdout, "Delivery: skipped (no repository changes)")
+	} else if result.ChangeSet != nil && result.ChangeSet.ChangeRef != "" {
+		fmt.Fprintln(stdout, "Delivery: draft PR ready")
+	} else if result.ChangeSet != nil && result.ChangeSet.BranchProviderRef != "" {
+		fmt.Fprintln(stdout, "Delivery: branch ready")
+	} else if result.ChangeSet != nil {
+		fmt.Fprintln(stdout, "Delivery: changes pending provider delivery")
+	}
+	for _, ref := range result.CommitRefs {
+		fmt.Fprintf(stdout, "Commit: %s@%s %s\n", ref.RepositoryRef, ref.SHA, ref.Subject)
+	}
+	if result.ChangeSet != nil {
+		fmt.Fprintf(stdout, "ChangeSet ID: %d\n", result.ChangeSet.ID)
+		if result.ChangeSet.BranchProviderRef != "" {
+			fmt.Fprintf(stdout, "Provider branch: %s\n", result.ChangeSet.BranchProviderRef)
+		}
+		if result.ChangeSet.ChangeRef != "" {
+			fmt.Fprintf(stdout, "Draft PR: %s\n", result.ChangeSet.ChangeRef)
+		}
+	}
+	fmt.Fprintf(stdout, "Next: forgelane runs show %d\n", result.AgentRun.ID)
+	fmt.Fprintf(stdout, "Next: forgelane runs logs %d\n", result.AgentRun.ID)
+	fmt.Fprintf(stdout, "Next: forgelane runs stop %d\n", result.AgentRun.ID)
+	fmt.Fprintf(stdout, "Next: forgelane runs retry %d\n", result.AgentRun.ID)
 }
 
 func printExecutedAgentRun(stdout io.Writer, result store.AgentRunPrepareResult) {
