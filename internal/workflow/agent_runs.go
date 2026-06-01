@@ -110,6 +110,7 @@ type AgentRunCreateResult struct {
 	AgentRun      AgentRun
 	RunSpec       RunSpec
 	Branch        string
+	ChangeSet     *ChangeSet
 	Events        []Event
 }
 
@@ -273,6 +274,15 @@ type AgentRunPrepareResult struct {
 	Events     []Event
 }
 
+// AgentRunControlResult is the outcome of a human ControlAction against an AgentRun.
+type AgentRunControlResult struct {
+	ControlAction ControlAction
+	AgentRun      AgentRun
+	RunnerJob     RunnerJob
+	Workspace     *Workspace
+	Events        []Event
+}
+
 // AgentRunDetail is the read model for inspecting one AgentRun.
 type AgentRunDetail struct {
 	AgentRun           AgentRun
@@ -402,6 +412,69 @@ type WorkspacePreparationStore interface {
 	MarkWorkspaceFailed(int64, string) (AgentRunPrepareResult, error)
 }
 
+// AgentRunControlStore persists human ControlActions and matching AgentRun Events.
+type AgentRunControlStore interface {
+	RequestAgentRunStop(int64, ControlActionPlan) (AgentRunControlResult, error)
+}
+
+// AgentRunRetryStore persists retry ControlActions and new AgentRun attempts.
+type AgentRunRetryStore interface {
+	GetAgentRunDetail(int64) (AgentRunDetail, error)
+	CreateRetryAgentRun(int64, PlannedAgentRunPlan) (AgentRunCreateResult, error)
+}
+
+// RequestAgentRunStop records a human stop request for an active AgentRun.
+func RequestAgentRunStop(store AgentRunControlStore, runID int64) (AgentRunControlResult, error) {
+	return store.RequestAgentRunStop(runID, ControlActionPlan{
+		Type:        "stop",
+		TargetType:  "agent_run",
+		TargetRef:   fmt.Sprintf("agent_run:%d", runID),
+		RequestedBy: "local",
+		Reason:      "forgelane runs stop",
+		Input: map[string]any{
+			"agent_run_id": runID,
+		},
+		Status: "succeeded",
+	})
+}
+
+// RequestAgentRunRetry records a retry ControlAction and creates a fresh planned AgentRun.
+func RequestAgentRunRetry(store AgentRunRetryStore, priorRunID int64) (AgentRunCreateResult, error) {
+	prior, err := store.GetAgentRunDetail(priorRunID)
+	if err != nil {
+		return AgentRunCreateResult{}, err
+	}
+	if !isTerminalAgentRunStatus(prior.AgentRun.Status) {
+		return AgentRunCreateResult{}, fmt.Errorf("AgentRun %d is %s; expected terminal run", priorRunID, prior.AgentRun.Status)
+	}
+	plan, err := NewPlannedAgentRunPlan(prior.WorkItem, "")
+	if err != nil {
+		return AgentRunCreateResult{}, err
+	}
+	plan.ControlAction = ControlActionPlan{
+		Type:        "retry",
+		TargetType:  "agent_run",
+		TargetRef:   fmt.Sprintf("agent_run:%d", priorRunID),
+		RequestedBy: "local",
+		Reason:      "forgelane runs retry",
+		Input: map[string]any{
+			"prior_agent_run_id": priorRunID,
+			"work_item_ref":      prior.WorkItem.ProviderRef,
+		},
+		Status: "succeeded",
+	}
+	return store.CreateRetryAgentRun(priorRunID, plan)
+}
+
+func isTerminalAgentRunStatus(status string) bool {
+	switch status {
+	case "completed", "failed", "cancelled", "timed_out":
+		return true
+	default:
+		return false
+	}
+}
+
 // WorkspacePreparer performs filesystem preparation after the Workspace is allocated.
 type WorkspacePreparer interface {
 	PrepareWorkspace(WorkspacePreparation) error
@@ -456,6 +529,9 @@ func ExecuteAgentRunCommandAndMaterialize(ctx context.Context, store AgentComman
 	}
 	if detail.Workspace.Status != "ready" {
 		return AgentRunPrepareResult{}, fmt.Errorf("Workspace for AgentRun %d is %s; expected ready", runID, detail.Workspace.Status)
+	}
+	if detail.AgentRun.Status != "preparing" {
+		return AgentRunPrepareResult{}, fmt.Errorf("AgentRun %d is %s; expected preparing", runID, detail.AgentRun.Status)
 	}
 
 	plan, err := planner.PlanAgentCommand(AgentCommandPlanInput{
