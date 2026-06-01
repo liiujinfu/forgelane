@@ -1418,6 +1418,341 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 	assertTableCount(t, homeDir, "control_actions", 3)
 }
 
+func TestRunsStartDeliversRepositoryChangesToDraftPR(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Start the primary delivery path",
+			Body:                "Create one command for issue-to-draft-PR delivery.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true},
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "start", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Started AgentRun 1",
+		"WorkItem: github://github.com/owner/repo/issues/123",
+		"Status: completed",
+		"Branch: forgelane/issue-123",
+		"Delivery: draft PR ready",
+		"ChangeSet ID: 1",
+		"Provider branch: github://github.com/owner/repo/branches/forgelane/issue-123",
+		"Draft PR: github://github.com/owner/repo/pulls/10",
+		"Next: forgelane runs show 1",
+		"Next: forgelane runs logs 1",
+		"Next: forgelane runs stop 1",
+		"Next: forgelane runs retry 1",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected runs start output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "draft_open") {
+		t.Fatalf("expected product summary not to expose internal status, got:\n%s", stdout)
+	}
+	if len(changeProvider.calls) != 1 {
+		t.Fatalf("expected one fake Change Provider push, got %#v", changeProvider.calls)
+	}
+	if len(changeProvider.draftPRCalls) != 1 {
+		t.Fatalf("expected one fake Change Provider draft PR call, got %#v", changeProvider.draftPRCalls)
+	}
+	assertTableCount(t, homeDir, "agent_runs", 1)
+	assertTableCount(t, homeDir, "runner_jobs", 1)
+	assertTableCount(t, homeDir, "workspaces", 1)
+	assertTableCount(t, homeDir, "change_sets", 1)
+	assertTableCount(t, homeDir, "commit_refs", 1)
+	assertTableCount(t, homeDir, "control_actions", 3)
+
+	eventsStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "events", "list", "--run", "1")
+	if err != nil {
+		t.Fatalf("expected events list after successful start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	assertInOrder(t, eventsStdout, []string{
+		"change_set.branch_push_started",
+		"change_set.branch_push_succeeded",
+		"change_set.draft_pr_started",
+		"change_set.draft_pr_succeeded",
+	})
+}
+
+func TestRunsStartIssueNumberNoChangeSkipsDeliveryWithoutChangeProvider(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "git@github.com:owner/repo.git")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Start shorthand no-change delivery",
+			Body:                "No repository changes should skip delivery artifacts.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	if _, stderr, err := executeForTest(t, "init", "--provider", "github"); err != nil {
+		t.Fatalf("expected init to configure current ForgeProject: %v\nstderr:\n%s", err, stderr)
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "start", "--agent-preset", "harmless-echo", "123")
+	if err != nil {
+		t.Fatalf("expected shorthand runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Started AgentRun 1",
+		"WorkItem: github://github.com/owner/repo/issues/123",
+		"Status: completed",
+		"Branch: forgelane/issue-123",
+		"Delivery: skipped (no repository changes)",
+		"Next: forgelane runs show 1",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected runs start output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "ChangeSet ID:") {
+		t.Fatalf("expected no ChangeSet output for no-change run, got:\n%s", stdout)
+	}
+	assertTableCount(t, homeDir, "agent_runs", 1)
+	assertTableCount(t, homeDir, "runner_jobs", 1)
+	assertTableCount(t, homeDir, "workspaces", 1)
+	assertTableCount(t, homeDir, "change_sets", 0)
+	assertTableCount(t, homeDir, "commit_refs", 0)
+	assertTableCount(t, homeDir, "control_actions", 1)
+}
+
+func TestRunsStartReportsRecoverableDeliveryFailures(t *testing.T) {
+	tests := []struct {
+		name           string
+		changeProvider workflow.ChangeProvider
+		wantErr        string
+		wantStart      []string
+		wantShow       []string
+		wantEvents     []string
+	}{
+		{
+			name:    "missing ChangeProvider",
+			wantErr: "missing ChangeProvider",
+			wantStart: []string{
+				"Started AgentRun 1",
+				"WorkItem: github://github.com/owner/repo/issues/123",
+				"Status: completed",
+				"Branch: forgelane/issue-123",
+				"Delivery: failed (deliver ChangeSet 1: missing ChangeProvider for provider \"github\")",
+				"ChangeSet ID: 1",
+				"Next: forgelane runs show 1",
+				"Next: forgelane runs retry 1",
+			},
+			wantShow: []string{
+				"Status: completed",
+				"ChangeSet: 1 planned forgelane/issue-123",
+				"ChangeSet commits: 1",
+			},
+		},
+		{
+			name: "branch push failure",
+			changeProvider: &recordingChangeProvider{
+				pushErr: os.ErrPermission,
+			},
+			wantErr: "push ChangeSet branch failed",
+			wantStart: []string{
+				"Started AgentRun 1",
+				"WorkItem: github://github.com/owner/repo/issues/123",
+				"Status: completed",
+				"Branch: forgelane/issue-123",
+				"Delivery: failed (push ChangeSet branch failed)",
+				"ChangeSet ID: 1",
+				"Next: forgelane runs show 1",
+				"Next: forgelane runs retry 1",
+			},
+			wantShow: []string{
+				"Status: completed",
+				"ChangeSet: 1 branch_push_failed forgelane/issue-123",
+				"ChangeSet commits: 1",
+			},
+			wantEvents: []string{
+				"change_set.branch_push_started",
+				"change_set.branch_push_failed",
+			},
+		},
+		{
+			name: "draft PR failure",
+			changeProvider: &recordingChangeProvider{
+				pushResult: workflow.ChangeBranchPushResult{
+					ChangeSetID:       1,
+					BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+					PushedCommitSHAs:  []string{"abc123"},
+				},
+				draftPRErr: os.ErrPermission,
+			},
+			wantErr: "create or update draft PR failed",
+			wantStart: []string{
+				"Started AgentRun 1",
+				"WorkItem: github://github.com/owner/repo/issues/123",
+				"Status: completed",
+				"Branch: forgelane/issue-123",
+				"Delivery: failed (create or update draft PR failed)",
+				"ChangeSet ID: 1",
+				"Provider branch: github://github.com/owner/repo/branches/forgelane/issue-123",
+				"Next: forgelane runs show 1",
+				"Next: forgelane runs retry 1",
+			},
+			wantShow: []string{
+				"Status: completed",
+				"ChangeSet: 1 branch_ready forgelane/issue-123",
+				"ChangeSet provider branch: github://github.com/owner/repo/branches/forgelane/issue-123",
+				"ChangeSet commits: 1",
+			},
+			wantEvents: []string{
+				"change_set.branch_push_started",
+				"change_set.branch_push_succeeded",
+				"change_set.draft_pr_started",
+				"change_set.draft_pr_failed",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			homeDir := t.TempDir()
+			runGit(t, workingDir, "init")
+			runGit(t, workingDir, "config", "user.email", "test@example.com")
+			runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+			runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+			if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+				t.Fatalf("write source repo file: %v", err)
+			}
+			runGit(t, workingDir, "add", "README.md")
+			runGit(t, workingDir, "commit", "-m", "initial")
+			withWorkingDir(t, workingDir)
+			withHomeDir(t, homeDir)
+
+			fakeProvider := &recordingWorkItemProvider{
+				issue: workitems.ProviderIssue{
+					ProviderRef:         "github://github.com/owner/repo/issues/123",
+					RepositoryRef:       "github://github.com/owner/repo",
+					Provider:            "github",
+					ProviderIssueNumber: 123,
+					Title:               "Start recoverable delivery failure",
+					Body:                "Delivery failures should keep inspectable ChangeSet state.",
+					Status:              "open",
+					RawStatus:           "open",
+					URL:                 "https://github.com/owner/repo/issues/123",
+					ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+				},
+			}
+
+			stdout, stderr, err := executeForTestWithOptions(t, Options{
+				WorkItemProvider:    fakeProvider,
+				AgentCommandPlanner: changingCommandPlanner{},
+				ChangeProvider:      tt.changeProvider,
+			}, "runs", "start", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123")
+			if err == nil {
+				t.Fatal("expected runs start to fail")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error to contain %q, got %v\nstderr:\n%s", tt.wantErr, err, stderr)
+			}
+			for _, want := range tt.wantStart {
+				if !strings.Contains(stdout, want) {
+					t.Fatalf("expected failed runs start output to contain %q, got:\n%s", want, stdout)
+				}
+			}
+			if strings.Contains(stdout, "branch_push_failed") || strings.Contains(stdout, "branch_ready") {
+				t.Fatalf("expected product summary not to expose internal delivery status, got:\n%s", stdout)
+			}
+
+			showStdout, stderr, err := executeForTestWithOptions(t, Options{
+				WorkItemProvider: fakeProvider,
+			}, "runs", "show", "1")
+			if err != nil {
+				t.Fatalf("expected runs show after failed start to succeed: %v\nstderr:\n%s", err, stderr)
+			}
+			for _, want := range tt.wantShow {
+				if !strings.Contains(showStdout, want) {
+					t.Fatalf("expected runs show output to contain %q, got:\n%s", want, showStdout)
+				}
+			}
+
+			if len(tt.wantEvents) > 0 {
+				eventsStdout, stderr, err := executeForTestWithOptions(t, Options{
+					WorkItemProvider: fakeProvider,
+				}, "events", "list", "--run", "1")
+				if err != nil {
+					t.Fatalf("expected events list after failed start to succeed: %v\nstderr:\n%s", err, stderr)
+				}
+				assertInOrder(t, eventsStdout, tt.wantEvents)
+			}
+		})
+	}
+}
+
 func TestRunsExecuteFailsClearlyWhenDeliveryProviderIsMissing(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()
