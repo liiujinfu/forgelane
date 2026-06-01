@@ -912,6 +912,124 @@ func TestRunsPrepareCreatesWorkspaceAndShowsState(t *testing.T) {
 	assertTableCount(t, homeDir, "workspaces", 1)
 }
 
+func TestRunsStopAndRetryExposeAgentRunControlActions(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Control an AgentRun",
+			Body:                "Stop and retry should be auditable CLI controls.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	createStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	runID := extractCreatedAgentRunID(t, createStdout)
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "prepare", strconv.FormatInt(runID, 10)); err != nil {
+		t.Fatalf("expected runs prepare to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	instanceStore, err := openInitializedStore()
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := instanceStore.MarkAgentCommandStarted(runID); err != nil {
+		instanceStore.Close()
+		t.Fatalf("mark AgentRun running: %v", err)
+	}
+	instanceStore.Close()
+
+	stopStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "stop", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs stop to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Stop requested for AgentRun 1",
+		"Status: cancelled",
+		"ControlAction ID:",
+		"Event: control_action.succeeded",
+		"Event: agent_run.cancel_requested",
+		"Event: agent_run.cancelled",
+	} {
+		if !strings.Contains(stopStdout, want) {
+			t.Fatalf("expected runs stop output to contain %q, got:\n%s", want, stopStdout)
+		}
+	}
+
+	retryStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "retry", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs retry to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Retried AgentRun 1 as AgentRun 2",
+		"Status: planned",
+		"ControlAction ID:",
+		"RunSpec ID:",
+		"Event: control_action.succeeded",
+		"Event: agent_run.created",
+		"Event: run_spec.created",
+	} {
+		if !strings.Contains(retryStdout, want) {
+			t.Fatalf("expected runs retry output to contain %q, got:\n%s", want, retryStdout)
+		}
+	}
+
+	assertTableCount(t, homeDir, "control_actions", 3)
+	assertTableCount(t, homeDir, "agent_runs", 2)
+	assertTableCount(t, homeDir, "run_specs", 2)
+	assertEventTypes(t, homeDir, []string{
+		"work_item.imported",
+		"control_action.succeeded",
+		"agent_run.created",
+		"run_spec.created",
+		"workspace.allocated",
+		"workspace.prepared",
+		"agent_command.started",
+		"control_action.succeeded",
+		"agent_run.cancel_requested",
+		"agent_run.cancelled",
+		"control_action.succeeded",
+		"agent_run.created",
+		"run_spec.created",
+	})
+}
+
 func TestRunsPrepareFailureRetainsFailedWorkspaceState(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()

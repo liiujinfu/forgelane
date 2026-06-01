@@ -838,6 +838,174 @@ func TestExecuteAgentRunCommandRecordsPreStartCancellationDistinctly(t *testing.
 	}
 }
 
+func TestRequestAgentRunStopRecordsControlActionAndCancelRequest(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+	if _, err := instanceStore.MarkAgentCommandStarted(runID); err != nil {
+		t.Fatalf("mark AgentRun running: %v", err)
+	}
+
+	result, err := workflow.RequestAgentRunStop(instanceStore, runID)
+	if err != nil {
+		t.Fatalf("request AgentRun stop: %v", err)
+	}
+	if result.ControlAction.Type != "stop" || result.ControlAction.Status != "succeeded" {
+		t.Fatalf("unexpected stop ControlAction: %#v", result.ControlAction)
+	}
+	if result.AgentRun.Status != "cancelled" {
+		t.Fatalf("expected stop request to mark AgentRun cancelled, got %q", result.AgentRun.Status)
+	}
+	if result.RunnerJob.Status != "cancelled" {
+		t.Fatalf("expected stop request to cancel RunnerJob, got %q", result.RunnerJob.Status)
+	}
+	if got := eventTypes(result.Events); got != "control_action.succeeded,agent_run.cancel_requested,agent_run.cancelled" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	events, err := instanceStore.ListEventsForAgentRun(runID)
+	if err != nil {
+		t.Fatalf("list Events: %v", err)
+	}
+	if got := eventTypes(events); got != "control_action.succeeded,agent_run.created,run_spec.created,workspace.allocated,workspace.prepared,agent_command.started,control_action.succeeded,agent_run.cancel_requested,agent_run.cancelled" {
+		t.Fatalf("unexpected persisted Event sequence %s", got)
+	}
+}
+
+func TestRequestAgentRunStopRejectsPreparedAgentRun(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+
+	_, err := workflow.RequestAgentRunStop(instanceStore, runID)
+	if err == nil || !strings.Contains(err.Error(), "expected running") {
+		t.Fatalf("expected stop to reject non-running AgentRun, got %v", err)
+	}
+}
+
+func TestAgentCommandCompletionDoesNotOverwriteStoppedRun(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+	if _, err := instanceStore.MarkAgentCommandStarted(runID); err != nil {
+		t.Fatalf("mark AgentRun running: %v", err)
+	}
+	if _, err := workflow.RequestAgentRunStop(instanceStore, runID); err != nil {
+		t.Fatalf("request AgentRun stop: %v", err)
+	}
+
+	result, err := instanceStore.MarkAgentCommandCompleted(runID, workflow.AgentCommandCompletion{
+		Status:   "completed",
+		ExitCode: 0,
+	})
+	if err != nil {
+		t.Fatalf("complete stopped AgentRun command: %v", err)
+	}
+	if result.AgentRun.Status != "cancelled" {
+		t.Fatalf("expected stopped AgentRun to remain cancelled, got %q", result.AgentRun.Status)
+	}
+	if result.RunnerJob.Status != "cancelled" {
+		t.Fatalf("expected stopped RunnerJob to remain cancelled, got %q", result.RunnerJob.Status)
+	}
+	if got := eventTypes(result.Events); got != "" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	events, err := instanceStore.ListEventsForAgentRun(runID)
+	if err != nil {
+		t.Fatalf("list Events: %v", err)
+	}
+	if got := eventTypes(events); strings.Contains(got, "agent_command.completed") {
+		t.Fatalf("expected stopped run not to record command completion, got %s", got)
+	}
+}
+
+func TestRequestAgentRunRetryCreatesNewRunSpecForTerminalRun(t *testing.T) {
+	instanceStore, priorRunID := preparedAgentRun(t)
+	failed, err := workflow.ExecuteAgentRunCommand(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		nonZeroExitCommandRunner{},
+		priorRunID,
+	)
+	if err != nil {
+		t.Fatalf("fail prior AgentRun: %v", err)
+	}
+	if failed.AgentRun.Status != "failed" {
+		t.Fatalf("expected prior AgentRun to be failed, got %q", failed.AgentRun.Status)
+	}
+
+	result, err := workflow.RequestAgentRunRetry(instanceStore, priorRunID)
+	if err != nil {
+		t.Fatalf("request AgentRun retry: %v", err)
+	}
+	if result.ControlAction.Type != "retry" || result.ControlAction.Status != "succeeded" {
+		t.Fatalf("unexpected retry ControlAction: %#v", result.ControlAction)
+	}
+	if result.AgentRun.ID == priorRunID {
+		t.Fatalf("expected retry to create a new AgentRun, reused %d", priorRunID)
+	}
+	if result.AgentRun.Status != "planned" {
+		t.Fatalf("expected retry AgentRun to be planned, got %q", result.AgentRun.Status)
+	}
+	if result.RunSpec.AgentRunID != result.AgentRun.ID || result.RunSpec.ID == 0 {
+		t.Fatalf("expected retry to create a new RunSpec for the new AgentRun, got %#v", result.RunSpec)
+	}
+	if result.Branch != "forgelane/issue-123" {
+		t.Fatalf("expected retry to keep WorkItem branch, got %q", result.Branch)
+	}
+	if got := eventTypes(result.Events); got != "control_action.succeeded,agent_run.created,run_spec.created" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	retryDetail, err := instanceStore.GetAgentRunDetail(result.AgentRun.ID)
+	if err != nil {
+		t.Fatalf("get retry AgentRun detail: %v", err)
+	}
+	if retryDetail.RunSpec.ID == failed.AgentRun.ID {
+		t.Fatalf("expected retry RunSpec to be distinct from prior run")
+	}
+}
+
+func TestRequestAgentRunRetryTargetsExistingActiveChangeSet(t *testing.T) {
+	instanceStore, priorRunID := preparedAgentRun(t)
+	completed, err := workflow.ExecuteAgentRunCommandAndMaterialize(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		priorRunID,
+	)
+	if err != nil {
+		t.Fatalf("complete prior AgentRun with ChangeSet: %v", err)
+	}
+	if completed.ChangeSet == nil {
+		t.Fatalf("expected prior AgentRun to create active ChangeSet")
+	}
+
+	result, err := workflow.RequestAgentRunRetry(instanceStore, priorRunID)
+	if err != nil {
+		t.Fatalf("request AgentRun retry: %v", err)
+	}
+	if result.ChangeSet == nil {
+		t.Fatalf("expected retry result to include targeted ChangeSet")
+	}
+	if result.ChangeSet.ID != completed.ChangeSet.ID ||
+		result.ChangeSet.BranchRef != completed.ChangeSet.BranchRef ||
+		result.ChangeSet.ActiveRunID != result.AgentRun.ID {
+		t.Fatalf("expected retry to target existing active ChangeSet, got %#v", result.ChangeSet)
+	}
+	if got := eventTypes(result.Events); got != "control_action.succeeded,agent_run.created,run_spec.created,change_set.retry_targeted" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	retryDetail, err := instanceStore.GetAgentRunDetail(result.AgentRun.ID)
+	if err != nil {
+		t.Fatalf("get retry AgentRun detail: %v", err)
+	}
+	if retryDetail.ChangeSet == nil ||
+		retryDetail.ChangeSet.ID != completed.ChangeSet.ID ||
+		retryDetail.ChangeSet.ActiveRunID != result.AgentRun.ID {
+		t.Fatalf("expected retry detail to show targeted active ChangeSet, got %#v", retryDetail.ChangeSet)
+	}
+}
+
 type staticCommandPlanner struct{}
 
 func (staticCommandPlanner) PlanAgentCommand(workflow.AgentCommandPlanInput) (workflow.AgentCommandPlan, error) {

@@ -32,6 +32,8 @@ func newRunsCommand(stdout io.Writer, options Options) *cobra.Command {
 	cmd.AddCommand(newRunsShowCommand(stdout))
 	cmd.AddCommand(newRunsPrepareCommand(stdout))
 	cmd.AddCommand(newRunsExecuteCommand(stdout, options))
+	cmd.AddCommand(newRunsStopCommand(stdout))
+	cmd.AddCommand(newRunsRetryCommand(stdout))
 	cmd.AddCommand(newRunsLogsCommand(stdout))
 	return cmd
 }
@@ -184,6 +186,60 @@ func newRunsExecuteCommand(stdout io.Writer, options Options) *cobra.Command {
 	}
 }
 
+func newRunsStopCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop <run_id>",
+		Short: "Request stop for an active AgentRun.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+
+			instanceStore, err := openInitializedStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			result, err := workflow.RequestAgentRunStop(instanceStore, runID)
+			if err != nil {
+				return err
+			}
+			printStoppedAgentRun(stdout, result)
+			return nil
+		},
+	}
+}
+
+func newRunsRetryCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "retry <run_id>",
+		Short: "Create a fresh AgentRun retry for a terminal AgentRun.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+
+			instanceStore, err := openInitializedStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			result, err := workflow.RequestAgentRunRetry(instanceStore, runID)
+			if err != nil {
+				return err
+			}
+			printRetriedAgentRun(stdout, runID, result)
+			return nil
+		},
+	}
+}
+
 func newRunsLogsCommand(stdout io.Writer) *cobra.Command {
 	var stream string
 
@@ -264,6 +320,33 @@ func printExecutedAgentRun(stdout io.Writer, result store.AgentRunPrepareResult)
 	}
 	if result.ChangeSet != nil {
 		fmt.Fprintf(stdout, "ChangeSet: %d %s %s\n", result.ChangeSet.ID, result.ChangeSet.Status, result.ChangeSet.BranchRef)
+		printChangeSetProviderRefs(stdout, *result.ChangeSet)
+	}
+	for _, event := range result.Events {
+		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
+		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
+	}
+}
+
+func printStoppedAgentRun(stdout io.Writer, result workflow.AgentRunControlResult) {
+	fmt.Fprintf(stdout, "Stop requested for AgentRun %d\n", result.AgentRun.ID)
+	fmt.Fprintf(stdout, "Status: %s\n", result.AgentRun.Status)
+	fmt.Fprintf(stdout, "ControlAction ID: %d\n", result.ControlAction.ID)
+	for _, event := range result.Events {
+		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
+		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
+	}
+}
+
+func printRetriedAgentRun(stdout io.Writer, priorRunID int64, result workflow.AgentRunCreateResult) {
+	fmt.Fprintf(stdout, "Retried AgentRun %d as AgentRun %d\n", priorRunID, result.AgentRun.ID)
+	fmt.Fprintf(stdout, "Status: %s\n", result.AgentRun.Status)
+	fmt.Fprintf(stdout, "ControlAction ID: %d\n", result.ControlAction.ID)
+	fmt.Fprintf(stdout, "RunSpec ID: %d\n", result.RunSpec.ID)
+	fmt.Fprintf(stdout, "Branch: %s\n", result.Branch)
+	if result.ChangeSet != nil {
+		fmt.Fprintf(stdout, "ChangeSet: %d %s %s\n", result.ChangeSet.ID, result.ChangeSet.Status, result.ChangeSet.BranchRef)
+		fmt.Fprintf(stdout, "ChangeSet active run: %d\n", result.ChangeSet.ActiveRunID)
 		printChangeSetProviderRefs(stdout, *result.ChangeSet)
 	}
 	for _, event := range result.Events {

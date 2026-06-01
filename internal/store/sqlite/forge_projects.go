@@ -1718,6 +1718,9 @@ func (store *Store) finishAgentCommand(agentRunID int64, status string, eventTyp
 	if detail.Workspace == nil {
 		return AgentRunPrepareResult{}, fmt.Errorf("Workspace not prepared for AgentRun %d", agentRunID)
 	}
+	if detail.AgentRun.Status == "cancelled" {
+		return agentRunPrepareResultFromDetail(detail, nil), nil
+	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	tx, err := store.db.Begin()
@@ -2147,6 +2150,70 @@ LIMIT 1`, workItemID).Scan(
 	return changeSet, true, nil
 }
 
+func scanActiveChangeSetForAgentRunTx(tx *sql.Tx, agentRunID int64) (ChangeSet, bool, error) {
+	var changeSet ChangeSet
+	err := tx.QueryRow(`
+SELECT
+	c.id,
+	c.work_item_id,
+	c.work_item_ref,
+	c.provider,
+	c.repository_ref,
+	c.base_branch,
+	c.branch_ref,
+	c.branch_provider_ref,
+	c.change_ref,
+	c.change_draft,
+	c.provider_snapshot,
+	c.status,
+	c.created_by_run_id,
+	c.active_run_id,
+	c.created_at,
+	c.updated_at
+FROM change_sets c
+WHERE c.status NOT IN ('merged', 'closed', 'abandoned')
+	AND (
+		c.created_by_run_id = ?
+		OR c.active_run_id = ?
+		OR EXISTS (
+			SELECT 1
+			FROM commit_refs r
+			WHERE r.agent_run_id = ?
+				AND r.change_set_id = c.id
+		)
+	)
+ORDER BY CASE
+	WHEN c.active_run_id = ? THEN 0
+	WHEN c.created_by_run_id = ? THEN 1
+	ELSE 2
+END, c.id DESC
+LIMIT 1`, agentRunID, agentRunID, agentRunID, agentRunID, agentRunID).Scan(
+		&changeSet.ID,
+		&changeSet.WorkItemID,
+		&changeSet.WorkItemRef,
+		&changeSet.Provider,
+		&changeSet.RepositoryRef,
+		&changeSet.BaseBranch,
+		&changeSet.BranchRef,
+		&changeSet.BranchProviderRef,
+		&changeSet.ChangeRef,
+		&changeSet.ChangeDraft,
+		&changeSet.ProviderSnapshot,
+		&changeSet.Status,
+		&changeSet.CreatedByRunID,
+		&changeSet.ActiveRunID,
+		&changeSet.CreatedAt,
+		&changeSet.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return ChangeSet{}, false, nil
+	}
+	if err != nil {
+		return ChangeSet{}, false, fmt.Errorf("query active ChangeSet for AgentRun %d: %w", agentRunID, err)
+	}
+	return changeSet, true, nil
+}
+
 func boolInt(value bool) int {
 	if value {
 		return 1
@@ -2381,6 +2448,23 @@ WHERE id = ?`,
 
 // CreatePlannedAgentRun writes one planned AgentRun, its immutable RunSpec, and matching Events.
 func (store *Store) CreatePlannedAgentRun(plan workflow.PlannedAgentRunPlan) (workflow.AgentRunCreateResult, error) {
+	return store.createAgentRun(plan, agentRunCreateOptions{})
+}
+
+// CreateRetryAgentRun writes a retry ControlAction, fresh AgentRun, fresh RunSpec, and optional active ChangeSet target in one transaction.
+func (store *Store) CreateRetryAgentRun(priorAgentRunID int64, plan workflow.PlannedAgentRunPlan) (workflow.AgentRunCreateResult, error) {
+	return store.createAgentRun(plan, agentRunCreateOptions{
+		priorAgentRunID:               priorAgentRunID,
+		targetPriorRunActiveChangeSet: true,
+	})
+}
+
+type agentRunCreateOptions struct {
+	priorAgentRunID               int64
+	targetPriorRunActiveChangeSet bool
+}
+
+func (store *Store) createAgentRun(plan workflow.PlannedAgentRunPlan, options agentRunCreateOptions) (workflow.AgentRunCreateResult, error) {
 	workItem := plan.WorkItem
 	now := time.Now().UTC().Format(time.RFC3339)
 
@@ -2486,6 +2570,46 @@ VALUES (?, ?, ?)`,
 		events = append(events, event)
 	}
 
+	var changeSet *workflow.ChangeSet
+	if options.targetPriorRunActiveChangeSet {
+		activeChangeSet, found, err := scanActiveChangeSetForAgentRunTx(tx, options.priorAgentRunID)
+		if err != nil {
+			return workflow.AgentRunCreateResult{}, err
+		}
+		if found {
+			if _, err := tx.Exec("UPDATE change_sets SET active_run_id = ?, updated_at = ? WHERE id = ?", runID, now, activeChangeSet.ID); err != nil {
+				return workflow.AgentRunCreateResult{}, fmt.Errorf("target ChangeSet %d for AgentRun %d: %w", activeChangeSet.ID, runID, err)
+			}
+			activeChangeSet.ActiveRunID = runID
+			activeChangeSet.UpdatedAt = now
+			changeSet = &activeChangeSet
+			event, err := appendAgentRunEventTx(tx, agentRunEventInput{
+				Type:            "change_set.retry_targeted",
+				OccurredAt:      now,
+				ForgeProjectID:  workItem.ForgeProjectID,
+				SubjectType:     "change_set",
+				SubjectRef:      fmt.Sprintf("change_set:%d", activeChangeSet.ID),
+				WorkItemID:      workItem.ID,
+				WorkItemRef:     workItem.ProviderRef,
+				AgentRunID:      runID,
+				ControlActionID: controlActionID,
+				ChangeSetID:     activeChangeSet.ID,
+				Payload: map[string]any{
+					"change_set_id":      activeChangeSet.ID,
+					"prior_agent_run_id": options.priorAgentRunID,
+					"agent_run_id":       runID,
+					"work_item_ref":      workItem.ProviderRef,
+					"branch_ref":         activeChangeSet.BranchRef,
+					"change_ref":         activeChangeSet.ChangeRef,
+				},
+			})
+			if err != nil {
+				return workflow.AgentRunCreateResult{}, err
+			}
+			events = append(events, event)
+		}
+	}
+
 	resultEventIDs := make([]int64, 0, len(events))
 	for _, event := range events {
 		resultEventIDs = append(resultEventIDs, event.ID)
@@ -2521,8 +2645,9 @@ VALUES (?, ?, ?)`,
 			SpecJSON:   specJSON,
 			CreatedAt:  now,
 		},
-		Branch: plan.Branch,
-		Events: events,
+		Branch:    plan.Branch,
+		ChangeSet: changeSet,
+		Events:    events,
 	}, nil
 }
 
@@ -2614,6 +2739,211 @@ func appendControlActionEventRefTx(tx *sql.Tx, controlActionID int64, eventID in
 		return fmt.Errorf("update ControlAction %d result Event refs: %w", controlActionID, err)
 	}
 	return nil
+}
+
+// RequestAgentRunStop records a human stop ControlAction and marks the AgentRun for cancellation.
+func (store *Store) RequestAgentRunStop(agentRunID int64, plan workflow.ControlActionPlan) (workflow.AgentRunControlResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return workflow.AgentRunControlResult{}, err
+	}
+	if detail.AgentRun.Status != "running" {
+		return workflow.AgentRunControlResult{}, fmt.Errorf("AgentRun %d is %s; expected running", agentRunID, detail.AgentRun.Status)
+	}
+
+	runnerJob, err := store.runnerJobForAgentRun(agentRunID)
+	if err != nil {
+		return workflow.AgentRunControlResult{}, err
+	}
+	if runnerJob.Status != "running" {
+		return workflow.AgentRunControlResult{}, fmt.Errorf("RunnerJob %d for AgentRun %d is %s; expected running", runnerJob.ID, agentRunID, runnerJob.Status)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return workflow.AgentRunControlResult{}, fmt.Errorf("begin AgentRun stop transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	actionInput, err := json.Marshal(plan.Input)
+	if err != nil {
+		return workflow.AgentRunControlResult{}, fmt.Errorf("encode stop ControlAction input: %w", err)
+	}
+	actionResult, err := tx.Exec(`
+INSERT INTO control_actions (
+	type,
+	target_type,
+	target_ref,
+	requested_by,
+	reason,
+	input,
+	status,
+	created_at,
+	decided_at,
+	result_event_refs
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		plan.Type,
+		plan.TargetType,
+		plan.TargetRef,
+		plan.RequestedBy,
+		plan.Reason,
+		string(actionInput),
+		plan.Status,
+		now,
+		now,
+		"[]",
+	)
+	if err != nil {
+		return workflow.AgentRunControlResult{}, fmt.Errorf("insert stop ControlAction: %w", err)
+	}
+	controlActionID, err := actionResult.LastInsertId()
+	if err != nil {
+		return workflow.AgentRunControlResult{}, fmt.Errorf("read inserted stop ControlAction id: %w", err)
+	}
+
+	if _, err := tx.Exec("UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ?", "cancel_requested", now, agentRunID); err != nil {
+		return workflow.AgentRunControlResult{}, fmt.Errorf("mark AgentRun %d cancel_requested: %w", agentRunID, err)
+	}
+
+	actionEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "control_action.succeeded",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "control_action",
+		SubjectRef:      fmt.Sprintf("control_action:%d", controlActionID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"type":              plan.Type,
+			"status":            plan.Status,
+			"agent_run_id":      agentRunID,
+			"previous_status":   detail.AgentRun.Status,
+		},
+	})
+	if err != nil {
+		return workflow.AgentRunControlResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, actionEvent.ID); err != nil {
+		return workflow.AgentRunControlResult{}, err
+	}
+
+	cancelEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "agent_run.cancel_requested",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "agent_run",
+		SubjectRef:      fmt.Sprintf("agent_run:%d", agentRunID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		Payload: map[string]any{
+			"agent_run_id":      agentRunID,
+			"previous_status":   detail.AgentRun.Status,
+			"status":            "cancel_requested",
+			"control_action_id": controlActionID,
+		},
+	})
+	if err != nil {
+		return workflow.AgentRunControlResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, cancelEvent.ID); err != nil {
+		return workflow.AgentRunControlResult{}, err
+	}
+
+	if _, err := tx.Exec("UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ?", "cancelled", now, agentRunID); err != nil {
+		return workflow.AgentRunControlResult{}, fmt.Errorf("mark AgentRun %d cancelled: %w", agentRunID, err)
+	}
+	if _, err := tx.Exec("UPDATE runner_jobs SET status = ?, updated_at = ? WHERE id = ?", "cancelled", now, runnerJob.ID); err != nil {
+		return workflow.AgentRunControlResult{}, fmt.Errorf("mark RunnerJob %d cancelled: %w", runnerJob.ID, err)
+	}
+	cancelledEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "agent_run.cancelled",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "agent_run",
+		SubjectRef:      fmt.Sprintf("agent_run:%d", agentRunID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		Payload: map[string]any{
+			"agent_run_id":      agentRunID,
+			"runner_job_id":     runnerJob.ID,
+			"previous_status":   "cancel_requested",
+			"status":            "cancelled",
+			"control_action_id": controlActionID,
+		},
+	})
+	if err != nil {
+		return workflow.AgentRunControlResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, cancelledEvent.ID); err != nil {
+		return workflow.AgentRunControlResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return workflow.AgentRunControlResult{}, fmt.Errorf("commit AgentRun stop request: %w", err)
+	}
+
+	var workspace *workflow.Workspace
+	if detail.Workspace != nil {
+		workspace = detail.Workspace
+	}
+	return workflow.AgentRunControlResult{
+		ControlAction: workflow.ControlAction{
+			ID:     controlActionID,
+			Type:   plan.Type,
+			Status: plan.Status,
+		},
+		AgentRun: workflow.AgentRun{
+			ID:         detail.AgentRun.ID,
+			WorkItemID: detail.AgentRun.WorkItemID,
+			Status:     "cancelled",
+			CreatedAt:  detail.AgentRun.CreatedAt,
+			UpdatedAt:  now,
+		},
+		RunnerJob: workflow.RunnerJob{
+			ID:         runnerJob.ID,
+			AgentRunID: runnerJob.AgentRunID,
+			Status:     "cancelled",
+			CreatedAt:  runnerJob.CreatedAt,
+			UpdatedAt:  now,
+		},
+		Workspace: workspace,
+		Events:    []workflow.Event{actionEvent, cancelEvent, cancelledEvent},
+	}, nil
+}
+
+func isTerminalAgentRunStatus(status string) bool {
+	switch status {
+	case "completed", "failed", "cancelled", "timed_out":
+		return true
+	default:
+		return false
+	}
+}
+
+func (store *Store) runnerJobForAgentRun(agentRunID int64) (workflow.RunnerJob, error) {
+	var job workflow.RunnerJob
+	err := store.db.QueryRow(`
+SELECT id, agent_run_id, status, created_at, updated_at
+FROM runner_jobs
+WHERE agent_run_id = ?`, agentRunID).Scan(
+		&job.ID,
+		&job.AgentRunID,
+		&job.Status,
+		&job.CreatedAt,
+		&job.UpdatedAt,
+	)
+	if err != nil {
+		return workflow.RunnerJob{}, err
+	}
+	return job, nil
 }
 
 // GetForgeProjectByRef returns a persisted ForgeProject by canonical ref.
