@@ -12,6 +12,8 @@ ForgeLane is an agentic software delivery control plane.
 - Change set: the branch and draft PR produced or updated by an agent run.
 - Agent adapter: the boundary that invokes a specific coding agent or command
   from a run spec.
+- Change provider: the boundary that mutates provider-owned delivery artifacts
+  such as branches and PRs after ForgeLane records the matching ControlAction.
 - Control action: a human action such as stop, retry, request changes, close, or
   reassign.
 - Event: an immutable record of something that happened in the delivery loop.
@@ -89,6 +91,8 @@ ForgeLane is an agentic software delivery control plane.
 - Automated and privileged actions must be auditable through events.
 - Privileged actions must pass through an explicit permission or approval
   boundary.
+- Provider mutation credentials belong to the ChangeProvider boundary, not the
+  AgentAdapter command environment.
 
 ## Early Product Boundaries
 
@@ -102,7 +106,8 @@ ForgeLane is an agentic software delivery control plane.
 
 ## Naming Guidance
 
-Use `AgentRun`, `Workspace`, `ChangeSet`, `ControlAction`, `Event`, and
-`ProviderRef` consistently in docs and code until a later architecture decision
-renames them. Use `AgentAdapter` for the integration boundary and reserve
-agent-specific names such as Codex CLI for adapter presets or configuration.
+Use `AgentRun`, `Workspace`, `ChangeSet`, `ChangeProvider`, `ControlAction`,
+`Event`, and `ProviderRef` consistently in docs and code until a later
+architecture decision renames them. Use `AgentAdapter` for the integration
+boundary and reserve agent-specific names such as Codex CLI for adapter presets
+or configuration.
