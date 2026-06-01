@@ -1179,6 +1179,19 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
 		},
 	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true},
+		},
+	}
 	createStdout, stderr, err := executeForTestWithOptions(t, Options{
 		WorkItemProvider:    fakeProvider,
 		AgentCommandPlanner: changingCommandPlanner{},
@@ -1203,6 +1216,7 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 	executeStdout, stderr, err := executeForTestWithOptions(t, Options{
 		WorkItemProvider:    fakeProvider,
 		AgentCommandPlanner: changingCommandPlanner{},
+		ChangeProvider:      changeProvider,
 	}, "runs", "execute", strconv.FormatInt(runID, 10))
 	if err != nil {
 		t.Fatalf("expected runs execute to succeed: %v\nstderr:\n%s", err, stderr)
@@ -1213,10 +1227,12 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 	for _, want := range []string{
 		"Executed AgentRun 1",
 		"Status: completed",
-		"ChangeSet: 1 planned forgelane/issue-123",
+		"ChangeSet: 1 draft_open forgelane/issue-123",
 		"Event: repository_commit.materialized",
 		"Event: change_set.created",
 		"Event: agent_command.completed",
+		"Event: change_set.branch_push_succeeded",
+		"Event: change_set.draft_pr_succeeded",
 	} {
 		if !strings.Contains(executeStdout, want) {
 			t.Fatalf("expected runs execute output to contain %q, got:\n%s", want, executeStdout)
@@ -1248,9 +1264,12 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 		t.Fatalf("expected runs show to succeed: %v\nstderr:\n%s", err, stderr)
 	}
 	for _, want := range []string{
-		"ChangeSet: 1 planned forgelane/issue-123",
+		"ChangeSet: 1 draft_open forgelane/issue-123",
 		"ChangeSet active run: 1",
 		"ChangeSet commits: 1",
+		"ChangeSet provider branch: github://github.com/owner/repo/branches/forgelane/issue-123",
+		"ChangeSet provider change: github://github.com/owner/repo/pulls/10",
+		"ChangeSet draft: true",
 		"Commit refs:",
 		"github://github.com/owner/repo@",
 		"Materialize AgentRun 1 repository changes",
@@ -1272,11 +1291,86 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 		"repository_commit.materialized",
 		"change_set.created",
 		"agent_command.completed",
+		"change_set.branch_push_succeeded",
+		"change_set.draft_pr_succeeded",
 	})
 
 	assertTableCount(t, homeDir, "change_sets", 1)
 	assertTableCount(t, homeDir, "commit_refs", 1)
-	assertTableCount(t, homeDir, "control_actions", 1)
+	assertTableCount(t, homeDir, "control_actions", 3)
+}
+
+func TestRunsExecuteFailsClearlyWhenDeliveryProviderIsMissing(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Materialize repository changes",
+			Body:                "Commit local Workspace repository changes.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	createStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+	}, "runs", "create", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	runID := extractCreatedAgentRunID(t, createStdout)
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+	}, "runs", "prepare", strconv.FormatInt(runID, 10)); err != nil {
+		t.Fatalf("expected runs prepare to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	_, stderr, err = executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+	}, "runs", "execute", strconv.FormatInt(runID, 10))
+	if err == nil {
+		t.Fatal("expected runs execute to fail without a ChangeProvider")
+	}
+	if !strings.Contains(err.Error(), "missing ChangeProvider") {
+		t.Fatalf("expected missing ChangeProvider error, got %v\nstderr:\n%s", err, stderr)
+	}
+
+	showStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "show", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs show to succeed after delivery failure: %v\nstderr:\n%s", err, stderr)
+	}
+	for _, want := range []string{
+		"Status: completed",
+		"ChangeSet: 1 planned forgelane/issue-123",
+		"ChangeSet commits: 1",
+	} {
+		if !strings.Contains(showStdout, want) {
+			t.Fatalf("expected runs show output to contain %q, got:\n%s", want, showStdout)
+		}
+	}
 }
 
 func TestRunsExecutePushesBranchThroughChangeProviderWithoutAgentProviderCredentials(t *testing.T) {
@@ -1310,10 +1404,19 @@ func TestRunsExecutePushesBranchThroughChangeProviderWithoutAgentProviderCredent
 		},
 	}
 	changeProvider := &recordingChangeProvider{
-		result: workflow.ChangeBranchPushResult{
+		pushResult: workflow.ChangeBranchPushResult{
 			ChangeSetID:       1,
 			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
 			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID: 1,
+			ChangeRef:   "github://github.com/owner/repo/pulls/10",
+			Draft:       true,
+			ProviderSnapshot: map[string]any{
+				"number": float64(10),
+				"draft":  true,
+			},
 		},
 	}
 
@@ -1344,10 +1447,12 @@ func TestRunsExecutePushesBranchThroughChangeProviderWithoutAgentProviderCredent
 		t.Fatalf("expected runs execute to succeed: %v\nstderr:\n%s", err, stderr)
 	}
 	for _, want := range []string{
-		"ChangeSet: 1 branch_ready forgelane/issue-123",
+		"ChangeSet: 1 draft_open forgelane/issue-123",
 		"Event: control_action.executing",
 		"Event: change_set.branch_push_started",
 		"Event: change_set.branch_push_succeeded",
+		"Event: change_set.draft_pr_started",
+		"Event: change_set.draft_pr_succeeded",
 	} {
 		if !strings.Contains(executeStdout, want) {
 			t.Fatalf("expected runs execute output to contain %q, got:\n%s", want, executeStdout)
@@ -1355,6 +1460,9 @@ func TestRunsExecutePushesBranchThroughChangeProviderWithoutAgentProviderCredent
 	}
 	if len(changeProvider.calls) != 1 {
 		t.Fatalf("expected one fake Change Provider push, got %#v", changeProvider.calls)
+	}
+	if len(changeProvider.draftPRCalls) != 1 {
+		t.Fatalf("expected one fake Change Provider draft PR call, got %#v", changeProvider.draftPRCalls)
 	}
 
 	logsStdout, stderr, err := executeForTestWithOptions(t, Options{
@@ -1932,17 +2040,28 @@ printf 'forgelane test change\n' > forgelane-agent-output.txt
 }
 
 type recordingChangeProvider struct {
-	result workflow.ChangeBranchPushResult
-	err    error
-	calls  []workflow.ChangeBranchPushPlan
+	pushResult    workflow.ChangeBranchPushResult
+	pushErr       error
+	calls         []workflow.ChangeBranchPushPlan
+	draftPRResult workflow.ChangeDraftPRResult
+	draftPRErr    error
+	draftPRCalls  []workflow.ChangeDraftPRPlan
 }
 
 func (provider *recordingChangeProvider) PushChangeSetBranch(_ context.Context, plan workflow.ChangeBranchPushPlan) (workflow.ChangeBranchPushResult, error) {
 	provider.calls = append(provider.calls, plan)
-	if provider.err != nil {
-		return workflow.ChangeBranchPushResult{}, provider.err
+	if provider.pushErr != nil {
+		return workflow.ChangeBranchPushResult{}, provider.pushErr
 	}
-	return provider.result, nil
+	return provider.pushResult, nil
+}
+
+func (provider *recordingChangeProvider) CreateOrUpdateDraftPR(_ context.Context, plan workflow.ChangeDraftPRPlan) (workflow.ChangeDraftPRResult, error) {
+	provider.draftPRCalls = append(provider.draftPRCalls, plan)
+	if provider.draftPRErr != nil {
+		return workflow.ChangeDraftPRResult{}, provider.draftPRErr
+	}
+	return provider.draftPRResult, nil
 }
 
 func gitOutput(t *testing.T, workingDir string, args ...string) string {

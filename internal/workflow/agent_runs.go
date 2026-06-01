@@ -172,20 +172,23 @@ type CommitRef struct {
 
 // ChangeSet records one ForgeLane-owned delivery artifact for a WorkItem.
 type ChangeSet struct {
-	ID             int64
-	WorkItemID     int64
-	WorkItemRef    string
-	Provider       string
-	RepositoryRef  string
-	BaseBranch     string
-	BranchRef      string
-	ChangeRef      string
-	Status         string
-	CreatedByRunID int64
-	ActiveRunID    int64
-	CommitRefs     []CommitRef
-	CreatedAt      string
-	UpdatedAt      string
+	ID                int64
+	WorkItemID        int64
+	WorkItemRef       string
+	Provider          string
+	RepositoryRef     string
+	BaseBranch        string
+	BranchRef         string
+	BranchProviderRef string
+	ChangeRef         string
+	ChangeDraft       bool
+	ProviderSnapshot  string
+	Status            string
+	CreatedByRunID    int64
+	ActiveRunID       int64
+	CommitRefs        []CommitRef
+	CreatedAt         string
+	UpdatedAt         string
 }
 
 // ChangeSetPlan is the provider-neutral delivery state chosen after local commits exist.
@@ -217,6 +220,27 @@ type ChangeBranchPushResult struct {
 	ChangeSetID       int64
 	BranchProviderRef string
 	PushedCommitSHAs  []string
+}
+
+// ChangeDraftPRPlan is the workflow request to create or update the reviewable draft PR/MR.
+type ChangeDraftPRPlan struct {
+	ChangeSetID       int64
+	WorkItemRef       string
+	Provider          string
+	RepositoryRef     string
+	BaseBranch        string
+	BranchRef         string
+	BranchProviderRef string
+	ExistingChangeRef string
+	CommitSHAs        []string
+}
+
+// ChangeDraftPRResult is the provider evidence from a successful draft PR/MR create or update.
+type ChangeDraftPRResult struct {
+	ChangeSetID      int64
+	ChangeRef        string
+	Draft            bool
+	ProviderSnapshot map[string]any
 }
 
 // CommitRefPlan is a local commit ref ready to persist after repository materialization.
@@ -319,10 +343,17 @@ type RepositoryChangeMaterializer interface {
 // ChangeProvider mutates provider-owned change state outside the AgentAdapter process.
 type ChangeProvider interface {
 	PushChangeSetBranch(context.Context, ChangeBranchPushPlan) (ChangeBranchPushResult, error)
+	CreateOrUpdateDraftPR(context.Context, ChangeDraftPRPlan) (ChangeDraftPRResult, error)
 }
 
 // BranchPushStartResult records the auditable permission boundary for provider branch mutation.
 type BranchPushStartResult struct {
+	ControlAction ControlAction
+	Events        []Event
+}
+
+// DraftPRStartResult records the auditable permission boundary for provider draft PR mutation.
+type DraftPRStartResult struct {
 	ControlAction ControlAction
 	Events        []Event
 }
@@ -351,6 +382,9 @@ type AgentCommandExecutionStore interface {
 	MarkChangeSetBranchPushStarted(int64, int64) (BranchPushStartResult, error)
 	MarkChangeSetBranchPushSucceeded(int64, ChangeBranchPushResult, int64) (AgentRunPrepareResult, error)
 	MarkChangeSetBranchPushFailed(int64, int64, int64, string) (AgentRunPrepareResult, error)
+	MarkChangeSetDraftPRStarted(int64, int64) (DraftPRStartResult, error)
+	MarkChangeSetDraftPRSucceeded(int64, ChangeDraftPRResult, int64) (AgentRunPrepareResult, error)
+	MarkChangeSetDraftPRFailed(int64, int64, int64, string) (AgentRunPrepareResult, error)
 }
 
 // ControlAction is a persisted operator request to change the delivery loop.
@@ -528,8 +562,11 @@ func ExecuteAgentRunCommandAndDeliver(ctx context.Context, store AgentCommandExe
 	if err != nil {
 		return AgentRunPrepareResult{}, err
 	}
-	if changeProvider == nil || completed.ChangeSet == nil || len(completed.CommitRefs) == 0 {
+	if completed.ChangeSet == nil || len(completed.CommitRefs) == 0 {
 		return completed, nil
+	}
+	if changeProvider == nil {
+		return completed, fmt.Errorf("deliver ChangeSet %d: missing ChangeProvider for provider %q", completed.ChangeSet.ID, completed.ChangeSet.Provider)
 	}
 
 	pushPlan := NewChangeBranchPushPlan(completed.Workspace, *completed.ChangeSet)
@@ -549,11 +586,45 @@ func ExecuteAgentRunCommandAndDeliver(ctx context.Context, store AgentCommandExe
 		return failed, fmt.Errorf("push ChangeSet branch failed")
 	}
 
-	delivered, err := store.MarkChangeSetBranchPushSucceeded(runID, pushResult, started.ControlAction.ID)
+	branchReady, err := store.MarkChangeSetBranchPushSucceeded(runID, pushResult, started.ControlAction.ID)
 	if err != nil {
 		return AgentRunPrepareResult{}, err
 	}
-	delivered.Events = append(completed.Events, delivered.Events...)
+	branchReady.Events = append(completed.Events, branchReady.Events...)
+	if branchReady.ChangeSet == nil || len(branchReady.ChangeSet.CommitRefs) == 0 {
+		return branchReady, nil
+	}
+
+	draftPRPlan := NewChangeDraftPRPlan(*branchReady.ChangeSet)
+	draftStarted, err := store.MarkChangeSetDraftPRStarted(runID, branchReady.ChangeSet.ID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	branchReady.Events = append(branchReady.Events, draftStarted.Events...)
+
+	draftPRResult, err := changeProvider.CreateOrUpdateDraftPR(ctx, draftPRPlan)
+	if err != nil {
+		failed, markErr := store.MarkChangeSetDraftPRFailed(runID, branchReady.ChangeSet.ID, draftStarted.ControlAction.ID, "provider draft PR create or update failed")
+		if markErr != nil {
+			return AgentRunPrepareResult{}, fmt.Errorf("create or update draft PR failed; mark draft PR failed: %v", markErr)
+		}
+		failed.Events = append(branchReady.Events, failed.Events...)
+		return failed, fmt.Errorf("create or update draft PR failed")
+	}
+	if draftPRResult.ChangeRef == "" || !draftPRResult.Draft {
+		failed, markErr := store.MarkChangeSetDraftPRFailed(runID, branchReady.ChangeSet.ID, draftStarted.ControlAction.ID, "provider draft PR result missing draft PR ref or draft status")
+		if markErr != nil {
+			return AgentRunPrepareResult{}, fmt.Errorf("create or update draft PR returned invalid result; mark draft PR failed: %v", markErr)
+		}
+		failed.Events = append(branchReady.Events, failed.Events...)
+		return failed, fmt.Errorf("create or update draft PR returned invalid result")
+	}
+
+	delivered, err := store.MarkChangeSetDraftPRSucceeded(runID, draftPRResult, draftStarted.ControlAction.ID)
+	if err != nil {
+		return AgentRunPrepareResult{}, err
+	}
+	delivered.Events = append(branchReady.Events, delivered.Events...)
 	return delivered, nil
 }
 
@@ -571,6 +642,25 @@ func NewChangeBranchPushPlan(workspace Workspace, changeSet ChangeSet) ChangeBra
 		LocalRepositoryPath: workspace.Paths.Repo,
 		BranchRef:           changeSet.BranchRef,
 		CommitSHAs:          commitSHAs,
+	}
+}
+
+// NewChangeDraftPRPlan derives provider draft PR input from a branch-ready ChangeSet.
+func NewChangeDraftPRPlan(changeSet ChangeSet) ChangeDraftPRPlan {
+	commitSHAs := make([]string, 0, len(changeSet.CommitRefs))
+	for _, ref := range changeSet.CommitRefs {
+		commitSHAs = append(commitSHAs, ref.SHA)
+	}
+	return ChangeDraftPRPlan{
+		ChangeSetID:       changeSet.ID,
+		WorkItemRef:       changeSet.WorkItemRef,
+		Provider:          changeSet.Provider,
+		RepositoryRef:     changeSet.RepositoryRef,
+		BaseBranch:        changeSet.BaseBranch,
+		BranchRef:         changeSet.BranchRef,
+		BranchProviderRef: changeSet.BranchProviderRef,
+		ExistingChangeRef: changeSet.ChangeRef,
+		CommitSHAs:        commitSHAs,
 	}
 }
 

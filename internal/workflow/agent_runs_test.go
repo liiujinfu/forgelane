@@ -243,10 +243,20 @@ func TestExecuteAgentRunCommandCreatesActiveChangeSetFromLocalCommitRefs(t *test
 func TestExecuteAgentRunCommandPushesChangeSetBranchThroughChangeProvider(t *testing.T) {
 	instanceStore, runID := preparedAgentRun(t)
 	changeProvider := &recordingChangeProvider{
-		result: workflow.ChangeBranchPushResult{
+		pushResult: workflow.ChangeBranchPushResult{
 			ChangeSetID:       1,
 			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
 			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID: 1,
+			ChangeRef:   "github://github.com/owner/repo/pulls/10",
+			Draft:       true,
+			ProviderSnapshot: map[string]any{
+				"number": float64(10),
+				"state":  "open",
+				"draft":  true,
+			},
 		},
 	}
 
@@ -265,6 +275,9 @@ func TestExecuteAgentRunCommandPushesChangeSetBranchThroughChangeProvider(t *tes
 	if len(changeProvider.calls) != 1 {
 		t.Fatalf("expected one Change Provider push, got %#v", changeProvider.calls)
 	}
+	if len(changeProvider.draftPRCalls) != 1 {
+		t.Fatalf("expected one Change Provider draft PR call, got %#v", changeProvider.draftPRCalls)
+	}
 	call := changeProvider.calls[0]
 	if call.ChangeSetID != result.ChangeSet.ID ||
 		call.RepositoryRef != "github://github.com/owner/repo" ||
@@ -272,12 +285,24 @@ func TestExecuteAgentRunCommandPushesChangeSetBranchThroughChangeProvider(t *tes
 		call.CommitSHAs[0] != "abc123" {
 		t.Fatalf("unexpected Change Provider push plan: %#v", call)
 	}
-	if result.ChangeSet == nil ||
-		result.ChangeSet.Status != "branch_ready" ||
-		result.ChangeSet.ChangeRef != "github://github.com/owner/repo/branches/forgelane/issue-123" {
-		t.Fatalf("expected branch-ready ChangeSet, got %#v", result.ChangeSet)
+	draftPRCall := changeProvider.draftPRCalls[0]
+	if draftPRCall.ChangeSetID != result.ChangeSet.ID ||
+		draftPRCall.RepositoryRef != "github://github.com/owner/repo" ||
+		draftPRCall.BranchRef != "forgelane/issue-123" ||
+		draftPRCall.BranchProviderRef != "github://github.com/owner/repo/branches/forgelane/issue-123" ||
+		draftPRCall.ExistingChangeRef != "" ||
+		draftPRCall.CommitSHAs[0] != "abc123" {
+		t.Fatalf("unexpected Change Provider draft PR plan: %#v", draftPRCall)
 	}
-	if got := eventTypes(result.Events); got != "repository_commit.materialized,change_set.created,agent_command.completed,control_action.executing,change_set.branch_push_started,change_set.branch_push_succeeded" {
+	if result.ChangeSet == nil ||
+		result.ChangeSet.Status != "draft_open" ||
+		result.ChangeSet.BranchProviderRef != "github://github.com/owner/repo/branches/forgelane/issue-123" ||
+		result.ChangeSet.ChangeRef != "github://github.com/owner/repo/pulls/10" ||
+		!result.ChangeSet.ChangeDraft ||
+		!strings.Contains(result.ChangeSet.ProviderSnapshot, `"draft":true`) {
+		t.Fatalf("expected draft-open ChangeSet, got %#v", result.ChangeSet)
+	}
+	if got := eventTypes(result.Events); got != "repository_commit.materialized,change_set.created,agent_command.completed,control_action.executing,change_set.branch_push_started,change_set.branch_push_succeeded,control_action.executing,change_set.draft_pr_started,change_set.draft_pr_succeeded" {
 		t.Fatalf("unexpected Event sequence %s", got)
 	}
 
@@ -286,16 +311,19 @@ func TestExecuteAgentRunCommandPushesChangeSetBranchThroughChangeProvider(t *tes
 		t.Fatalf("get AgentRun detail: %v", err)
 	}
 	if detail.ChangeSet == nil ||
-		detail.ChangeSet.Status != "branch_ready" ||
-		detail.ChangeSet.ChangeRef != "github://github.com/owner/repo/branches/forgelane/issue-123" ||
+		detail.ChangeSet.Status != "draft_open" ||
+		detail.ChangeSet.BranchProviderRef != "github://github.com/owner/repo/branches/forgelane/issue-123" ||
+		detail.ChangeSet.ChangeRef != "github://github.com/owner/repo/pulls/10" ||
+		!detail.ChangeSet.ChangeDraft ||
+		!strings.Contains(detail.ChangeSet.ProviderSnapshot, `"number":10`) ||
 		len(detail.ChangeSet.CommitRefs) != 1 {
-		t.Fatalf("unexpected persisted branch-ready ChangeSet: %#v", detail.ChangeSet)
+		t.Fatalf("unexpected persisted draft-open ChangeSet: %#v", detail.ChangeSet)
 	}
 }
 
 func TestExecuteAgentRunCommandRecordsRecoverableChangeProviderPushFailure(t *testing.T) {
 	instanceStore, runID := preparedAgentRun(t)
-	changeProvider := &recordingChangeProvider{err: errors.New("provider rejected branch update with token SECRET_VALUE")}
+	changeProvider := &recordingChangeProvider{pushErr: errors.New("provider rejected branch update with token SECRET_VALUE")}
 
 	result, err := workflow.ExecuteAgentRunCommandAndDeliver(
 		context.Background(),
@@ -341,6 +369,219 @@ func TestExecuteAgentRunCommandRecordsRecoverableChangeProviderPushFailure(t *te
 	}
 	if got := eventTypes(events); !strings.Contains(got, "change_set.branch_push_failed") {
 		t.Fatalf("expected branch push failure Event, got %s", got)
+	}
+}
+
+func TestExecuteAgentRunCommandFailsClearlyWithoutChangeProviderAfterLocalCommit(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+
+	result, err := workflow.ExecuteAgentRunCommandAndDeliver(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		nil,
+		runID,
+	)
+	if err == nil {
+		t.Fatal("expected missing ChangeProvider failure")
+	}
+	if !strings.Contains(err.Error(), "missing ChangeProvider") {
+		t.Fatalf("expected missing ChangeProvider error, got %v", err)
+	}
+	if result.ChangeSet == nil ||
+		result.ChangeSet.Status != "planned" ||
+		len(result.ChangeSet.CommitRefs) != 1 {
+		t.Fatalf("expected local ChangeSet state to remain inspectable, got %#v", result.ChangeSet)
+	}
+	if got := eventTypes(result.Events); got != "repository_commit.materialized,change_set.created,agent_command.completed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+}
+
+func TestExecuteAgentRunCommandSkipsDraftPRForNoChangeRun(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+	changeProvider := &recordingChangeProvider{}
+
+	result, err := workflow.ExecuteAgentRunCommandAndDeliver(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		noChangeRepositoryMaterializer{},
+		changeProvider,
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("execute AgentRun command and deliver: %v", err)
+	}
+	if result.ChangeSet != nil {
+		t.Fatalf("expected no ChangeSet for no-change run, got %#v", result.ChangeSet)
+	}
+	if len(changeProvider.calls) != 0 || len(changeProvider.draftPRCalls) != 0 {
+		t.Fatalf("expected no Change Provider calls for no-change run, got pushes=%#v draft_prs=%#v", changeProvider.calls, changeProvider.draftPRCalls)
+	}
+	if got := eventTypes(result.Events); strings.Contains(got, "draft_pr") {
+		t.Fatalf("expected no draft PR Events, got %s", got)
+	}
+}
+
+func TestExecuteAgentRunCommandRecordsRecoverableDraftPRFailure(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRErr: errors.New("provider rejected draft PR create with token SECRET_VALUE"),
+	}
+
+	result, err := workflow.ExecuteAgentRunCommandAndDeliver(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		changeProvider,
+		runID,
+	)
+	if err == nil {
+		t.Fatal("expected draft PR failure")
+	}
+	if !strings.Contains(err.Error(), "create or update draft PR") {
+		t.Fatalf("expected draft PR error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "SECRET_VALUE") {
+		t.Fatalf("expected provider error detail to be sanitized, got %v", err)
+	}
+	if result.ChangeSet == nil ||
+		result.ChangeSet.Status != "branch_ready" ||
+		result.ChangeSet.BranchProviderRef != "github://github.com/owner/repo/branches/forgelane/issue-123" ||
+		result.ChangeSet.ChangeRef != "" ||
+		len(result.ChangeSet.CommitRefs) != 1 {
+		t.Fatalf("expected recoverable branch-ready ChangeSet in result, got %#v", result.ChangeSet)
+	}
+	if got := eventTypes(result.Events); got != "repository_commit.materialized,change_set.created,agent_command.completed,control_action.executing,change_set.branch_push_started,change_set.branch_push_succeeded,control_action.executing,change_set.draft_pr_started,change_set.draft_pr_failed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+}
+
+func TestExecuteAgentRunCommandRecordsRecoverableInvalidDraftPRResult(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "",
+			Draft:            false,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": false},
+		},
+	}
+
+	result, err := workflow.ExecuteAgentRunCommandAndDeliver(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		changeProvider,
+		runID,
+	)
+	if err == nil {
+		t.Fatal("expected invalid draft PR result failure")
+	}
+	if !strings.Contains(err.Error(), "invalid result") {
+		t.Fatalf("expected invalid draft PR result error, got %v", err)
+	}
+	if result.ChangeSet == nil ||
+		result.ChangeSet.Status != "branch_ready" ||
+		result.ChangeSet.BranchProviderRef != "github://github.com/owner/repo/branches/forgelane/issue-123" ||
+		result.ChangeSet.ChangeRef != "" {
+		t.Fatalf("expected recoverable branch-ready ChangeSet, got %#v", result.ChangeSet)
+	}
+	if got := eventTypes(result.Events); got != "repository_commit.materialized,change_set.created,agent_command.completed,control_action.executing,change_set.branch_push_started,change_set.branch_push_succeeded,control_action.executing,change_set.draft_pr_started,change_set.draft_pr_failed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+}
+
+func TestExecuteAgentRunCommandUpdatesExistingDraftPRForActiveChangeSet(t *testing.T) {
+	instanceStore, firstRunID := preparedAgentRun(t)
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true},
+		},
+	}
+
+	firstResult, err := workflow.ExecuteAgentRunCommandAndDeliver(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		changeProvider,
+		firstRunID,
+	)
+	if err != nil {
+		t.Fatalf("execute first AgentRun command and deliver: %v", err)
+	}
+	if firstResult.ChangeSet == nil || firstResult.ChangeSet.ChangeRef == "" {
+		t.Fatalf("expected first run to open a draft PR, got %#v", firstResult.ChangeSet)
+	}
+
+	changeProvider.pushResult = workflow.ChangeBranchPushResult{
+		ChangeSetID:       firstResult.ChangeSet.ID,
+		BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+		PushedCommitSHAs:  []string{"abc123", "def456"},
+	}
+	changeProvider.draftPRResult = workflow.ChangeDraftPRResult{
+		ChangeSetID:      firstResult.ChangeSet.ID,
+		ChangeRef:        "github://github.com/owner/repo/pulls/10",
+		Draft:            true,
+		ProviderSnapshot: map[string]any{"number": float64(10), "draft": true, "updated": true},
+	}
+
+	secondRunID := createRetryAgentRunForExistingWorkItem(t, instanceStore, firstRunID)
+	secondResult, err := workflow.ExecuteAgentRunCommandAndDeliver(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		secondCommitRepositoryChangeMaterializer{},
+		changeProvider,
+		secondRunID,
+	)
+	if err != nil {
+		t.Fatalf("execute second AgentRun command and deliver: %v", err)
+	}
+	if len(changeProvider.draftPRCalls) != 2 {
+		t.Fatalf("expected two Change Provider draft PR calls, got %#v", changeProvider.draftPRCalls)
+	}
+	updateCall := changeProvider.draftPRCalls[1]
+	if updateCall.ChangeSetID != firstResult.ChangeSet.ID ||
+		updateCall.ExistingChangeRef != "github://github.com/owner/repo/pulls/10" ||
+		len(updateCall.CommitSHAs) != 2 ||
+		updateCall.CommitSHAs[1] != "def456" {
+		t.Fatalf("expected retry to update existing draft PR, got %#v", updateCall)
+	}
+	if secondResult.ChangeSet == nil ||
+		secondResult.ChangeSet.ID != firstResult.ChangeSet.ID ||
+		secondResult.ChangeSet.ChangeRef != "github://github.com/owner/repo/pulls/10" ||
+		len(secondResult.ChangeSet.CommitRefs) != 2 {
+		t.Fatalf("unexpected retry ChangeSet: %#v", secondResult.ChangeSet)
 	}
 }
 
@@ -664,17 +905,28 @@ func (noChangeRepositoryMaterializer) MaterializeRepositoryChanges(context.Conte
 }
 
 type recordingChangeProvider struct {
-	result workflow.ChangeBranchPushResult
-	err    error
-	calls  []workflow.ChangeBranchPushPlan
+	pushResult    workflow.ChangeBranchPushResult
+	pushErr       error
+	calls         []workflow.ChangeBranchPushPlan
+	draftPRResult workflow.ChangeDraftPRResult
+	draftPRErr    error
+	draftPRCalls  []workflow.ChangeDraftPRPlan
 }
 
 func (provider *recordingChangeProvider) PushChangeSetBranch(_ context.Context, plan workflow.ChangeBranchPushPlan) (workflow.ChangeBranchPushResult, error) {
 	provider.calls = append(provider.calls, plan)
-	if provider.err != nil {
-		return workflow.ChangeBranchPushResult{}, provider.err
+	if provider.pushErr != nil {
+		return workflow.ChangeBranchPushResult{}, provider.pushErr
 	}
-	return provider.result, nil
+	return provider.pushResult, nil
+}
+
+func (provider *recordingChangeProvider) CreateOrUpdateDraftPR(_ context.Context, plan workflow.ChangeDraftPRPlan) (workflow.ChangeDraftPRResult, error) {
+	provider.draftPRCalls = append(provider.draftPRCalls, plan)
+	if provider.draftPRErr != nil {
+		return workflow.ChangeDraftPRResult{}, provider.draftPRErr
+	}
+	return provider.draftPRResult, nil
 }
 
 type nonZeroExitCommandRunner struct{}
