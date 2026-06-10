@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	commandadapter "github.com/liiujinfu/forgelane/internal/agentadapter/command"
 	githubprovider "github.com/liiujinfu/forgelane/internal/provider/github"
@@ -31,6 +32,7 @@ func newRunsCommand(stdout io.Writer, options Options) *cobra.Command {
 	cmd.AddCommand(newRunsCreateCommand(stdout, options.WorkItemProvider))
 	cmd.AddCommand(newRunsStartCommand(stdout, options))
 	cmd.AddCommand(newRunsShowCommand(stdout))
+	cmd.AddCommand(newRunsEvidenceCommand(stdout))
 	cmd.AddCommand(newRunsPrepareCommand(stdout))
 	cmd.AddCommand(newRunsExecuteCommand(stdout, options))
 	cmd.AddCommand(newRunsStopCommand(stdout))
@@ -335,6 +337,40 @@ func newRunsLogsCommand(stdout io.Writer) *cobra.Command {
 	return cmd
 }
 
+func newRunsEvidenceCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "evidence <run_id>",
+		Short: "Show delivery evidence for review and debugging.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+
+			instanceStore, err := openReadOnlyStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			detail, err := instanceStore.GetAgentRunDetail(runID)
+			if err != nil {
+				return err
+			}
+			segments, err := instanceStore.ListLogSegmentsForAgentRun(runID, "")
+			if err != nil {
+				return err
+			}
+			events, err := instanceStore.ListEventsForAgentRun(runID)
+			if err != nil {
+				return err
+			}
+			return printRunEvidence(stdout, detail, segments, events)
+		},
+	}
+}
+
 func agentCommandPlanner(options Options) workflow.AgentCommandPlanner {
 	if options.AgentCommandPlanner != nil {
 		return options.AgentCommandPlanner
@@ -414,6 +450,7 @@ func printStartedAgentRun(stdout io.Writer, workItem store.WorkItem, branch stri
 			fmt.Fprintf(stdout, "Draft PR: %s\n", result.ChangeSet.ChangeRef)
 		}
 	}
+	fmt.Fprintf(stdout, "Next: forgelane runs evidence %d\n", result.AgentRun.ID)
 	fmt.Fprintf(stdout, "Next: forgelane runs show %d\n", result.AgentRun.ID)
 	fmt.Fprintf(stdout, "Next: forgelane runs logs %d\n", result.AgentRun.ID)
 	fmt.Fprintf(stdout, "Next: forgelane runs stop %d\n", result.AgentRun.ID)
@@ -562,6 +599,163 @@ func printAgentRunDetail(stdout io.Writer, detail store.AgentRunDetail) error {
 		printChangeSetProviderRefs(stdout, *detail.ChangeSet)
 	}
 	return nil
+}
+
+func printRunEvidence(stdout io.Writer, detail store.AgentRunDetail, segments []store.LogSegment, events []store.Event) error {
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(detail.RunSpec.SpecJSON), &spec); err != nil {
+		return fmt.Errorf("decode RunSpec %d: %w", detail.RunSpec.ID, err)
+	}
+
+	fmt.Fprintf(stdout, "Delivery evidence for AgentRun %d\n", detail.AgentRun.ID)
+	fmt.Fprintf(stdout, "WorkItem: %s\n", detail.WorkItem.ProviderRef)
+	fmt.Fprintf(stdout, "Status: %s\n", detail.AgentRun.Status)
+	fmt.Fprintf(stdout, "Branch: %s\n", stringField(spec, "branch"))
+	printEvidenceDelivery(stdout, detail, events)
+	if len(detail.CommitRefs) == 0 {
+		fmt.Fprintln(stdout, "Commit refs: none")
+	} else {
+		fmt.Fprintln(stdout, "Commit refs:")
+		for _, ref := range detail.CommitRefs {
+			fmt.Fprintf(stdout, "- %s@%s %s\n", ref.RepositoryRef, ref.SHA, ref.Subject)
+		}
+	}
+	if detail.ChangeSet == nil {
+		if detail.DeliverySkipped {
+			fmt.Fprintln(stdout, "ChangeSet status: none (delivery skipped)")
+		} else {
+			fmt.Fprintln(stdout, "ChangeSet status: none")
+		}
+	} else {
+		fmt.Fprintf(stdout, "ChangeSet status: %s\n", detail.ChangeSet.Status)
+		if detail.ChangeSet.BranchProviderRef != "" {
+			fmt.Fprintf(stdout, "Provider branch: %s\n", detail.ChangeSet.BranchProviderRef)
+		}
+		if detail.ChangeSet.ChangeRef != "" {
+			fmt.Fprintf(stdout, "Draft PR: %s\n", detail.ChangeSet.ChangeRef)
+		}
+	}
+	if detail.Workspace != nil {
+		fmt.Fprintf(stdout, "Logs: forgelane runs logs %d\n", detail.AgentRun.ID)
+		fmt.Fprintf(stdout, "Workspace logs: %s\n", detail.Workspace.Paths.Logs)
+	} else {
+		fmt.Fprintln(stdout, "Logs: workspace not prepared")
+	}
+	if len(segments) == 0 {
+		fmt.Fprintln(stdout, "Log previews: none")
+	} else {
+		fmt.Fprintln(stdout, "Log previews:")
+		for _, segment := range evidenceLogSegments(segments) {
+			fmt.Fprintf(stdout, "- %s #%d %s: %s\n", segment.Stream, segment.Sequence, segment.ArtifactPath, conciseLogPreview(segment.Preview))
+		}
+		if len(segments) > maxEvidenceLogPreviewSegments {
+			fmt.Fprintf(stdout, "More log segments: %d hidden; use forgelane runs logs %d\n", len(segments)-maxEvidenceLogPreviewSegments, detail.AgentRun.ID)
+		}
+	}
+	evidenceEvents := filteredEvidenceEvents(events)
+	if len(evidenceEvents) == 0 {
+		fmt.Fprintln(stdout, "Events: none")
+	} else {
+		fmt.Fprintln(stdout, "Events:")
+		for _, event := range evidenceEvents {
+			fmt.Fprintf(stdout, "- #%d %s %s\n", event.ID, event.Type, event.SubjectRef)
+		}
+		if len(evidenceEvents) < len(events) {
+			fmt.Fprintf(stdout, "More events: forgelane events list --run %d\n", detail.AgentRun.ID)
+		}
+	}
+	return nil
+}
+
+func printEvidenceDelivery(stdout io.Writer, detail store.AgentRunDetail, events []store.Event) {
+	if detail.DeliverySkipped {
+		reason := detail.DeliverySkipReason
+		if reason == "" {
+			reason = "reason missing"
+		}
+		fmt.Fprintf(stdout, "Delivery: skipped (%s)\n", reason)
+		return
+	}
+	if detail.ChangeSet == nil {
+		fmt.Fprintln(stdout, "Delivery: no ChangeSet")
+		return
+	}
+	switch detail.ChangeSet.Status {
+	case "draft_open":
+		fmt.Fprintln(stdout, "Delivery: draft PR ready")
+	case "branch_ready":
+		if hasEventType(events, "change_set.draft_pr_failed") {
+			fmt.Fprintln(stdout, "Delivery: failed draft PR")
+		} else if detail.ChangeSet.ChangeRef != "" {
+			fmt.Fprintln(stdout, "Delivery: branch ready")
+		} else {
+			fmt.Fprintln(stdout, "Delivery: pending draft PR")
+		}
+	case "branch_push_failed":
+		fmt.Fprintln(stdout, "Delivery: failed branch push")
+	case "planned":
+		fmt.Fprintln(stdout, "Delivery: changes pending provider delivery")
+	default:
+		fmt.Fprintf(stdout, "Delivery: %s\n", detail.ChangeSet.Status)
+	}
+}
+
+func conciseLogPreview(preview string) string {
+	preview = strings.TrimSpace(preview)
+	preview = strings.ReplaceAll(preview, "\r\n", "\n")
+	preview = strings.ReplaceAll(preview, "\n", " | ")
+	if preview == "" {
+		return "(empty)"
+	}
+	if len(preview) > maxEvidenceLogPreviewBytes {
+		return preview[:maxEvidenceLogPreviewBytes] + "..."
+	}
+	return preview
+}
+
+const (
+	maxEvidenceLogPreviewBytes    = 200
+	maxEvidenceLogPreviewSegments = 3
+)
+
+func evidenceLogSegments(segments []store.LogSegment) []store.LogSegment {
+	if len(segments) <= maxEvidenceLogPreviewSegments {
+		return segments
+	}
+	return segments[:maxEvidenceLogPreviewSegments]
+}
+
+func filteredEvidenceEvents(events []store.Event) []store.Event {
+	filtered := make([]store.Event, 0, len(events))
+	for _, event := range events {
+		if isEvidenceEventType(event.Type) {
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered
+}
+
+func isEvidenceEventType(eventType string) bool {
+	switch eventType {
+	case "agent_command.started",
+		"agent_command.completed",
+		"agent_command.failed",
+		"agent_command.timed_out",
+		"agent_command.cancelled",
+		"repository_delivery.skipped",
+		"repository_commit.materialized",
+		"change_set.created",
+		"change_set.claimed",
+		"change_set.branch_push_started",
+		"change_set.branch_push_succeeded",
+		"change_set.branch_push_failed",
+		"change_set.draft_pr_started",
+		"change_set.draft_pr_succeeded",
+		"change_set.draft_pr_failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func printChangeSetProviderRefs(stdout io.Writer, changeSet store.ChangeSet) {

@@ -114,8 +114,15 @@ go run ./cmd/forgelane work-items show --id 1
 go run ./cmd/forgelane runs create github://github.com/owner/repo/issues/123
 go run ./cmd/forgelane runs show 1
 go run ./cmd/forgelane runs prepare 1
+go run ./cmd/forgelane runs start github://github.com/owner/repo/issues/123
+go run ./cmd/forgelane runs evidence 1
+go run ./cmd/forgelane runs logs 1
 go run ./cmd/forgelane events list --run 1
 ```
+
+After `runs start`, prefer `forgelane runs evidence <run_id>` as the review and
+debugging summary before dropping into raw `runs show`, `runs logs`, or
+`events list --run` output.
 
 `work-items import` records a cached provider issue snapshot in the
 instance-global SQLite store at `~/.forgelane/forgelane.db` and appends a
