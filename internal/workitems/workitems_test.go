@@ -35,6 +35,46 @@ func TestNewWorkItemImportNormalizesProviderIssue(t *testing.T) {
 	}
 }
 
+func TestParseProviderRefAcceptsGitLabIssueRefs(t *testing.T) {
+	ref, err := ParseProviderRef("gitlab://gitlab.com/group/subgroup/project/issues/456")
+	if err != nil {
+		t.Fatalf("parse GitLab ProviderRef: %v", err)
+	}
+
+	if ref.Provider != "gitlab" ||
+		ref.ProviderHost != "gitlab.com" ||
+		ref.RepositoryPath != "group/subgroup/project" ||
+		ref.IssueNumber != 456 {
+		t.Fatalf("unexpected GitLab ProviderRef: %#v", ref)
+	}
+	if ref.String() != "gitlab://gitlab.com/group/subgroup/project/issues/456" {
+		t.Fatalf("unexpected canonical ref %q", ref.String())
+	}
+	if ref.RepositoryRef() != "gitlab://gitlab.com/group/subgroup/project" {
+		t.Fatalf("unexpected repository ref %q", ref.RepositoryRef())
+	}
+}
+
+func TestParseProviderRefAcceptsSelfHostedGitLabIssueRefs(t *testing.T) {
+	ref, err := ParseProviderRef("gitlab://gitlab.example.com/group/subgroup/project/issues/456")
+	if err != nil {
+		t.Fatalf("parse self-hosted GitLab ProviderRef: %v", err)
+	}
+
+	if ref.Provider != "gitlab" ||
+		ref.ProviderHost != "gitlab.example.com" ||
+		ref.RepositoryPath != "group/subgroup/project" ||
+		ref.IssueNumber != 456 {
+		t.Fatalf("unexpected self-hosted GitLab ProviderRef: %#v", ref)
+	}
+	if ref.String() != "gitlab://gitlab.example.com/group/subgroup/project/issues/456" {
+		t.Fatalf("unexpected canonical ref %q", ref.String())
+	}
+	if ref.RepositoryRef() != "gitlab://gitlab.example.com/group/subgroup/project" {
+		t.Fatalf("unexpected repository ref %q", ref.RepositoryRef())
+	}
+}
+
 func TestWorkItemImportEventPlanDistinguishesImportAndRefresh(t *testing.T) {
 	importDecision, err := NewWorkItemImport(ProviderIssue{
 		ProviderRef:       "github://github.com/owner/repo/issues/123",

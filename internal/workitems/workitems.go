@@ -29,33 +29,52 @@ func ParseProviderRef(raw string) (ProviderRef, error) {
 	if err != nil {
 		return ProviderRef{}, fmt.Errorf("invalid WorkItem ProviderRef %q", raw)
 	}
-	if (parsed.Scheme == "https" || parsed.Scheme == "http") && parsed.Host == "github.com" {
-		return ProviderRef{}, fmt.Errorf("raw GitHub issue URLs are not supported; use github://github.com/owner/repo/issues/123")
+	if (parsed.Scheme == "https" || parsed.Scheme == "http") && (parsed.Host == "github.com" || parsed.Host == "gitlab.com") {
+		return ProviderRef{}, fmt.Errorf("raw %s issue URLs are not supported; use %s://%s/owner/repo/issues/123", providerName(parsed.Host), providerScheme(parsed.Host), parsed.Host)
 	}
-	if parsed.Scheme != "github" {
+	if parsed.Scheme != "github" && parsed.Scheme != "gitlab" {
 		return ProviderRef{}, fmt.Errorf("unsupported WorkItem provider %q", parsed.Scheme)
 	}
-	if parsed.Host != "github.com" {
+	if parsed.Scheme == "github" && parsed.Host != "github.com" {
 		return ProviderRef{}, fmt.Errorf("unsupported GitHub provider host %q", parsed.Host)
+	}
+	if parsed.Scheme == "gitlab" && parsed.Host == "" {
+		return ProviderRef{}, fmt.Errorf("unsupported GitLab provider host %q", parsed.Host)
 	}
 
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if len(parts) != 4 || parts[2] != "issues" {
+	issueMarker := -1
+	for index, part := range parts {
+		if part == "issues" {
+			issueMarker = index
+			break
+		}
+	}
+	if issueMarker < 0 || issueMarker != len(parts)-2 {
+		return ProviderRef{}, fmt.Errorf("invalid %s issue ProviderRef %q", providerName(parsed.Scheme), raw)
+	}
+	repositoryParts := parts[:issueMarker]
+	if parsed.Scheme == "github" && len(repositoryParts) != 2 {
 		return ProviderRef{}, fmt.Errorf("invalid GitHub issue ProviderRef %q", raw)
 	}
-	if !validProviderPathPart(parts[0]) || !validProviderPathPart(parts[1]) {
-		return ProviderRef{}, fmt.Errorf("invalid GitHub issue ProviderRef %q", raw)
+	if parsed.Scheme == "gitlab" && len(repositoryParts) < 2 {
+		return ProviderRef{}, fmt.Errorf("invalid GitLab issue ProviderRef %q", raw)
+	}
+	for _, part := range repositoryParts {
+		if !validProviderPathPart(part) {
+			return ProviderRef{}, fmt.Errorf("invalid %s issue ProviderRef %q", providerName(parsed.Scheme), raw)
+		}
 	}
 
-	issueNumber, err := strconv.Atoi(parts[3])
+	issueNumber, err := strconv.Atoi(parts[len(parts)-1])
 	if err != nil || issueNumber <= 0 {
-		return ProviderRef{}, fmt.Errorf("invalid GitHub issue ProviderRef %q", raw)
+		return ProviderRef{}, fmt.Errorf("invalid %s issue ProviderRef %q", providerName(parsed.Scheme), raw)
 	}
 
 	return ProviderRef{
 		Provider:       parsed.Scheme,
 		ProviderHost:   parsed.Host,
-		RepositoryPath: parts[0] + "/" + parts[1],
+		RepositoryPath: strings.Join(repositoryParts, "/"),
 		IssueNumber:    issueNumber,
 	}, nil
 }
@@ -207,7 +226,41 @@ type ProviderError struct {
 }
 
 func (err ProviderError) Error() string {
-	return fmt.Sprintf("GitHub provider failure reading issue %s: HTTP %d", err.ProviderRef, err.StatusCode)
+	return fmt.Sprintf("%s provider failure reading issue %s: HTTP %d", providerNameFromRef(err.ProviderRef), err.ProviderRef, err.StatusCode)
+}
+
+func providerName(provider string) string {
+	switch provider {
+	case "github", "github.com":
+		return "GitHub"
+	case "gitlab", "gitlab.com":
+		return "GitLab"
+	default:
+		return provider
+	}
+}
+
+func providerScheme(host string) string {
+	switch host {
+	case "github.com":
+		return "github"
+	case "gitlab.com":
+		return "gitlab"
+	default:
+		return host
+	}
+}
+
+func providerNameFromRef(providerRef string) string {
+	parsed, err := url.Parse(providerRef)
+	if err != nil {
+		return "provider"
+	}
+	name := providerName(parsed.Scheme)
+	if name == "" {
+		return "provider"
+	}
+	return name
 }
 
 func validProviderPathPart(part string) bool {

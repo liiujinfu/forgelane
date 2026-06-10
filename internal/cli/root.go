@@ -18,10 +18,12 @@ type Options struct {
 	Stdout                       io.Writer
 	Stderr                       io.Writer
 	WorkItemProvider             workitems.Provider
+	WorkItemProviderFactory      func(workitems.ProviderRef) (workitems.Provider, error)
 	AgentCommandPlanner          workflow.AgentCommandPlanner
 	AgentCommandRunner           workflow.AgentCommandRunner
 	RepositoryChangeMaterializer workflow.RepositoryChangeMaterializer
 	ChangeProvider               workflow.ChangeProvider
+	ChangeProviderFactory        func(string) (workflow.ChangeProvider, error)
 }
 
 // NewRootCommand constructs the ForgeLane CLI command tree.
@@ -52,7 +54,7 @@ func NewRootCommand(options Options) *cobra.Command {
 
 	root.AddCommand(newInitCommand(stdout))
 	root.AddCommand(newVersionCommand(stdout))
-	root.AddCommand(newWorkItemsCommand(stdout, options.WorkItemProvider))
+	root.AddCommand(newWorkItemsCommand(stdout, options))
 	root.AddCommand(newRunsCommand(stdout, options))
 	root.AddCommand(newEventsCommand(stdout))
 
@@ -76,7 +78,7 @@ func newInitCommand(stdout io.Writer) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&options.RepoURL, "repo-url", "", "GitHub repository URL")
+	cmd.Flags().StringVar(&options.RepoURL, "repo-url", "", "Provider repository URL")
 	cmd.Flags().StringVar(&options.Provider, "provider", "", "WorkItem provider")
 	cmd.Flags().StringVar(&options.Repo, "repo", "", "Provider repository path")
 

@@ -1134,8 +1134,10 @@ func TestRunsExecuteHarmlessPresetCapturesLogsAndScrubsEnvironment(t *testing.T)
 	runGit(t, workingDir, "commit", "-m", "initial")
 	withWorkingDir(t, workingDir)
 	withHomeDir(t, homeDir)
+	t.Setenv("FORGELANE_GITHUB_TOKEN", "sensitive-forgelane-github-token")
 	t.Setenv("GITHUB_TOKEN", "sensitive-provider-token")
 	t.Setenv("GH_TOKEN", "sensitive-gh-token")
+	t.Setenv("FORGELANE_GITLAB_TOKEN", "sensitive-forgelane-gitlab-token")
 	t.Setenv("GITLAB_TOKEN", "sensitive-gitlab-token")
 
 	fakeProvider := &recordingWorkItemProvider{
@@ -1225,7 +1227,7 @@ func TestRunsExecuteHarmlessPresetCapturesLogsAndScrubsEnvironment(t *testing.T)
 			t.Fatalf("expected runs logs output to contain %q, got:\n%s", want, logsStdout)
 		}
 	}
-	for _, secret := range []string{"sensitive-provider-token", "sensitive-gh-token", "sensitive-gitlab-token"} {
+	for _, secret := range []string{"sensitive-forgelane-github-token", "sensitive-provider-token", "sensitive-gh-token", "sensitive-forgelane-gitlab-token", "sensitive-gitlab-token"} {
 		if strings.Contains(logsStdout, secret) {
 			t.Fatalf("expected scrubbed provider token %q, got logs:\n%s", secret, logsStdout)
 		}
@@ -2079,7 +2081,10 @@ func TestRunsExecuteFailsClearlyWhenDeliveryProviderIsMissing(t *testing.T) {
 }
 
 func TestRunsExecutePushesBranchThroughChangeProviderWithoutAgentProviderCredentials(t *testing.T) {
+	t.Setenv("FORGELANE_GITHUB_TOKEN", "sensitive-forgelane-github-token")
 	t.Setenv("GITHUB_TOKEN", "sensitive-provider-token")
+	t.Setenv("FORGELANE_GITLAB_TOKEN", "sensitive-forgelane-gitlab-token")
+	t.Setenv("GITLAB_TOKEN", "sensitive-gitlab-token")
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()
 	runGit(t, workingDir, "init")
@@ -2339,6 +2344,294 @@ func TestRunsCreateFullProviderRefImportDoesNotEnableIssueNumberShorthand(t *tes
 	assertTableCount(t, homeDir, "run_specs", 1)
 }
 
+func TestRunsCreateSelectsWorkItemProviderFromGitLabFullRef(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "gitlab://gitlab.com/group/subgroup/project/issues/456",
+			RepositoryRef:       "gitlab://gitlab.com/group/subgroup/project",
+			Provider:            "gitlab",
+			ProviderIssueNumber: 456,
+			Title:               "Deliver GitLab ChangeSet",
+			Body:                "GitLab full refs should select the GitLab WorkItem provider.",
+			Status:              "open",
+			RawStatus:           "opened",
+			URL:                 "https://gitlab.com/group/subgroup/project/-/issues/456",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	var selectedProvider string
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProviderFactory: func(ref workitems.ProviderRef) (workitems.Provider, error) {
+			selectedProvider = ref.Provider
+			return fakeProvider, nil
+		},
+	}, "runs", "create", "--agent-preset", "harmless-echo", "gitlab://gitlab.com/group/subgroup/project/issues/456")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if selectedProvider != "gitlab" {
+		t.Fatalf("expected GitLab provider selection, got %q", selectedProvider)
+	}
+	for _, want := range []string{
+		"WorkItem: gitlab://gitlab.com/group/subgroup/project/issues/456",
+		"Branch: forgelane/issue-456",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected runs create output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestRunsStartDeliversGitLabFullRefThroughSelectedChangeProvider(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://gitlab.com/group/subgroup/project")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "gitlab://gitlab.com/group/subgroup/project/issues/456",
+			RepositoryRef:       "gitlab://gitlab.com/group/subgroup/project",
+			Provider:            "gitlab",
+			ProviderIssueNumber: 456,
+			Title:               "Deliver GitLab ChangeSet",
+			Body:                "GitLab full refs should select the GitLab WorkItem and ChangeProvider.",
+			Status:              "open",
+			RawStatus:           "opened",
+			URL:                 "https://gitlab.com/group/subgroup/project/-/issues/456",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "gitlab://gitlab.com/group/subgroup/project/branches/forgelane/issue-456",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID: 1,
+			ChangeRef:   "gitlab://gitlab.com/group/subgroup/project/merge_requests/11",
+			Draft:       true,
+			ProviderSnapshot: map[string]any{
+				"iid":   float64(11),
+				"draft": true,
+			},
+		},
+	}
+	var selectedWorkItemProvider string
+	var selectedChangeProvider string
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProviderFactory: func(ref workitems.ProviderRef) (workitems.Provider, error) {
+			selectedWorkItemProvider = ref.Provider
+			return fakeProvider, nil
+		},
+		ChangeProviderFactory: func(provider string) (workflow.ChangeProvider, error) {
+			selectedChangeProvider = provider
+			return changeProvider, nil
+		},
+		AgentCommandPlanner: changingCommandPlanner{},
+	}, "runs", "start", "--agent-preset", "harmless-echo", "gitlab://gitlab.com/group/subgroup/project/issues/456")
+	if err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if selectedWorkItemProvider != "gitlab" || selectedChangeProvider != "gitlab" {
+		t.Fatalf("expected GitLab provider selection, got work_item=%q change=%q", selectedWorkItemProvider, selectedChangeProvider)
+	}
+	for _, want := range []string{
+		"WorkItem: gitlab://gitlab.com/group/subgroup/project/issues/456",
+		"Delivery: draft PR ready",
+		"Provider branch: gitlab://gitlab.com/group/subgroup/project/branches/forgelane/issue-456",
+		"Draft PR: gitlab://gitlab.com/group/subgroup/project/merge_requests/11",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected runs start output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if len(changeProvider.calls) != 1 || changeProvider.calls[0].Provider != "gitlab" {
+		t.Fatalf("expected one GitLab branch push call, got %#v", changeProvider.calls)
+	}
+	if len(changeProvider.draftPRCalls) != 1 || changeProvider.draftPRCalls[0].Provider != "gitlab" {
+		t.Fatalf("expected one GitLab draft MR call, got %#v", changeProvider.draftPRCalls)
+	}
+}
+
+func TestRunsStartDeliversSelfHostedGitLabFullRefThroughSelectedChangeProvider(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://gitlab.example.com/group/subgroup/project")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "gitlab://gitlab.example.com/group/subgroup/project/issues/456",
+			RepositoryRef:       "gitlab://gitlab.example.com/group/subgroup/project",
+			Provider:            "gitlab",
+			ProviderIssueNumber: 456,
+			Title:               "Deliver self-hosted GitLab ChangeSet",
+			Body:                "Self-hosted GitLab refs should flow through workspace prepare and delivery.",
+			Status:              "open",
+			RawStatus:           "opened",
+			URL:                 "https://gitlab.example.com/group/subgroup/project/-/issues/456",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "gitlab://gitlab.example.com/group/subgroup/project/branches/forgelane/issue-456",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID: 1,
+			ChangeRef:   "gitlab://gitlab.example.com/group/subgroup/project/merge_requests/11",
+			Draft:       true,
+			ProviderSnapshot: map[string]any{
+				"iid":   float64(11),
+				"draft": true,
+			},
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProviderFactory: func(ref workitems.ProviderRef) (workitems.Provider, error) {
+			if ref.String() != "gitlab://gitlab.example.com/group/subgroup/project/issues/456" {
+				t.Fatalf("unexpected WorkItem ref %s", ref.String())
+			}
+			return fakeProvider, nil
+		},
+		ChangeProviderFactory: func(provider string) (workflow.ChangeProvider, error) {
+			if provider != "gitlab" {
+				t.Fatalf("unexpected ChangeProvider %s", provider)
+			}
+			return changeProvider, nil
+		},
+		AgentCommandPlanner: changingCommandPlanner{},
+	}, "runs", "start", "--agent-preset", "harmless-echo", "gitlab://gitlab.example.com/group/subgroup/project/issues/456")
+	if err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	for _, want := range []string{
+		"WorkItem: gitlab://gitlab.example.com/group/subgroup/project/issues/456",
+		"Provider branch: gitlab://gitlab.example.com/group/subgroup/project/branches/forgelane/issue-456",
+		"Draft PR: gitlab://gitlab.example.com/group/subgroup/project/merge_requests/11",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected runs start output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestRunsCreateResolvesGitLabIssueNumberFromConfiguredForgeProject(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "https://gitlab.com/group/subgroup/project")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init", "--provider", "gitlab"); err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "gitlab://gitlab.com/group/subgroup/project/issues/456",
+			RepositoryRef:       "gitlab://gitlab.com/group/subgroup/project",
+			Provider:            "gitlab",
+			ProviderIssueNumber: 456,
+			Title:               "Resolve GitLab shorthand",
+			Body:                "Numeric issue shorthand should resolve through the GitLab ForgeProject.",
+			Status:              "open",
+			RawStatus:           "opened",
+			URL:                 "https://gitlab.com/group/subgroup/project/-/issues/456",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProviderFactory: func(ref workitems.ProviderRef) (workitems.Provider, error) {
+			if ref.String() != "gitlab://gitlab.com/group/subgroup/project/issues/456" {
+				t.Fatalf("unexpected resolved ref %s", ref.String())
+			}
+			return fakeProvider, nil
+		},
+	}, "runs", "create", "--agent-preset", "harmless-echo", "456")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if !strings.Contains(stdout, "WorkItem: gitlab://gitlab.com/group/subgroup/project/issues/456") {
+		t.Fatalf("expected GitLab WorkItem in output, got:\n%s", stdout)
+	}
+}
+
+func TestRunsCreateResolvesSelfHostedGitLabIssueNumberFromConfiguredForgeProject(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "https://gitlab.example.com/group/subgroup/project")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init", "--provider", "gitlab"); err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "gitlab://gitlab.example.com/group/subgroup/project/issues/456",
+			RepositoryRef:       "gitlab://gitlab.example.com/group/subgroup/project",
+			Provider:            "gitlab",
+			ProviderIssueNumber: 456,
+			Title:               "Resolve self-hosted GitLab shorthand",
+			Body:                "Numeric issue shorthand should preserve the configured GitLab host.",
+			Status:              "open",
+			RawStatus:           "opened",
+			URL:                 "https://gitlab.example.com/group/subgroup/project/-/issues/456",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProviderFactory: func(ref workitems.ProviderRef) (workitems.Provider, error) {
+			if ref.String() != "gitlab://gitlab.example.com/group/subgroup/project/issues/456" {
+				t.Fatalf("unexpected resolved ref %s", ref.String())
+			}
+			return fakeProvider, nil
+		},
+	}, "runs", "create", "--agent-preset", "harmless-echo", "456")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if !strings.Contains(stdout, "WorkItem: gitlab://gitlab.example.com/group/subgroup/project/issues/456") {
+		t.Fatalf("expected self-hosted GitLab WorkItem in output, got:\n%s", stdout)
+	}
+}
+
 func TestRootHelpShowsSkeletonCommands(t *testing.T) {
 	stdout, stderr, err := executeForTest(t, "--help")
 	if err != nil {
@@ -2451,6 +2744,48 @@ func TestInitWithGitHubRepoShorthandPersistsSameForgeProject(t *testing.T) {
 	assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
 }
 
+func TestInitWithGitLabRepoShorthandPersistsForgeProject(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	stdout, stderr, err := executeForTest(t, "init", "--provider", "gitlab", "--repo", "group/subgroup/project")
+	if err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "Configured ForgeProject gitlab://gitlab.com/group/subgroup/project") {
+		t.Fatalf("expected init output to describe configured ForgeProject, got:\n%s", stdout)
+	}
+
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"gitlab://gitlab.com/group/subgroup/project"})
+}
+
+func TestInitWithSelfHostedGitLabRepoURLPersistsForgeProject(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	stdout, stderr, err := executeForTest(t, "init", "--provider", "gitlab", "--repo-url", "https://gitlab.example.com/group/subgroup/project.git")
+	if err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "Configured ForgeProject gitlab://gitlab.example.com/group/subgroup/project") {
+		t.Fatalf("expected init output to describe configured ForgeProject, got:\n%s", stdout)
+	}
+
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"gitlab://gitlab.example.com/group/subgroup/project"})
+}
+
 func TestInitInfersGitHubForgeProjectFromOriginRemote(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -2472,6 +2807,52 @@ func TestInitInfersGitHubForgeProjectFromOriginRemote(t *testing.T) {
 
 	assertNoRepoLocalConfig(t, workingDir)
 	assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
+}
+
+func TestInitInfersGitLabForgeProjectFromOriginRemote(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "git@gitlab.com:group/subgroup/project.git")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	stdout, stderr, err := executeForTest(t, "init", "--provider", "gitlab")
+	if err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "Configured ForgeProject gitlab://gitlab.com/group/subgroup/project") {
+		t.Fatalf("expected init output to describe configured ForgeProject, got:\n%s", stdout)
+	}
+
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"gitlab://gitlab.com/group/subgroup/project"})
+}
+
+func TestInitInfersSelfHostedGitLabForgeProjectFromOriginRemote(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "git@gitlab.example.com:group/subgroup/project.git")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	stdout, stderr, err := executeForTest(t, "init", "--provider", "gitlab")
+	if err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "Configured ForgeProject gitlab://gitlab.example.com/group/subgroup/project") {
+		t.Fatalf("expected init output to describe configured ForgeProject, got:\n%s", stdout)
+	}
+
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"gitlab://gitlab.example.com/group/subgroup/project"})
 }
 
 func TestInitAcceptsSupportedGitHubRemoteURLForms(t *testing.T) {
@@ -2507,17 +2888,44 @@ func TestInitAcceptsSupportedGitHubRemoteURLForms(t *testing.T) {
 	}
 }
 
+func TestInitAcceptsSupportedGitLabRemoteURLForms(t *testing.T) {
+	tests := []struct {
+		name    string
+		repoURL string
+	}{
+		{name: "https", repoURL: "https://gitlab.com/group/subgroup/project"},
+		{name: "https git suffix", repoURL: "https://gitlab.com/group/subgroup/project.git"},
+		{name: "ssh scp", repoURL: "git@gitlab.com:group/subgroup/project.git"},
+		{name: "ssh url", repoURL: "ssh://git@gitlab.com/group/subgroup/project.git"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			homeDir := t.TempDir()
+			withWorkingDir(t, workingDir)
+			withHomeDir(t, homeDir)
+
+			_, stderr, err := executeForTest(t, "init", "--repo-url", tt.repoURL)
+			if err != nil {
+				t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+			}
+			if stderr != "" {
+				t.Fatalf("expected no stderr, got %q", stderr)
+			}
+
+			assertNoRepoLocalConfig(t, workingDir)
+			assertForgeProjects(t, homeDir, []string{"gitlab://gitlab.com/group/subgroup/project"})
+		})
+	}
+}
+
 func TestInitRejectsInvalidInputsWithClearErrors(t *testing.T) {
 	tests := []struct {
 		name    string
 		args    []string
 		wantErr string
 	}{
-		{
-			name:    "unsupported provider",
-			args:    []string{"init", "--provider", "gitlab", "--repo", "owner/repo"},
-			wantErr: `unsupported provider "gitlab"`,
-		},
 		{
 			name:    "invalid repo ref",
 			args:    []string{"init", "--provider", "github", "--repo", "owner"},
@@ -2539,9 +2947,9 @@ func TestInitRejectsInvalidInputsWithClearErrors(t *testing.T) {
 			wantErr: `invalid GitHub repository ref "owner/."`,
 		},
 		{
-			name:    "unsupported remote url",
-			args:    []string{"init", "--repo-url", "https://gitlab.com/owner/repo"},
-			wantErr: `unsupported GitHub repository URL "https://gitlab.com/owner/repo"`,
+			name:    "invalid GitLab repo ref",
+			args:    []string{"init", "--provider", "gitlab", "--repo", "group"},
+			wantErr: `invalid GitLab repository ref "group"`,
 		},
 		{
 			name:    "branch webpage url",
@@ -2551,7 +2959,7 @@ func TestInitRejectsInvalidInputsWithClearErrors(t *testing.T) {
 		{
 			name:    "ambiguous shorthand in repo url",
 			args:    []string{"init", "--repo-url", "owner/repo"},
-			wantErr: `unsupported GitHub repository URL "owner/repo"`,
+			wantErr: `unsupported repository URL "owner/repo"`,
 		},
 		{
 			name:    "missing origin asks for repo url",
@@ -2737,7 +3145,7 @@ func (changingCommandPlanner) PlanAgentCommand(input workflow.AgentCommandPlanIn
 type tokenCheckingChangingCommandPlanner struct{}
 
 func (tokenCheckingChangingCommandPlanner) PlanAgentCommand(input workflow.AgentCommandPlanInput) (workflow.AgentCommandPlan, error) {
-	script := `if [ -n "${GITHUB_TOKEN:-}" ] || [ -n "${GH_TOKEN:-}" ] || [ -n "${GITLAB_TOKEN:-}" ]; then
+	script := `if [ -n "${FORGELANE_GITHUB_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ] || [ -n "${GH_TOKEN:-}" ] || [ -n "${FORGELANE_GITLAB_TOKEN:-}" ] || [ -n "${GITLAB_TOKEN:-}" ]; then
   printf 'provider-token=present\n'
 else
   printf 'provider-token=absent\n'

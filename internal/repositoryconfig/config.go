@@ -81,43 +81,70 @@ func forgeProjectFromOptions(options InitOptions) (ForgeProject, error) {
 
 	provider := options.Provider
 	if provider == "" && options.RepoURL != "" {
-		provider = "github"
+		provider = providerFromRepositoryURL(options.RepoURL)
+		if provider == "" {
+			return ForgeProject{}, fmt.Errorf("unsupported repository URL %q", options.RepoURL)
+		}
 	}
 	if provider == "" && options.RepoURL == "" && options.Repo == "" {
 		return ForgeProject{}, fmt.Errorf("missing repository; pass --repo-url")
 	}
-	if provider != "github" {
+	if provider != "github" && provider != "gitlab" {
 		return ForgeProject{}, fmt.Errorf("unsupported provider %q", provider)
 	}
 
 	var repoPath string
+	var baseURL string
 	var err error
-	switch {
-	case options.RepoURL != "":
-		repoPath, err = parseGitHubURL(options.RepoURL)
-	case options.Repo != "":
-		repoPath, err = parseGitHubRepo(options.Repo)
-	default:
-		var originURL string
-		originURL, err = originRemoteURL(options.WorkingDir)
-		if err != nil {
-			return ForgeProject{}, err
-		}
-		repoPath, err = parseGitHubURL(originURL)
-	}
+	repoPath, baseURL, err = repoPathFromOptions(provider, options)
 	if err != nil {
 		return ForgeProject{}, err
 	}
 
 	return ForgeProject{
-		Provider: "github",
-		BaseURL:  "https://github.com",
+		Provider: provider,
+		BaseURL:  baseURL,
 		Path:     repoPath,
 	}, nil
 }
 
+func repoPathFromOptions(provider string, options InitOptions) (string, string, error) {
+	switch {
+	case options.RepoURL != "":
+		if provider == "gitlab" {
+			return parseGitLabURL(options.RepoURL)
+		}
+		return parseGitHubURL(options.RepoURL)
+	case options.Repo != "":
+		if provider == "gitlab" {
+			repoPath, err := parseGitLabRepo(options.Repo)
+			return repoPath, "https://gitlab.com", err
+		}
+		repoPath, err := parseGitHubRepo(options.Repo)
+		return repoPath, "https://github.com", err
+	default:
+		originURL, err := originRemoteURL(options.WorkingDir)
+		if err != nil {
+			return "", "", err
+		}
+		if provider == "gitlab" {
+			return parseGitLabURL(originURL)
+		}
+		return parseGitHubURL(originURL)
+	}
+}
+
 // InferForgeProjectFromOrigin returns the ForgeProject implied by a directory's origin remote.
 func InferForgeProjectFromOrigin(workingDir string) (ForgeProject, error) {
+	return inferForgeProjectFromOrigin(workingDir, "")
+}
+
+// InferForgeProjectFromOriginForProvider returns the ForgeProject implied by origin for an explicit provider.
+func InferForgeProjectFromOriginForProvider(workingDir string, provider string) (ForgeProject, error) {
+	return inferForgeProjectFromOrigin(workingDir, provider)
+}
+
+func inferForgeProjectFromOrigin(workingDir string, provider string) (ForgeProject, error) {
 	if workingDir == "" {
 		var err error
 		workingDir, err = os.Getwd()
@@ -129,13 +156,22 @@ func InferForgeProjectFromOrigin(workingDir string) (ForgeProject, error) {
 	if err != nil {
 		return ForgeProject{}, err
 	}
-	repoPath, err := parseGitHubURL(originURL)
+	if provider == "" {
+		provider = providerFromRepositoryURL(originURL)
+	}
+	if provider == "" {
+		return ForgeProject{}, fmt.Errorf("unsupported repository URL %q", originURL)
+	}
+	if provider != "github" && provider != "gitlab" {
+		return ForgeProject{}, fmt.Errorf("unsupported provider %q", provider)
+	}
+	repoPath, baseURL, err := parseRepositoryURL(provider, originURL)
 	if err != nil {
 		return ForgeProject{}, err
 	}
 	return ForgeProject{
-		Provider: "github",
-		BaseURL:  "https://github.com",
+		Provider: provider,
+		BaseURL:  baseURL,
 		Path:     repoPath,
 	}, nil
 }
@@ -173,31 +209,31 @@ func forgeProjectHost(forgeProject ForgeProject) string {
 	return baseURL.Host
 }
 
-func parseGitHubURL(raw string) (string, error) {
+func parseGitHubURL(raw string) (string, string, error) {
 	if repoPath, ok := parseGitHubSCPRemote(raw); ok {
-		return repoPath, nil
+		return repoPath, "https://github.com", nil
 	}
 
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid GitHub repository URL %q", raw)
+		return "", "", fmt.Errorf("invalid GitHub repository URL %q", raw)
 	}
 	if parsed.Scheme != "https" && parsed.Scheme != "ssh" {
-		return "", fmt.Errorf("unsupported GitHub repository URL %q", raw)
+		return "", "", fmt.Errorf("unsupported GitHub repository URL %q", raw)
 	}
 	if parsed.Host != "github.com" {
-		return "", fmt.Errorf("unsupported GitHub repository URL %q", raw)
+		return "", "", fmt.Errorf("unsupported GitHub repository URL %q", raw)
 	}
 	if parsed.Scheme == "ssh" && parsed.User.Username() != "git" {
-		return "", fmt.Errorf("unsupported GitHub repository URL %q", raw)
+		return "", "", fmt.Errorf("unsupported GitHub repository URL %q", raw)
 	}
 
 	repoPath := strings.Trim(path.Clean(parsed.Path), "/")
 	repoPath = strings.TrimSuffix(repoPath, ".git")
 	if !validOwnerRepo(repoPath) {
-		return "", fmt.Errorf("invalid GitHub repository URL %q", raw)
+		return "", "", fmt.Errorf("invalid GitHub repository URL %q", raw)
 	}
-	return repoPath, nil
+	return repoPath, "https://github.com", nil
 }
 
 func parseGitHubSCPRemote(raw string) (string, bool) {
@@ -217,6 +253,86 @@ func parseGitHubRepo(raw string) (string, error) {
 	return repoPath, nil
 }
 
+func parseGitLabURL(raw string) (string, string, error) {
+	if repoPath, baseURL, ok := parseGitLabSCPRemote(raw); ok {
+		return repoPath, baseURL, nil
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid GitLab repository URL %q", raw)
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "ssh" {
+		return "", "", fmt.Errorf("unsupported GitLab repository URL %q", raw)
+	}
+	if parsed.Host == "" || parsed.Host == "github.com" {
+		return "", "", fmt.Errorf("unsupported GitLab repository URL %q", raw)
+	}
+	if parsed.Scheme == "ssh" && parsed.User.Username() != "git" {
+		return "", "", fmt.Errorf("unsupported GitLab repository URL %q", raw)
+	}
+
+	repoPath := strings.Trim(path.Clean(parsed.Path), "/")
+	repoPath = strings.TrimSuffix(repoPath, ".git")
+	if !validGitLabProjectPath(repoPath) {
+		return "", "", fmt.Errorf("invalid GitLab repository URL %q", raw)
+	}
+	return repoPath, "https://" + parsed.Host, nil
+}
+
+func parseGitLabSCPRemote(raw string) (string, string, bool) {
+	if !strings.HasPrefix(raw, "git@") {
+		return "", "", false
+	}
+	hostAndPath := strings.TrimPrefix(raw, "git@")
+	separator := strings.IndexByte(hostAndPath, ':')
+	if separator <= 0 {
+		return "", "", false
+	}
+	host := hostAndPath[:separator]
+	if host == "" || host == "github.com" || strings.ContainsAny(host, "/\\") {
+		return "", "", false
+	}
+	repoPath := strings.TrimSuffix(hostAndPath[separator+1:], ".git")
+	return repoPath, "https://" + host, validGitLabProjectPath(repoPath)
+}
+
+func parseGitLabRepo(raw string) (string, error) {
+	repoPath := strings.TrimSpace(raw)
+	if !validGitLabProjectPath(repoPath) {
+		return "", fmt.Errorf("invalid GitLab repository ref %q", raw)
+	}
+	return repoPath, nil
+}
+
+func providerFromRepositoryURL(raw string) string {
+	if strings.HasPrefix(raw, "git@github.com:") {
+		return "github"
+	}
+	if strings.HasPrefix(raw, "git@gitlab.com:") {
+		return "gitlab"
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	switch parsed.Host {
+	case "github.com":
+		return "github"
+	case "gitlab.com":
+		return "gitlab"
+	default:
+		return ""
+	}
+}
+
+func parseRepositoryURL(provider string, raw string) (string, string, error) {
+	if provider == "gitlab" {
+		return parseGitLabURL(raw)
+	}
+	return parseGitHubURL(raw)
+}
+
 func validOwnerRepo(repoPath string) bool {
 	parts := strings.Split(repoPath, "/")
 	if len(parts) != 2 {
@@ -230,6 +346,31 @@ func validOwnerRepo(repoPath string) bool {
 			if char < 0x21 || char > 0x7e || strings.ContainsRune(`\/?#[]@!$&'()*+,;=`, char) {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+func validGitLabProjectPath(repoPath string) bool {
+	parts := strings.Split(repoPath, "/")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if !validRepositoryPathPart(part) || part == "-" {
+			return false
+		}
+	}
+	return true
+}
+
+func validRepositoryPathPart(part string) bool {
+	if part == "" || part == "." || part == ".." || strings.TrimSpace(part) != part {
+		return false
+	}
+	for _, char := range part {
+		if char < 0x21 || char > 0x7e || strings.ContainsRune(`\/?#[]@!$&'()*+,;=`, char) {
+			return false
 		}
 	}
 	return true

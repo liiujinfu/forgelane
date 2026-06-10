@@ -1023,8 +1023,13 @@ func (plan PlannedAgentRunPlan) EventPlans(ids PlannedAgentRunIDs) []EventPlan {
 
 func splitRepositoryPath(repositoryPath string) (string, string, error) {
 	parts := strings.Split(repositoryPath, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	if len(parts) < 2 {
 		return "", "", fmt.Errorf("invalid repository path %q", repositoryPath)
 	}
-	return parts[0], parts[1], nil
+	for _, part := range parts {
+		if part == "" {
+			return "", "", fmt.Errorf("invalid repository path %q", repositoryPath)
+		}
+	}
+	return strings.Join(parts[:len(parts)-1], "/"), parts[len(parts)-1], nil
 }

@@ -37,6 +37,9 @@ func NewIssueProvider(options Options) *IssueProvider {
 	}
 	token := options.Token
 	if token == "" {
+		token = os.Getenv("FORGELANE_GITHUB_TOKEN")
+	}
+	if token == "" {
 		token = os.Getenv("GITHUB_TOKEN")
 	}
 	client := options.Client

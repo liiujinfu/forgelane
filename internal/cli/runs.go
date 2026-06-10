@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	commandadapter "github.com/liiujinfu/forgelane/internal/agentadapter/command"
-	githubprovider "github.com/liiujinfu/forgelane/internal/provider/github"
 	"github.com/liiujinfu/forgelane/internal/repositoryconfig"
 	"github.com/liiujinfu/forgelane/internal/runner"
 	processrunner "github.com/liiujinfu/forgelane/internal/runner/process"
@@ -22,14 +21,11 @@ import (
 )
 
 func newRunsCommand(stdout io.Writer, options Options) *cobra.Command {
-	if options.WorkItemProvider == nil {
-		options.WorkItemProvider = githubprovider.NewIssueProvider(githubprovider.Options{})
-	}
 	cmd := &cobra.Command{
 		Use:   "runs",
 		Short: "Create and inspect AgentRuns.",
 	}
-	cmd.AddCommand(newRunsCreateCommand(stdout, options.WorkItemProvider))
+	cmd.AddCommand(newRunsCreateCommand(stdout, options))
 	cmd.AddCommand(newRunsStartCommand(stdout, options))
 	cmd.AddCommand(newRunsShowCommand(stdout))
 	cmd.AddCommand(newRunsEvidenceCommand(stdout))
@@ -41,7 +37,7 @@ func newRunsCommand(stdout io.Writer, options Options) *cobra.Command {
 	return cmd
 }
 
-func newRunsCreateCommand(stdout io.Writer, provider workitems.Provider) *cobra.Command {
+func newRunsCreateCommand(stdout io.Writer, options Options) *cobra.Command {
 	var agentPreset string
 	cmd := &cobra.Command{
 		Use:   "create <provider-ref-or-issue>",
@@ -55,6 +51,10 @@ func newRunsCreateCommand(stdout io.Writer, provider workitems.Provider) *cobra.
 			defer instanceStore.Close()
 
 			ref, err := resolveWorkItemRef(args[0], instanceStore)
+			if err != nil {
+				return err
+			}
+			provider, err := workItemProviderForRef(options, ref)
 			if err != nil {
 				return err
 			}
@@ -97,7 +97,11 @@ func newRunsStartCommand(stdout io.Writer, options Options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			workItem, err := getOrImportWorkItem(cmd, instanceStore, options.WorkItemProvider, ref)
+			provider, err := workItemProviderForRef(options, ref)
+			if err != nil {
+				return err
+			}
+			workItem, err := getOrImportWorkItem(cmd, instanceStore, provider, ref)
 			if err != nil {
 				return err
 			}
@@ -118,13 +122,17 @@ func newRunsStartCommand(stdout io.Writer, options Options) *cobra.Command {
 				return err
 			}
 
+			changeProvider, err := changeProviderForProvider(options, workItem.Provider)
+			if err != nil {
+				return err
+			}
 			result, err := workflow.ExecuteAgentRunCommandAndDeliver(
 				cmd.Context(),
 				instanceStore,
 				agentCommandPlanner(options),
 				agentCommandRunner(options),
 				repositoryChangeMaterializer(options),
-				options.ChangeProvider,
+				changeProvider,
 				created.AgentRun.ID,
 			)
 			if err != nil {
@@ -225,13 +233,17 @@ func newRunsExecuteCommand(stdout io.Writer, options Options) *cobra.Command {
 			}
 			defer instanceStore.Close()
 
+			changeProvider, err := changeProviderForRun(options, instanceStore, runID)
+			if err != nil {
+				return err
+			}
 			result, err := workflow.ExecuteAgentRunCommandAndDeliver(
 				cmd.Context(),
 				instanceStore,
 				agentCommandPlanner(options),
 				agentCommandRunner(options),
 				repositoryChangeMaterializer(options),
-				options.ChangeProvider,
+				changeProvider,
 				runID,
 			)
 			if err != nil {

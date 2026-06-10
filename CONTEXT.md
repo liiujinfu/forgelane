@@ -96,8 +96,12 @@ ForgeLane is an agentic software delivery control plane.
 
 ## Early Product Boundaries
 
-- v0 targets GitHub first.
-- v0 should prove one issue-to-draft-PR loop before adding provider breadth.
+- v0 targets GitHub first. Issue #40 adds only a narrow GitLab.com and
+  self-hosted GitLab path for the same WorkItem import plus branch-to-draft-MR
+  ChangeProvider loop; this does not open general provider breadth.
+- v0 should prove one issue-to-draft-PR/MR loop before adding broader provider
+  breadth, including checks, reviews, comments, provider webhooks, or a plugin
+  system.
 - v0 assumes a trusted single-user/self-hosted operator while still recording
   privileged actions through ControlAction and Event records.
 - Do not introduce an independent issue tracker unless the roadmap changes.
