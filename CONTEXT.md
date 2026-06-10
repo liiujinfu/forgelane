@@ -25,6 +25,10 @@ ForgeLane is an agentic software delivery control plane.
 - Repository config: ForgeLane-owned defaults for one target repository or
   ForgeProject, such as the default WorkItem provider/repo used to resolve
   shorthand input.
+- Workflow contract: a repo-owned, version-controlled file at the target
+  repository root that declares durable expectations for ForgeLane agent runs,
+  such as default AgentAdapter preset, semantic tracker label mappings,
+  verification evidence, and approval policy hints.
 - Instance state store: ForgeLane-owned persistent state for one local
   ForgeLane instance, including ForgeProjects, WorkItem snapshots, and Events.
 - Target repository: the Git repository ForgeLane will prepare as the code
@@ -59,6 +63,10 @@ ForgeLane is an agentic software delivery control plane.
 - ForgeLane instance state such as ForgeProjects, WorkItem snapshots, and
   Events belongs in the instance state store, not inside target source
   repositories and not in provider-owned systems.
+- A Workflow contract is repository guidance, not ForgeLane instance state and
+  not per-run RunSpec state. It must be resolved from the target repository root
+  and must not contain secrets, local paths, current run ids, last errors, or
+  other instance/run state.
 - WorkItem snapshots are cached provider state, not a replacement source of
   truth; show/import output should expose snapshot freshness.
 - WorkItem `imported_at` records the first local import time; `refreshed_at`

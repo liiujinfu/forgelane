@@ -544,6 +544,9 @@ func TestRunsCreateImportsWorkItemAndCreatesPlannedRunSpec(t *testing.T) {
 	if got := agentAdapter["kind"]; got != "command" {
 		t.Fatalf("expected generic command AgentAdapter, got %#v", got)
 	}
+	if got := agentAdapter["preset"]; got != "codex" {
+		t.Fatalf("expected missing workflow contract to fall back to codex preset, got %#v", got)
+	}
 	grants, ok := agentAdapter["credential_grants"].([]any)
 	if !ok || len(grants) != 1 {
 		t.Fatalf("expected default Codex RunSpec to declare one credential grant, got %#v", agentAdapter["credential_grants"])
@@ -557,6 +560,71 @@ func TestRunsCreateImportsWorkItemAndCreatesPlannedRunSpec(t *testing.T) {
 	}
 	if got := grant["secret_id"]; got != "env:OPENAI_API_KEY" {
 		t.Fatalf("expected env-backed OPENAI_API_KEY secret id, got %#v", got)
+	}
+}
+
+func TestRunsCreateUsesWorkflowContractDefaultAgentPreset(t *testing.T) {
+	workingDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	subdir := filepath.Join(workingDir, "nested")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatalf("create subdir: %v", err)
+	}
+	homeDir := t.TempDir()
+	withWorkingDir(t, subdir)
+	withHomeDir(t, homeDir)
+	contract := `{
+  "version": 1,
+  "agent": {
+    "default_preset": "harmless-echo"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(workingDir, "forgelane.workflow.json"), []byte(contract), 0o644); err != nil {
+		t.Fatalf("write workflow contract: %v", err)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Use workflow contract agent preset",
+			Body:                "RunSpec creation should load the repo-owned workflow contract.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	_, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	var specJSON string
+	if err := db.QueryRow("SELECT spec_json FROM run_specs").Scan(&specJSON); err != nil {
+		t.Fatalf("query RunSpec: %v", err)
+	}
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(specJSON), &spec); err != nil {
+		t.Fatalf("expected RunSpec JSON to decode: %v\n%s", err, specJSON)
+	}
+	agentAdapter, ok := spec["agent_adapter"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected RunSpec agent_adapter object, got %#v", spec["agent_adapter"])
+	}
+	if got := agentAdapter["preset"]; got != "harmless-echo" {
+		t.Fatalf("expected workflow contract default preset harmless-echo, got %#v", got)
+	}
+	if grants, ok := agentAdapter["credential_grants"].([]any); ok && len(grants) != 0 {
+		t.Fatalf("expected harmless preset to avoid credential grants, got %#v", grants)
 	}
 }
 
@@ -2957,6 +3025,171 @@ func TestRootHelpShowsSkeletonCommands(t *testing.T) {
 	if strings.Contains(stdout, "completion") {
 		t.Fatalf("expected help output not to expose completion command, got:\n%s", stdout)
 	}
+}
+
+func TestWorkflowInitCreatesDefaultContract(t *testing.T) {
+	workingDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	subdir := filepath.Join(workingDir, "nested")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatalf("create subdir: %v", err)
+	}
+	withWorkingDir(t, subdir)
+	withHomeDir(t, t.TempDir())
+
+	stdout, stderr, err := executeForTest(t, "workflow", "init")
+	if err != nil {
+		t.Fatalf("expected workflow init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "Created workflow contract forgelane.workflow.json") {
+		t.Fatalf("expected workflow init output to describe created contract, got:\n%s", stdout)
+	}
+
+	content, err := os.ReadFile(filepath.Join(workingDir, "forgelane.workflow.json"))
+	if err != nil {
+		t.Fatalf("read workflow contract: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(subdir, "forgelane.workflow.json")); !os.IsNotExist(err) {
+		t.Fatalf("workflow init should create the contract at the repository root, subdir stat err: %v", err)
+	}
+	var contract map[string]any
+	if err := json.Unmarshal(content, &contract); err != nil {
+		t.Fatalf("decode workflow contract: %v\n%s", err, content)
+	}
+	agent, ok := contract["agent"].(map[string]any)
+	if !ok || agent["default_preset"] != "codex" {
+		t.Fatalf("expected default codex agent preset, got %#v", contract["agent"])
+	}
+	tracker, ok := contract["tracker"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tracker section, got %#v", contract["tracker"])
+	}
+	labels, ok := tracker["labels"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tracker labels, got %#v", tracker["labels"])
+	}
+	for role, label := range map[string]string{
+		"trigger":         "forgelane",
+		"ready_for_agent": "ready-for-agent",
+		"needs_info":      "needs-info",
+		"ready_for_human": "ready-for-human",
+	} {
+		if labels[role] != label {
+			t.Fatalf("expected tracker label %s=%q, got %#v", role, label, labels[role])
+		}
+	}
+	verification, ok := contract["verification"].(map[string]any)
+	if !ok || verification["test_command"] != "go test ./..." {
+		t.Fatalf("expected verification test command, got %#v", contract["verification"])
+	}
+	if evidence, ok := verification["evidence"].([]any); !ok || len(evidence) == 0 {
+		t.Fatalf("expected verification evidence requirements, got %#v", verification["evidence"])
+	}
+	approvals, ok := contract["approvals"].(map[string]any)
+	if !ok || approvals["provider_mutations"] == "" || approvals["privileged_actions"] == "" {
+		t.Fatalf("expected approval policy hints, got %#v", contract["approvals"])
+	}
+	notes, ok := contract["automation_notes"].([]any)
+	if !ok || len(notes) == 0 {
+		t.Fatalf("expected automation notes, got %#v", contract["automation_notes"])
+	}
+	if _, ok := contract["watcher"]; ok {
+		t.Fatalf("workflow contract should document future watcher behavior without watcher config, got %#v", contract["watcher"])
+	}
+	if strings.Contains(string(content), "run_id") || strings.Contains(string(content), "secret") || strings.Contains(string(content), "last_error") {
+		t.Fatalf("workflow contract should not contain instance or run state:\n%s", content)
+	}
+}
+
+func TestWorkflowInitRefusesToOverwriteExistingContract(t *testing.T) {
+	workingDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, t.TempDir())
+	contractPath := filepath.Join(workingDir, "forgelane.workflow.json")
+	existing := []byte("{\"version\":99}\n")
+	if err := os.WriteFile(contractPath, existing, 0o644); err != nil {
+		t.Fatalf("write existing workflow contract: %v", err)
+	}
+
+	stdout, stderr, err := executeForTest(t, "workflow", "init")
+	if err == nil {
+		t.Fatal("expected workflow init to refuse existing contract")
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "workflow contract forgelane.workflow.json already exists") {
+		t.Fatalf("expected existing contract error, got:\n%s", stderr)
+	}
+	content, err := os.ReadFile(contractPath)
+	if err != nil {
+		t.Fatalf("read workflow contract: %v", err)
+	}
+	if string(content) != string(existing) {
+		t.Fatalf("workflow init should not overwrite existing contract:\n%s", content)
+	}
+}
+
+func TestInitWithWorkflowCreatesDefaultContract(t *testing.T) {
+	workingDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	stdout, stderr, err := executeForTest(t, "init", "--repo-url", "https://github.com/owner/repo", "--with-workflow")
+	if err != nil {
+		t.Fatalf("expected init with workflow to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Configured ForgeProject github://github.com/owner/repo",
+		"Created workflow contract forgelane.workflow.json",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected init output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(workingDir, "forgelane.workflow.json")); err != nil {
+		t.Fatalf("expected workflow contract to exist: %v", err)
+	}
+
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
+}
+
+func TestPlainInitSuggestsWorkflowContractWithoutCreatingIt(t *testing.T) {
+	workingDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	stdout, stderr, err := executeForTest(t, "init", "--repo-url", "https://github.com/owner/repo")
+	if err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "Configured ForgeProject github://github.com/owner/repo") {
+		t.Fatalf("expected init output to describe configured ForgeProject, got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "Workflow contract missing; run `forgelane workflow init` or `forgelane init --with-workflow` to create forgelane.workflow.json") {
+		t.Fatalf("expected init output to suggest explicit workflow contract creation, got:\n%s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(workingDir, "forgelane.workflow.json")); !os.IsNotExist(err) {
+		t.Fatalf("plain init should not create workflow contract, stat err: %v", err)
+	}
+
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
 }
 
 func TestVersionCommandShowsDevelopmentDefaults(t *testing.T) {

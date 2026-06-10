@@ -16,6 +16,7 @@ import (
 	processrunner "github.com/liiujinfu/forgelane/internal/runner/process"
 	store "github.com/liiujinfu/forgelane/internal/store/sqlite"
 	"github.com/liiujinfu/forgelane/internal/workflow"
+	"github.com/liiujinfu/forgelane/internal/workflowcontract"
 	"github.com/liiujinfu/forgelane/internal/workitems"
 	"github.com/spf13/cobra"
 )
@@ -66,10 +67,14 @@ func newRunsCreateCommand(stdout io.Writer, options Options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			selectedPreset, err := agentPresetForRun(agentPreset)
+			if err != nil {
+				return err
+			}
 
 			result, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
 				WorkItem:    workItem,
-				AgentPreset: agentPreset,
+				AgentPreset: selectedPreset,
 			})
 			if err != nil {
 				return err
@@ -108,10 +113,14 @@ func newRunsStartCommand(stdout io.Writer, options Options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			selectedPreset, err := agentPresetForRun(agentPreset)
+			if err != nil {
+				return err
+			}
 
 			created, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
 				WorkItem:    workItem,
-				AgentPreset: agentPreset,
+				AgentPreset: selectedPreset,
 			})
 			if err != nil {
 				return err
@@ -387,7 +396,14 @@ func newRunsRetryCommand(stdout io.Writer) *cobra.Command {
 			}
 			defer instanceStore.Close()
 
-			result, err := workflow.RequestAgentRunRetry(instanceStore, runID)
+			selectedPreset, err := agentPresetForRun("")
+			if err != nil {
+				return err
+			}
+
+			result, err := workflow.RequestAgentRunRetry(instanceStore, runID, workflow.RequestAgentRunRetryInput{
+				AgentPreset: selectedPreset,
+			})
 			if err != nil {
 				return err
 			}
@@ -395,6 +411,20 @@ func newRunsRetryCommand(stdout io.Writer) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func agentPresetForRun(explicitPreset string) (string, error) {
+	if explicitPreset != "" {
+		return explicitPreset, nil
+	}
+	root, err := workflowcontract.RepositoryRoot("")
+	if err != nil {
+		if errors.Is(err, workflowcontract.ErrRepositoryRootNotFound) {
+			return workflowcontract.Default().Agent.DefaultPreset, nil
+		}
+		return "", err
+	}
+	return workflowcontract.DefaultAgentPreset(root)
 }
 
 func newRunsLogsCommand(stdout io.Writer) *cobra.Command {

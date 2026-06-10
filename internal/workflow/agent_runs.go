@@ -23,6 +23,11 @@ type CreatePlannedAgentRunInput struct {
 	CommandTimeout time.Duration
 }
 
+// RequestAgentRunRetryInput configures the fresh RunSpec created for a retry.
+type RequestAgentRunRetryInput struct {
+	AgentPreset string
+}
+
 // WorkItemSnapshot is the cached provider-owned WorkItem state captured in a RunSpec.
 type WorkItemSnapshot struct {
 	ID                  int64
@@ -537,7 +542,7 @@ func ResolveAgentRunApproval(store AgentRunAttentionResponseStore, runID int64, 
 }
 
 // RequestAgentRunRetry records a retry ControlAction and creates a fresh planned AgentRun.
-func RequestAgentRunRetry(store AgentRunRetryStore, priorRunID int64) (AgentRunCreateResult, error) {
+func RequestAgentRunRetry(store AgentRunRetryStore, priorRunID int64, input RequestAgentRunRetryInput) (AgentRunCreateResult, error) {
 	prior, err := store.GetAgentRunDetail(priorRunID)
 	if err != nil {
 		return AgentRunCreateResult{}, err
@@ -545,7 +550,7 @@ func RequestAgentRunRetry(store AgentRunRetryStore, priorRunID int64) (AgentRunC
 	if !isTerminalAgentRunStatus(prior.AgentRun.Status) {
 		return AgentRunCreateResult{}, fmt.Errorf("AgentRun %d is %s; expected terminal run", priorRunID, prior.AgentRun.Status)
 	}
-	plan, err := NewPlannedAgentRunPlan(prior.WorkItem, "")
+	plan, err := NewPlannedAgentRunPlan(prior.WorkItem, input.AgentPreset)
 	if err != nil {
 		return AgentRunCreateResult{}, err
 	}

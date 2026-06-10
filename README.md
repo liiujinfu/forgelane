@@ -110,8 +110,10 @@ Inspect the current CLI surface:
 go run ./cmd/forgelane --help
 go run ./cmd/forgelane version
 go run ./cmd/forgelane init --repo-url https://github.com/owner/repo
+go run ./cmd/forgelane init --repo-url https://github.com/owner/repo --with-workflow
 go run ./cmd/forgelane init --repo-url https://gitlab.com/group/project
 go run ./cmd/forgelane init --provider gitlab --repo-url https://gitlab.example.com/group/project.git
+go run ./cmd/forgelane workflow init
 go run ./cmd/forgelane work-items import github://github.com/owner/repo/issues/123
 go run ./cmd/forgelane work-items import gitlab://gitlab.com/group/project/issues/123
 go run ./cmd/forgelane work-items import gitlab://gitlab.example.com/group/project/issues/123
@@ -144,6 +146,16 @@ compact audit Event. `work-items show` reads only that local snapshot; run
 suite uses fake WorkItem providers and does not require network access or
 credentials.
 
+`init` writes instance config to `~/.forgelane/forgelane.db`, not to the target
+repository. When `forgelane.workflow.json` is missing, plain `init` prints the
+explicit command to create it but does not modify the repository. Use
+`workflow init` or `init --with-workflow` to opt in to the repo-owned workflow
+contract. The contract is written at the Git repository root and is
+version-controlled repository guidance: default AgentAdapter preset, semantic
+tracker label mappings, test command, evidence requirements, approval policy
+hints, and automation notes. It must not contain secrets, local paths, run ids,
+last errors, or other instance/run state.
+
 `runs create` creates a new planned AgentRun, a succeeded `start`
 ControlAction, and an immutable RunSpec snapshot. `runs prepare` allocates a
 RunnerJob and Workspace under `~/.forgelane/workspaces/run-<id>/`, clones the
@@ -154,6 +166,13 @@ ChangeProvider to push the ForgeLane-managed branch and create or update the
 draft PR/MR. `runs start` performs the create, prepare, execute, materialize,
 push, and draft PR/MR path in one command. `events list --run` reads the
 AgentRun timeline from SQLite without contacting providers.
+
+When a workflow contract exists, new RunSpecs use its default AgentAdapter
+preset unless the operator passes `--agent-preset`. Without a contract, manual
+`runs create` and `runs start` continue with built-in defaults and do not check
+tracker label eligibility. The default contract documents that future automated
+watcher behavior can use the contract's trigger and readiness label mappings;
+that watcher is not part of the current CLI delivery loop.
 
 Provider mutation credentials belong to the provider boundary, not the
 AgentAdapter process. GitHub delivery reads `FORGELANE_GITHUB_TOKEN` first and

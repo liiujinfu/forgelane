@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"github.com/liiujinfu/forgelane/internal/repositoryconfig"
 	"github.com/liiujinfu/forgelane/internal/version"
 	"github.com/liiujinfu/forgelane/internal/workflow"
+	"github.com/liiujinfu/forgelane/internal/workflowcontract"
 	"github.com/liiujinfu/forgelane/internal/workitems"
 	"github.com/spf13/cobra"
 )
@@ -53,6 +55,7 @@ func NewRootCommand(options Options) *cobra.Command {
 	root.SetVersionTemplate("{{.Name}} version {{.Version}}\n")
 
 	root.AddCommand(newInitCommand(stdout))
+	root.AddCommand(newWorkflowCommand(stdout))
 	root.AddCommand(newVersionCommand(stdout))
 	root.AddCommand(newWorkItemsCommand(stdout, options))
 	root.AddCommand(newRunsCommand(stdout, options))
@@ -63,6 +66,7 @@ func NewRootCommand(options Options) *cobra.Command {
 
 func newInitCommand(stdout io.Writer) *cobra.Command {
 	var options repositoryconfig.InitOptions
+	var withWorkflow bool
 
 	cmd := &cobra.Command{
 		Use:   "init",
@@ -73,16 +77,71 @@ func newInitCommand(stdout io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(stdout, "Configured ForgeProject %s\n", repositoryconfig.ForgeProjectRef(forgeProject))
-			return err
+			if _, err := fmt.Fprintf(stdout, "Configured ForgeProject %s\n", repositoryconfig.ForgeProjectRef(forgeProject)); err != nil {
+				return err
+			}
+			if withWorkflow {
+				root, err := workflowcontract.RepositoryRoot("")
+				if err != nil {
+					return err
+				}
+				return createDefaultWorkflowContract(stdout, root)
+			}
+			root, err := workflowcontract.RepositoryRoot("")
+			if err == nil {
+				workflowExists, err := workflowcontract.Exists(root)
+				if err != nil {
+					return err
+				}
+				if !workflowExists {
+					_, err = fmt.Fprintf(stdout, "Workflow contract missing; run `forgelane workflow init` or `forgelane init --with-workflow` to create %s\n", workflowcontract.FileName)
+					return err
+				}
+			} else if !errors.Is(err, workflowcontract.ErrRepositoryRootNotFound) {
+				return err
+			}
+			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&options.RepoURL, "repo-url", "", "Provider repository URL")
 	cmd.Flags().StringVar(&options.Provider, "provider", "", "WorkItem provider")
 	cmd.Flags().StringVar(&options.Repo, "repo", "", "Provider repository path")
+	cmd.Flags().BoolVar(&withWorkflow, "with-workflow", false, "Create the default repo-owned workflow contract")
 
 	return cmd
+}
+
+func newWorkflowCommand(stdout io.Writer) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "workflow",
+		Short: "Manage the repo-owned ForgeLane workflow contract.",
+	}
+	cmd.AddCommand(newWorkflowInitCommand(stdout))
+	return cmd
+}
+
+func newWorkflowInitCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "init",
+		Short: "Create the default repo-owned workflow contract.",
+		Args:  cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			root, err := workflowcontract.RepositoryRoot("")
+			if err != nil {
+				return err
+			}
+			return createDefaultWorkflowContract(stdout, root)
+		},
+	}
+}
+
+func createDefaultWorkflowContract(stdout io.Writer, repositoryRoot string) error {
+	if err := workflowcontract.InitDefault(repositoryRoot); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "Created workflow contract %s\n", workflowcontract.FileName)
+	return err
 }
 
 func newVersionCommand(stdout io.Writer) *cobra.Command {
