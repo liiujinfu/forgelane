@@ -12,6 +12,11 @@ ForgeLane is an agentic software delivery control plane.
 - Change set: the branch and draft PR produced or updated by an agent run.
 - Agent adapter: the boundary that invokes a specific coding agent or command
   from a run spec.
+- Run attention loop: ForgeLane-owned interaction state that lets an AgentRun
+  wait for user feedback or approval through ControlAction/Event history instead
+  of interactive AgentAdapter process input.
+- Run attention request: a pending AgentRun-targeted ControlAction asking for
+  feedback or approval; it is resolved by user feedback, approval, or rejection.
 - Change provider: the boundary that mutates provider-owned delivery artifacts
   such as branches and PRs after ForgeLane records the matching ControlAction.
 - Control action: a human action such as stop, retry, request changes, close, or
@@ -75,6 +80,12 @@ ForgeLane is an agentic software delivery control plane.
   degrading to TargetRepository-only config.
 - ForgeLane owns run state, control actions, approvals, events, logs,
   workspaces, and artifacts.
+- Run attention feedback and approval are ForgeLane-owned AgentRun state. User
+  responses must enter through ControlAction/Event records, not by attaching
+  stdin or hidden interaction channels to the AgentAdapter process.
+- Run attention approval is distinct from provider mutation approval or
+  ChangeSet approval. Provider branch and PR/MR mutations remain ChangeProvider
+  responsibilities after ForgeLane records the matching ControlAction boundary.
 - AgentRun and RunnerJob command execution use explicit runtime states:
   `running`, `completed`, `failed`, `timed_out`, and `cancelled`. Runtime
   `cancelled` means the executing command context was cancelled; it does not by

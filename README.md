@@ -124,6 +124,10 @@ go run ./cmd/forgelane runs start gitlab://gitlab.com/group/project/issues/123 -
 go run ./cmd/forgelane runs show 1
 go run ./cmd/forgelane runs prepare 1
 go run ./cmd/forgelane runs execute 1
+go run ./cmd/forgelane runs request-attention 1 feedback "Which test boundary should I use?"
+go run ./cmd/forgelane runs send 1 "Use the CLI boundary."
+go run ./cmd/forgelane runs request-attention 1 approval "May I continue with the requested cleanup?"
+go run ./cmd/forgelane runs approve 1 approve "Approved for this run."
 go run ./cmd/forgelane runs evidence 1
 go run ./cmd/forgelane runs logs 1
 go run ./cmd/forgelane events list --run 1
@@ -162,6 +166,13 @@ request write, and issue read capabilities. GitLab tokens need API access for
 issues/MRs plus write repository access for Git push. Branch push uses git
 transport with a temporary credential helper, not persisted token URLs and not
 `gh`/`glab`.
+
+The Run attention loop records pending feedback or approval requests as
+AgentRun-targeted ControlActions and Events. `runs show` surfaces pending
+attention, `runs send` answers feedback requests, and `runs approve` approves
+or rejects approval requests. These user responses enter ForgeLane state rather
+than the AgentAdapter process stdin. Provider mutation approval remains a
+separate ChangeSet/ChangeProvider boundary.
 
 ## Agent Development Workflow
 

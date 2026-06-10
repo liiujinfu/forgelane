@@ -729,6 +729,309 @@ func TestRunsShowDisplaysAgentRunDetailFromLocalState(t *testing.T) {
 	}
 }
 
+func TestRunsAttentionRecordsFeedbackRequestAndAnswer(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Request user attention",
+			Body:                "Runs can wait for human feedback without process stdin.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+
+	createStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "create", "github://github.com/owner/repo/issues/123")
+	if err != nil {
+		t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	runID := extractCreatedAgentRunID(t, createStdout)
+
+	requestStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "request-attention", strconv.FormatInt(runID, 10), "feedback", "Which test boundary should I use?")
+	if err != nil {
+		t.Fatalf("expected feedback attention request to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Requested feedback for AgentRun 1",
+		"Status: requested",
+		"ControlAction ID:",
+		"Event: control_action.requested",
+		"Event: run_attention.feedback_requested",
+	} {
+		if !strings.Contains(requestStdout, want) {
+			t.Fatalf("expected request output to contain %q, got:\n%s", want, requestStdout)
+		}
+	}
+
+	showStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "show", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs show to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	for _, want := range []string{
+		"Pending attention:",
+		"- feedback #2: Which test boundary should I use?",
+		"Next: forgelane runs send 1 <message>",
+	} {
+		if !strings.Contains(showStdout, want) {
+			t.Fatalf("expected runs show output to contain %q, got:\n%s", want, showStdout)
+		}
+	}
+
+	sendStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "send", strconv.FormatInt(runID, 10), "Use the CLI boundary.")
+	if err != nil {
+		t.Fatalf("expected runs send to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Sent feedback for AgentRun 1",
+		"Resolved attention request: 2",
+		"ControlAction ID:",
+		"Event: control_action.succeeded",
+		"Event: run_attention.feedback_sent",
+	} {
+		if !strings.Contains(sendStdout, want) {
+			t.Fatalf("expected send output to contain %q, got:\n%s", want, sendStdout)
+		}
+	}
+
+	showStdout, stderr, err = executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "show", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected runs show to succeed after feedback: %v\nstderr:\n%s", err, stderr)
+	}
+	if strings.Contains(showStdout, "Pending attention:") {
+		t.Fatalf("expected feedback answer to clear pending attention, got:\n%s", showStdout)
+	}
+
+	eventsStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "events", "list", "--run", strconv.FormatInt(runID, 10))
+	if err != nil {
+		t.Fatalf("expected events list to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	assertInOrder(t, eventsStdout, []string{
+		"run_attention.feedback_requested",
+		"run_attention.feedback_sent",
+	})
+	assertTableCount(t, homeDir, "control_actions", 3)
+	actions := readControlActions(t, homeDir)
+	assertControlAction(t, actions[1], "request_feedback", "succeeded", "agent", map[string]any{
+		"kind":    "feedback",
+		"message": "Which test boundary should I use?",
+	})
+	assertControlAction(t, actions[2], "send_feedback", "succeeded", "local", map[string]any{
+		"request_control_action_id": float64(2),
+		"message":                   "Use the CLI boundary.",
+	})
+	requestResolutionEvent := readEventPayloadForControlAction(t, homeDir, "control_action.succeeded", 2)
+	if got := requestResolutionEvent["control_action_id"]; got != float64(2) {
+		t.Fatalf("expected request resolution Event to target request ControlAction 2, got %#v", requestResolutionEvent)
+	}
+	if got := requestResolutionEvent["resolved_by_control_action_id"]; got != float64(3) {
+		t.Fatalf("expected request resolution Event to reference response ControlAction 3, got %#v", requestResolutionEvent)
+	}
+	if got := requestResolutionEvent["status"]; got != "succeeded" {
+		t.Fatalf("expected request resolution Event status succeeded, got %#v", requestResolutionEvent)
+	}
+	feedbackEvent := readEventPayload(t, homeDir, "run_attention.feedback_sent")
+	if got := feedbackEvent["message"]; got != "Use the CLI boundary." {
+		t.Fatalf("expected feedback Event payload to include answer, got %#v", feedbackEvent)
+	}
+	if got := feedbackEvent["request_control_action_id"]; got != float64(2) {
+		t.Fatalf("expected feedback Event payload to reference request ControlAction 2, got %#v", feedbackEvent)
+	}
+}
+
+func TestRunsAttentionResolvesApprovalRequest(t *testing.T) {
+	tests := []struct {
+		action      string
+		wantOutput  []string
+		wantEvents  []string
+		clearsState bool
+	}{
+		{
+			action: "approve",
+			wantOutput: []string{
+				"Approved attention request for AgentRun 1",
+				"Resolved attention request: 2",
+				"ControlAction ID:",
+				"Event: control_action.succeeded",
+				"Event: run_attention.approval_approved",
+			},
+			wantEvents: []string{
+				"run_attention.approval_requested",
+				"run_attention.approval_approved",
+			},
+			clearsState: true,
+		},
+		{
+			action: "reject",
+			wantOutput: []string{
+				"Rejected attention request for AgentRun 1",
+				"Resolved attention request: 2",
+				"ControlAction ID:",
+				"Event: control_action.succeeded",
+				"Event: run_attention.approval_rejected",
+			},
+			wantEvents: []string{
+				"run_attention.approval_requested",
+				"run_attention.approval_rejected",
+			},
+			clearsState: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.action, func(t *testing.T) {
+			workingDir := t.TempDir()
+			homeDir := t.TempDir()
+			withWorkingDir(t, workingDir)
+			withHomeDir(t, homeDir)
+
+			fakeProvider := &recordingWorkItemProvider{
+				issue: workitems.ProviderIssue{
+					ProviderRef:         "github://github.com/owner/repo/issues/123",
+					RepositoryRef:       "github://github.com/owner/repo",
+					Provider:            "github",
+					ProviderIssueNumber: 123,
+					Title:               "Resolve approval attention",
+					Body:                "Runs can wait for human approval without process stdin.",
+					Status:              "open",
+					RawStatus:           "open",
+					URL:                 "https://github.com/owner/repo/issues/123",
+					ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+				},
+			}
+
+			createStdout, stderr, err := executeForTestWithOptions(t, Options{
+				WorkItemProvider: fakeProvider,
+			}, "runs", "create", "github://github.com/owner/repo/issues/123")
+			if err != nil {
+				t.Fatalf("expected runs create to succeed: %v\nstderr:\n%s", err, stderr)
+			}
+			runID := extractCreatedAgentRunID(t, createStdout)
+
+			if _, stderr, err := executeForTestWithOptions(t, Options{
+				WorkItemProvider: fakeProvider,
+			}, "runs", "request-attention", strconv.FormatInt(runID, 10), "approval", "May I continue with the requested cleanup?"); err != nil {
+				t.Fatalf("expected approval attention request to succeed: %v\nstderr:\n%s", err, stderr)
+			}
+
+			showStdout, stderr, err := executeForTestWithOptions(t, Options{
+				WorkItemProvider: fakeProvider,
+			}, "runs", "show", strconv.FormatInt(runID, 10))
+			if err != nil {
+				t.Fatalf("expected runs show to succeed: %v\nstderr:\n%s", err, stderr)
+			}
+			for _, want := range []string{
+				"Pending attention:",
+				"- approval #2: May I continue with the requested cleanup?",
+				"Next: forgelane runs approve 1 <approve|reject>",
+			} {
+				if !strings.Contains(showStdout, want) {
+					t.Fatalf("expected runs show output to contain %q, got:\n%s", want, showStdout)
+				}
+			}
+
+			approveStdout, stderr, err := executeForTestWithOptions(t, Options{
+				WorkItemProvider: fakeProvider,
+			}, "runs", "approve", strconv.FormatInt(runID, 10), tt.action, "Decision note")
+			if err != nil {
+				t.Fatalf("expected runs approve %s to succeed: %v\nstderr:\n%s", tt.action, err, stderr)
+			}
+			if stderr != "" {
+				t.Fatalf("expected no stderr, got %q", stderr)
+			}
+			for _, want := range tt.wantOutput {
+				if !strings.Contains(approveStdout, want) {
+					t.Fatalf("expected runs approve output to contain %q, got:\n%s", want, approveStdout)
+				}
+			}
+
+			showStdout, stderr, err = executeForTestWithOptions(t, Options{
+				WorkItemProvider: fakeProvider,
+			}, "runs", "show", strconv.FormatInt(runID, 10))
+			if err != nil {
+				t.Fatalf("expected runs show to succeed after approval decision: %v\nstderr:\n%s", err, stderr)
+			}
+			if tt.clearsState && strings.Contains(showStdout, "Pending attention:") {
+				t.Fatalf("expected approval decision to clear pending attention, got:\n%s", showStdout)
+			}
+
+			eventsStdout, stderr, err := executeForTestWithOptions(t, Options{
+				WorkItemProvider: fakeProvider,
+			}, "events", "list", "--run", strconv.FormatInt(runID, 10))
+			if err != nil {
+				t.Fatalf("expected events list to succeed: %v\nstderr:\n%s", err, stderr)
+			}
+			assertInOrder(t, eventsStdout, tt.wantEvents)
+			assertTableCount(t, homeDir, "control_actions", 3)
+			actions := readControlActions(t, homeDir)
+			resolvedRequestStatus := "succeeded"
+			if tt.action == "reject" {
+				resolvedRequestStatus = "rejected"
+			}
+			assertControlAction(t, actions[1], "request_approval", resolvedRequestStatus, "agent", map[string]any{
+				"kind":    "approval",
+				"message": "May I continue with the requested cleanup?",
+			})
+			assertControlAction(t, actions[2], tt.action, "succeeded", "local", map[string]any{
+				"request_control_action_id": float64(2),
+				"decision":                  tt.action,
+				"message":                   "Decision note",
+			})
+			requestResolutionEventType := "control_action.succeeded"
+			if tt.action == "reject" {
+				requestResolutionEventType = "control_action.rejected"
+			}
+			requestResolutionEvent := readEventPayloadForControlAction(t, homeDir, requestResolutionEventType, 2)
+			if got := requestResolutionEvent["control_action_id"]; got != float64(2) {
+				t.Fatalf("expected request resolution Event to target request ControlAction 2, got %#v", requestResolutionEvent)
+			}
+			if got := requestResolutionEvent["resolved_by_control_action_id"]; got != float64(3) {
+				t.Fatalf("expected request resolution Event to reference response ControlAction 3, got %#v", requestResolutionEvent)
+			}
+			if got := requestResolutionEvent["status"]; got != resolvedRequestStatus {
+				t.Fatalf("expected request resolution Event status %q, got %#v", resolvedRequestStatus, requestResolutionEvent)
+			}
+			eventType := "run_attention.approval_approved"
+			if tt.action == "reject" {
+				eventType = "run_attention.approval_rejected"
+			}
+			approvalEvent := readEventPayload(t, homeDir, eventType)
+			if got := approvalEvent["decision"]; got != tt.action {
+				t.Fatalf("expected approval Event payload decision %q, got %#v", tt.action, approvalEvent)
+			}
+			if got := approvalEvent["request_control_action_id"]; got != float64(2) {
+				t.Fatalf("expected approval Event payload to reference request ControlAction 2, got %#v", approvalEvent)
+			}
+		})
+	}
+}
+
 func TestEventsListRunDisplaysOrderedAgentRunTimeline(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -3332,6 +3635,98 @@ func assertTableCount(t *testing.T, homeDir string, table string, want int) {
 	if got != want {
 		t.Fatalf("unexpected %s count: got %d, want %d", table, got, want)
 	}
+}
+
+type controlActionAudit struct {
+	actionType  string
+	status      string
+	requestedBy string
+	input       map[string]any
+}
+
+func readControlActions(t *testing.T, homeDir string) []controlActionAudit {
+	t.Helper()
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	rows, err := db.Query("SELECT type, status, requested_by, input FROM control_actions ORDER BY id")
+	if err != nil {
+		t.Fatalf("query ControlActions: %v", err)
+	}
+	defer rows.Close()
+
+	var actions []controlActionAudit
+	for rows.Next() {
+		var action controlActionAudit
+		var inputJSON string
+		if err := rows.Scan(&action.actionType, &action.status, &action.requestedBy, &inputJSON); err != nil {
+			t.Fatalf("scan ControlAction: %v", err)
+		}
+		if err := json.Unmarshal([]byte(inputJSON), &action.input); err != nil {
+			t.Fatalf("decode ControlAction input %q: %v", inputJSON, err)
+		}
+		actions = append(actions, action)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate ControlActions: %v", err)
+	}
+	return actions
+}
+
+func assertControlAction(t *testing.T, action controlActionAudit, wantType string, wantStatus string, wantRequestedBy string, wantInput map[string]any) {
+	t.Helper()
+
+	if action.actionType != wantType || action.status != wantStatus || action.requestedBy != wantRequestedBy {
+		t.Fatalf("unexpected ControlAction: got type=%q status=%q requested_by=%q input=%#v; want type=%q status=%q requested_by=%q",
+			action.actionType,
+			action.status,
+			action.requestedBy,
+			action.input,
+			wantType,
+			wantStatus,
+			wantRequestedBy,
+		)
+	}
+	for key, want := range wantInput {
+		if got := action.input[key]; got != want {
+			t.Fatalf("expected ControlAction %s input[%q] = %#v, got %#v in %#v", wantType, key, want, got, action.input)
+		}
+	}
+}
+
+func readEventPayload(t *testing.T, homeDir string, eventType string) map[string]any {
+	t.Helper()
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	var payloadJSON string
+	if err := db.QueryRow("SELECT payload FROM events WHERE type = ? ORDER BY id DESC LIMIT 1", eventType).Scan(&payloadJSON); err != nil {
+		t.Fatalf("query Event payload %s: %v", eventType, err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		t.Fatalf("decode Event payload %s: %v\n%s", eventType, err, payloadJSON)
+	}
+	return payload
+}
+
+func readEventPayloadForControlAction(t *testing.T, homeDir string, eventType string, controlActionID int64) map[string]any {
+	t.Helper()
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	var payloadJSON string
+	if err := db.QueryRow("SELECT payload FROM events WHERE type = ? AND control_action_id = ? ORDER BY id DESC LIMIT 1", eventType, controlActionID).Scan(&payloadJSON); err != nil {
+		t.Fatalf("query Event payload %s for ControlAction %d: %v", eventType, controlActionID, err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		t.Fatalf("decode Event payload %s for ControlAction %d: %v\n%s", eventType, controlActionID, err, payloadJSON)
+	}
+	return payload
 }
 
 func assertLogSegmentStreams(t *testing.T, homeDir string, wantStreams []string) {
