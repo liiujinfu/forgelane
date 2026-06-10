@@ -80,6 +80,33 @@ func TestRunnerReportsNonZeroExitWhilePreservingLogs(t *testing.T) {
 	}
 }
 
+func TestRunnerDoesNotAttachInteractiveStdin(t *testing.T) {
+	workspace := t.TempDir()
+	plan := workflow.AgentCommandPlan{
+		Executable:       "sh",
+		Args:             []string{"-c", "if read -r line; then printf 'stdin=%s\\n' \"$line\"; else printf 'stdin=closed\\n'; fi"},
+		WorkingDirectory: workspace,
+		Env:              []string{"PATH=" + os.Getenv("PATH")},
+		StdoutPath:       filepath.Join(workspace, "logs", "stdout.log"),
+		StderrPath:       filepath.Join(workspace, "logs", "stderr.log"),
+	}
+
+	result, err := (processrunner.Runner{}).RunAgentCommand(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("run command: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("expected stdin check to exit cleanly, got %d", result.ExitCode)
+	}
+	content, err := os.ReadFile(plan.StdoutPath)
+	if err != nil {
+		t.Fatalf("read stdout log: %v", err)
+	}
+	if string(content) != "stdin=closed\n" {
+		t.Fatalf("expected AgentAdapter process stdin to be closed, got %q", string(content))
+	}
+}
+
 func TestRunnerStopsCommandWhenContextTimesOut(t *testing.T) {
 	workspace := t.TempDir()
 	plan := workflow.AgentCommandPlan{

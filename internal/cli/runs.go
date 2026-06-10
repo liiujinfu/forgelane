@@ -32,6 +32,9 @@ func newRunsCommand(stdout io.Writer, options Options) *cobra.Command {
 	cmd.AddCommand(newRunsPrepareCommand(stdout))
 	cmd.AddCommand(newRunsExecuteCommand(stdout, options))
 	cmd.AddCommand(newRunsStopCommand(stdout))
+	cmd.AddCommand(newRunsRequestAttentionCommand(stdout))
+	cmd.AddCommand(newRunsSendCommand(stdout))
+	cmd.AddCommand(newRunsApproveCommand(stdout))
 	cmd.AddCommand(newRunsRetryCommand(stdout))
 	cmd.AddCommand(newRunsLogsCommand(stdout))
 	return cmd
@@ -282,6 +285,91 @@ func newRunsStopCommand(stdout io.Writer) *cobra.Command {
 	}
 }
 
+func newRunsRequestAttentionCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "request-attention <run_id> <feedback|approval> <message>",
+		Short: "Record pending user attention for an AgentRun.",
+		Args:  cobra.ExactArgs(3),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+
+			instanceStore, err := openInitializedStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			result, err := workflow.RequestAgentRunAttention(instanceStore, runID, args[1], args[2])
+			if err != nil {
+				return err
+			}
+			printRequestedRunAttention(stdout, result)
+			return nil
+		},
+	}
+}
+
+func newRunsSendCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "send <run_id> <message>",
+		Short: "Send feedback to a pending AgentRun attention request.",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+
+			instanceStore, err := openInitializedStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			result, err := workflow.SendAgentRunFeedback(instanceStore, runID, args[1])
+			if err != nil {
+				return err
+			}
+			printSentRunFeedback(stdout, result)
+			return nil
+		},
+	}
+}
+
+func newRunsApproveCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "approve <run_id> <approve|reject> [message]",
+		Short: "Approve or reject a pending AgentRun approval request.",
+		Args:  cobra.RangeArgs(2, 3),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+			message := ""
+			if len(args) == 3 {
+				message = args[2]
+			}
+
+			instanceStore, err := openInitializedStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			result, err := workflow.ResolveAgentRunApproval(instanceStore, runID, args[1], message)
+			if err != nil {
+				return err
+			}
+			printResolvedRunApproval(stdout, result)
+			return nil
+		},
+	}
+}
+
 func newRunsRetryCommand(stdout io.Writer) *cobra.Command {
 	return &cobra.Command{
 		Use:   "retry <run_id>",
@@ -499,6 +587,43 @@ func printStoppedAgentRun(stdout io.Writer, result workflow.AgentRunControlResul
 	}
 }
 
+func printRequestedRunAttention(stdout io.Writer, result workflow.AgentRunAttentionResult) {
+	fmt.Fprintf(stdout, "Requested %s for AgentRun %d\n", result.Attention.Kind, result.AgentRun.ID)
+	fmt.Fprintf(stdout, "Status: %s\n", result.ControlAction.Status)
+	fmt.Fprintf(stdout, "ControlAction ID: %d\n", result.ControlAction.ID)
+	for _, event := range result.Events {
+		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
+		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
+	}
+}
+
+func printSentRunFeedback(stdout io.Writer, result workflow.AgentRunAttentionResponseResult) {
+	fmt.Fprintf(stdout, "Sent feedback for AgentRun %d\n", result.AgentRun.ID)
+	fmt.Fprintf(stdout, "Resolved attention request: %d\n", result.ResolvedAttention.ControlActionID)
+	fmt.Fprintf(stdout, "ControlAction ID: %d\n", result.ControlAction.ID)
+	for _, event := range result.Events {
+		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
+		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
+	}
+}
+
+func printResolvedRunApproval(stdout io.Writer, result workflow.AgentRunAttentionResponseResult) {
+	switch result.Decision {
+	case "approve":
+		fmt.Fprintf(stdout, "Approved attention request for AgentRun %d\n", result.AgentRun.ID)
+	case "reject":
+		fmt.Fprintf(stdout, "Rejected attention request for AgentRun %d\n", result.AgentRun.ID)
+	default:
+		fmt.Fprintf(stdout, "Resolved attention request for AgentRun %d\n", result.AgentRun.ID)
+	}
+	fmt.Fprintf(stdout, "Resolved attention request: %d\n", result.ResolvedAttention.ControlActionID)
+	fmt.Fprintf(stdout, "ControlAction ID: %d\n", result.ControlAction.ID)
+	for _, event := range result.Events {
+		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
+		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
+	}
+}
+
 func printRetriedAgentRun(stdout io.Writer, priorRunID int64, result workflow.AgentRunCreateResult) {
 	fmt.Fprintf(stdout, "Retried AgentRun %d as AgentRun %d\n", priorRunID, result.AgentRun.ID)
 	fmt.Fprintf(stdout, "Status: %s\n", result.AgentRun.Status)
@@ -609,6 +734,18 @@ func printAgentRunDetail(stdout io.Writer, detail store.AgentRunDetail) error {
 		fmt.Fprintf(stdout, "ChangeSet active run: %d\n", detail.ChangeSet.ActiveRunID)
 		fmt.Fprintf(stdout, "ChangeSet commits: %d\n", len(detail.ChangeSet.CommitRefs))
 		printChangeSetProviderRefs(stdout, *detail.ChangeSet)
+	}
+	if len(detail.PendingAttention) > 0 {
+		fmt.Fprintln(stdout, "Pending attention:")
+		for _, attention := range detail.PendingAttention {
+			fmt.Fprintf(stdout, "- %s #%d: %s\n", attention.Kind, attention.ControlActionID, attention.Message)
+			switch attention.Kind {
+			case "feedback":
+				fmt.Fprintf(stdout, "Next: forgelane runs send %d <message>\n", detail.AgentRun.ID)
+			case "approval":
+				fmt.Fprintf(stdout, "Next: forgelane runs approve %d <approve|reject>\n", detail.AgentRun.ID)
+			}
+		}
 	}
 	return nil
 }

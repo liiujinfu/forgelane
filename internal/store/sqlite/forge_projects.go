@@ -727,7 +727,73 @@ WHERE agent_runs.id = ?`
 	}
 	detail.DeliverySkipped = deliverySkipped
 	detail.DeliverySkipReason = deliverySkipReason
+	pendingAttention, err := store.listPendingAttentionForAgentRun(id)
+	if err != nil {
+		return AgentRunDetail{}, err
+	}
+	detail.PendingAttention = pendingAttention
 	return detail, nil
+}
+
+func (store *Store) listPendingAttentionForAgentRun(agentRunID int64) ([]workflow.RunAttentionRequest, error) {
+	targetRef := fmt.Sprintf("agent_run:%d", agentRunID)
+	rows, err := store.db.Query(`
+SELECT id, type, requested_by, input, created_at
+FROM control_actions
+WHERE target_type = 'agent_run'
+	AND target_ref = ?
+	AND status = 'requested'
+	AND type IN ('request_feedback', 'request_approval')
+ORDER BY id ASC`, targetRef)
+	if err != nil {
+		return nil, fmt.Errorf("query pending Run attention for AgentRun %d: %w", agentRunID, err)
+	}
+	defer rows.Close()
+
+	var pending []workflow.RunAttentionRequest
+	for rows.Next() {
+		var id int64
+		var actionType string
+		var requestedBy string
+		var inputJSON string
+		var createdAt string
+		if err := rows.Scan(&id, &actionType, &requestedBy, &inputJSON, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan pending Run attention for AgentRun %d: %w", agentRunID, err)
+		}
+		var input struct {
+			Kind    string `json:"kind"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
+			return nil, fmt.Errorf("decode pending Run attention %d: %w", id, err)
+		}
+		kind := input.Kind
+		if kind == "" {
+			kind = attentionKindFromActionType(actionType)
+		}
+		pending = append(pending, workflow.RunAttentionRequest{
+			ControlActionID: id,
+			Kind:            kind,
+			Message:         input.Message,
+			RequestedBy:     requestedBy,
+			CreatedAt:       createdAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending Run attention for AgentRun %d: %w", agentRunID, err)
+	}
+	return pending, nil
+}
+
+func attentionKindFromActionType(actionType string) string {
+	switch actionType {
+	case "request_feedback":
+		return "feedback"
+	case "request_approval":
+		return "approval"
+	default:
+		return ""
+	}
 }
 
 func (store *Store) getDeliverySkipForAgentRun(agentRunID int64) (bool, string, error) {
@@ -2739,6 +2805,422 @@ func appendControlActionEventRefTx(tx *sql.Tx, controlActionID int64, eventID in
 		return fmt.Errorf("update ControlAction %d result Event refs: %w", controlActionID, err)
 	}
 	return nil
+}
+
+// RequestAgentRunAttention records a pending user-attention request for an AgentRun.
+func (store *Store) RequestAgentRunAttention(agentRunID int64, plan workflow.RunAttentionRequestPlan) (workflow.AgentRunAttentionResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return workflow.AgentRunAttentionResult{}, err
+	}
+	actionType, requestEventType, err := attentionRequestTypes(plan.Kind)
+	if err != nil {
+		return workflow.AgentRunAttentionResult{}, err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return workflow.AgentRunAttentionResult{}, fmt.Errorf("begin Run attention request transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	actionInput, err := json.Marshal(map[string]any{
+		"agent_run_id": agentRunID,
+		"kind":         plan.Kind,
+		"message":      plan.Message,
+	})
+	if err != nil {
+		return workflow.AgentRunAttentionResult{}, fmt.Errorf("encode Run attention request input: %w", err)
+	}
+	actionResult, err := tx.Exec(`
+INSERT INTO control_actions (
+	type,
+	target_type,
+	target_ref,
+	requested_by,
+	reason,
+	input,
+	status,
+	created_at,
+	decided_at,
+	result_event_refs
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		actionType,
+		"agent_run",
+		fmt.Sprintf("agent_run:%d", agentRunID),
+		plan.RequestedBy,
+		plan.Reason,
+		string(actionInput),
+		"requested",
+		now,
+		nil,
+		"[]",
+	)
+	if err != nil {
+		return workflow.AgentRunAttentionResult{}, fmt.Errorf("insert Run attention ControlAction: %w", err)
+	}
+	controlActionID, err := actionResult.LastInsertId()
+	if err != nil {
+		return workflow.AgentRunAttentionResult{}, fmt.Errorf("read Run attention ControlAction id: %w", err)
+	}
+
+	controlEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "control_action.requested",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "control_action",
+		SubjectRef:      fmt.Sprintf("control_action:%d", controlActionID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"type":              actionType,
+			"status":            "requested",
+			"agent_run_id":      agentRunID,
+			"kind":              plan.Kind,
+		},
+	})
+	if err != nil {
+		return workflow.AgentRunAttentionResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, controlEvent.ID); err != nil {
+		return workflow.AgentRunAttentionResult{}, err
+	}
+	attentionEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            requestEventType,
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "agent_run",
+		SubjectRef:      fmt.Sprintf("agent_run:%d", agentRunID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"agent_run_id":      agentRunID,
+			"kind":              plan.Kind,
+			"message":           plan.Message,
+			"requested_by":      plan.RequestedBy,
+		},
+	})
+	if err != nil {
+		return workflow.AgentRunAttentionResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, attentionEvent.ID); err != nil {
+		return workflow.AgentRunAttentionResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return workflow.AgentRunAttentionResult{}, fmt.Errorf("commit Run attention request: %w", err)
+	}
+
+	return workflow.AgentRunAttentionResult{
+		ControlAction: workflow.ControlAction{
+			ID:     controlActionID,
+			Type:   actionType,
+			Status: "requested",
+		},
+		AgentRun: detail.AgentRun,
+		Attention: workflow.RunAttentionRequest{
+			ControlActionID: controlActionID,
+			Kind:            plan.Kind,
+			Message:         plan.Message,
+			RequestedBy:     plan.RequestedBy,
+			CreatedAt:       now,
+		},
+		Events: []workflow.Event{controlEvent, attentionEvent},
+	}, nil
+}
+
+// SendAgentRunFeedback records user feedback for the oldest pending feedback request.
+func (store *Store) SendAgentRunFeedback(agentRunID int64, plan workflow.RunAttentionResponsePlan) (workflow.AgentRunAttentionResponseResult, error) {
+	return store.resolveAgentRunAttention(agentRunID, attentionResolution{
+		Kind:                  "feedback",
+		ActionType:            "send_feedback",
+		RequestResolvedStatus: "succeeded",
+		AttentionEventType:    "run_attention.feedback_sent",
+		Message:               plan.Message,
+		RequestedBy:           plan.RequestedBy,
+		Reason:                plan.Reason,
+	})
+}
+
+// ResolveAgentRunApproval records an approve/reject decision for the oldest pending approval request.
+func (store *Store) ResolveAgentRunApproval(agentRunID int64, decision string, plan workflow.RunAttentionResponsePlan) (workflow.AgentRunAttentionResponseResult, error) {
+	resolvedStatus, attentionEventType, err := approvalDecisionTypes(decision)
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+	return store.resolveAgentRunAttention(agentRunID, attentionResolution{
+		Kind:                  "approval",
+		ActionType:            decision,
+		RequestResolvedStatus: resolvedStatus,
+		AttentionEventType:    attentionEventType,
+		Decision:              decision,
+		Message:               plan.Message,
+		RequestedBy:           plan.RequestedBy,
+		Reason:                plan.Reason,
+	})
+}
+
+type attentionResolution struct {
+	Kind                  string
+	ActionType            string
+	RequestResolvedStatus string
+	AttentionEventType    string
+	Decision              string
+	Message               string
+	RequestedBy           string
+	Reason                string
+}
+
+func (store *Store) resolveAgentRunAttention(agentRunID int64, resolution attentionResolution) (workflow.AgentRunAttentionResponseResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+	pending, err := store.oldestPendingAttentionForAgentRun(agentRunID, resolution.Kind)
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, fmt.Errorf("begin Run attention resolution transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	actionInputPayload := map[string]any{
+		"agent_run_id":              agentRunID,
+		"request_control_action_id": pending.ControlActionID,
+		"message":                   resolution.Message,
+	}
+	if resolution.Decision != "" {
+		actionInputPayload["decision"] = resolution.Decision
+	}
+	actionInput, err := json.Marshal(actionInputPayload)
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, fmt.Errorf("encode Run attention resolution input: %w", err)
+	}
+	actionResult, err := tx.Exec(`
+INSERT INTO control_actions (
+	type,
+	target_type,
+	target_ref,
+	requested_by,
+	reason,
+	input,
+	status,
+	created_at,
+	decided_at,
+	result_event_refs
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		resolution.ActionType,
+		"agent_run",
+		fmt.Sprintf("agent_run:%d", agentRunID),
+		resolution.RequestedBy,
+		resolution.Reason,
+		string(actionInput),
+		"succeeded",
+		now,
+		now,
+		"[]",
+	)
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, fmt.Errorf("insert Run attention resolution ControlAction: %w", err)
+	}
+	controlActionID, err := actionResult.LastInsertId()
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, fmt.Errorf("read Run attention resolution ControlAction id: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE control_actions SET status = ?, decided_at = ? WHERE id = ?", resolution.RequestResolvedStatus, now, pending.ControlActionID); err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, fmt.Errorf("resolve %s request ControlAction %d: %w", resolution.Kind, pending.ControlActionID, err)
+	}
+
+	requestActionType, _, err := attentionRequestTypes(resolution.Kind)
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+	requestControlEventType, err := controlActionStatusEventType(resolution.RequestResolvedStatus)
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+	controlEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "control_action.succeeded",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "control_action",
+		SubjectRef:      fmt.Sprintf("control_action:%d", controlActionID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		Payload: map[string]any{
+			"control_action_id":        controlActionID,
+			"type":                     resolution.ActionType,
+			"status":                   "succeeded",
+			"agent_run_id":             agentRunID,
+			"resolved_control_action":  pending.ControlActionID,
+			"resolved_attention_kind":  pending.Kind,
+			"resolved_attention_state": resolution.RequestResolvedStatus,
+		},
+	})
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, controlEvent.ID); err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+	requestControlEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            requestControlEventType,
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "control_action",
+		SubjectRef:      fmt.Sprintf("control_action:%d", pending.ControlActionID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: pending.ControlActionID,
+		Payload: map[string]any{
+			"control_action_id":             pending.ControlActionID,
+			"type":                          requestActionType,
+			"status":                        resolution.RequestResolvedStatus,
+			"agent_run_id":                  agentRunID,
+			"kind":                          pending.Kind,
+			"resolved_by_control_action_id": controlActionID,
+		},
+	})
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, pending.ControlActionID, requestControlEvent.ID); err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+	attentionPayload := map[string]any{
+		"control_action_id":         controlActionID,
+		"request_control_action_id": pending.ControlActionID,
+		"agent_run_id":              agentRunID,
+		"message":                   resolution.Message,
+		"requested_by":              resolution.RequestedBy,
+	}
+	if resolution.Decision != "" {
+		attentionPayload["decision"] = resolution.Decision
+	}
+	attentionEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            resolution.AttentionEventType,
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "agent_run",
+		SubjectRef:      fmt.Sprintf("agent_run:%d", agentRunID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		Payload:         attentionPayload,
+	})
+	if err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, attentionEvent.ID); err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, pending.ControlActionID, attentionEvent.ID); err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return workflow.AgentRunAttentionResponseResult{}, fmt.Errorf("commit Run attention resolution: %w", err)
+	}
+
+	return workflow.AgentRunAttentionResponseResult{
+		ControlAction: workflow.ControlAction{
+			ID:     controlActionID,
+			Type:   resolution.ActionType,
+			Status: "succeeded",
+		},
+		AgentRun:          detail.AgentRun,
+		ResolvedAttention: pending,
+		Decision:          resolution.Decision,
+		Events:            []workflow.Event{controlEvent, requestControlEvent, attentionEvent},
+	}, nil
+}
+
+func (store *Store) oldestPendingAttentionForAgentRun(agentRunID int64, kind string) (workflow.RunAttentionRequest, error) {
+	actionType, _, err := attentionRequestTypes(kind)
+	if err != nil {
+		return workflow.RunAttentionRequest{}, err
+	}
+	targetRef := fmt.Sprintf("agent_run:%d", agentRunID)
+	var pending workflow.RunAttentionRequest
+	var inputJSON string
+	err = store.db.QueryRow(`
+SELECT id, requested_by, input, created_at
+FROM control_actions
+WHERE target_type = 'agent_run'
+	AND target_ref = ?
+	AND status = 'requested'
+	AND type = ?
+ORDER BY id ASC
+LIMIT 1`, targetRef, actionType).Scan(
+		&pending.ControlActionID,
+		&pending.RequestedBy,
+		&inputJSON,
+		&pending.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return workflow.RunAttentionRequest{}, fmt.Errorf("AgentRun %d has no pending %s request", agentRunID, kind)
+	}
+	if err != nil {
+		return workflow.RunAttentionRequest{}, fmt.Errorf("query pending %s request for AgentRun %d: %w", kind, agentRunID, err)
+	}
+	var input struct {
+		Kind    string `json:"kind"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
+		return workflow.RunAttentionRequest{}, fmt.Errorf("decode pending %s request %d: %w", kind, pending.ControlActionID, err)
+	}
+	pending.Kind = input.Kind
+	pending.Message = input.Message
+	return pending, nil
+}
+
+func attentionRequestTypes(kind string) (string, string, error) {
+	switch kind {
+	case "feedback":
+		return "request_feedback", "run_attention.feedback_requested", nil
+	case "approval":
+		return "request_approval", "run_attention.approval_requested", nil
+	default:
+		return "", "", fmt.Errorf("unsupported Run attention kind %q", kind)
+	}
+}
+
+func approvalDecisionTypes(decision string) (string, string, error) {
+	switch decision {
+	case "approve":
+		return "succeeded", "run_attention.approval_approved", nil
+	case "reject":
+		return "rejected", "run_attention.approval_rejected", nil
+	default:
+		return "", "", fmt.Errorf("unsupported approval decision %q", decision)
+	}
+}
+
+func controlActionStatusEventType(status string) (string, error) {
+	switch status {
+	case "succeeded":
+		return "control_action.succeeded", nil
+	case "rejected":
+		return "control_action.rejected", nil
+	default:
+		return "", fmt.Errorf("unsupported ControlAction resolution status %q", status)
+	}
 }
 
 // RequestAgentRunStop records a human stop ControlAction and marks the AgentRun for cancellation.

@@ -283,6 +283,15 @@ type AgentRunControlResult struct {
 	Events        []Event
 }
 
+// RunAttentionRequest is a pending request for user attention attached to an AgentRun.
+type RunAttentionRequest struct {
+	ControlActionID int64
+	Kind            string
+	Message         string
+	RequestedBy     string
+	CreatedAt       string
+}
+
 // AgentRunDetail is the read model for inspecting one AgentRun.
 type AgentRunDetail struct {
 	AgentRun           AgentRun
@@ -293,6 +302,7 @@ type AgentRunDetail struct {
 	ChangeSet          *ChangeSet
 	DeliverySkipped    bool
 	DeliverySkipReason string
+	PendingAttention   []RunAttentionRequest
 }
 
 // AgentCommandPlanInput is the immutable RunSpec and Workspace context needed to plan a command.
@@ -404,6 +414,38 @@ type ControlAction struct {
 	Status string
 }
 
+// RunAttentionRequestPlan is the workflow decision for asking a user to unblock a Run.
+type RunAttentionRequestPlan struct {
+	Kind        string
+	Message     string
+	RequestedBy string
+	Reason      string
+}
+
+// RunAttentionResponsePlan is the workflow decision for answering a pending Run attention request.
+type RunAttentionResponsePlan struct {
+	Message     string
+	RequestedBy string
+	Reason      string
+}
+
+// AgentRunAttentionResult is the outcome of recording a pending Run attention request.
+type AgentRunAttentionResult struct {
+	ControlAction ControlAction
+	AgentRun      AgentRun
+	Attention     RunAttentionRequest
+	Events        []Event
+}
+
+// AgentRunAttentionResponseResult is the outcome of resolving a pending Run attention request.
+type AgentRunAttentionResponseResult struct {
+	ControlAction     ControlAction
+	AgentRun          AgentRun
+	ResolvedAttention RunAttentionRequest
+	Decision          string
+	Events            []Event
+}
+
 // WorkspacePreparationStore persists Workspace preparation state.
 type WorkspacePreparationStore interface {
 	GetAgentRunDetail(int64) (AgentRunDetail, error)
@@ -415,6 +457,17 @@ type WorkspacePreparationStore interface {
 // AgentRunControlStore persists human ControlActions and matching AgentRun Events.
 type AgentRunControlStore interface {
 	RequestAgentRunStop(int64, ControlActionPlan) (AgentRunControlResult, error)
+}
+
+// AgentRunAttentionStore persists pending user-attention requests for an AgentRun.
+type AgentRunAttentionStore interface {
+	RequestAgentRunAttention(int64, RunAttentionRequestPlan) (AgentRunAttentionResult, error)
+}
+
+// AgentRunAttentionResponseStore persists user responses to pending Run attention requests.
+type AgentRunAttentionResponseStore interface {
+	SendAgentRunFeedback(int64, RunAttentionResponsePlan) (AgentRunAttentionResponseResult, error)
+	ResolveAgentRunApproval(int64, string, RunAttentionResponsePlan) (AgentRunAttentionResponseResult, error)
 }
 
 // AgentRunRetryStore persists retry ControlActions and new AgentRun attempts.
@@ -435,6 +488,51 @@ func RequestAgentRunStop(store AgentRunControlStore, runID int64) (AgentRunContr
 			"agent_run_id": runID,
 		},
 		Status: "succeeded",
+	})
+}
+
+// RequestAgentRunAttention records a pending request for user feedback or approval.
+func RequestAgentRunAttention(store AgentRunAttentionStore, runID int64, kind string, message string) (AgentRunAttentionResult, error) {
+	kind = strings.TrimSpace(kind)
+	message = strings.TrimSpace(message)
+	if kind != "feedback" && kind != "approval" {
+		return AgentRunAttentionResult{}, fmt.Errorf("unsupported Run attention kind %q", kind)
+	}
+	if message == "" {
+		return AgentRunAttentionResult{}, fmt.Errorf("Run attention message is required")
+	}
+	return store.RequestAgentRunAttention(runID, RunAttentionRequestPlan{
+		Kind:        kind,
+		Message:     message,
+		RequestedBy: "agent",
+		Reason:      "forgelane runs request-attention",
+	})
+}
+
+// SendAgentRunFeedback records user feedback for the oldest pending feedback request on a Run.
+func SendAgentRunFeedback(store AgentRunAttentionResponseStore, runID int64, message string) (AgentRunAttentionResponseResult, error) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return AgentRunAttentionResponseResult{}, fmt.Errorf("feedback message is required")
+	}
+	return store.SendAgentRunFeedback(runID, RunAttentionResponsePlan{
+		Message:     message,
+		RequestedBy: "local",
+		Reason:      "forgelane runs send",
+	})
+}
+
+// ResolveAgentRunApproval approves or rejects the oldest pending approval request on a Run.
+func ResolveAgentRunApproval(store AgentRunAttentionResponseStore, runID int64, decision string, message string) (AgentRunAttentionResponseResult, error) {
+	decision = strings.TrimSpace(decision)
+	message = strings.TrimSpace(message)
+	if decision != "approve" && decision != "reject" {
+		return AgentRunAttentionResponseResult{}, fmt.Errorf("unsupported approval decision %q", decision)
+	}
+	return store.ResolveAgentRunApproval(runID, decision, RunAttentionResponsePlan{
+		Message:     message,
+		RequestedBy: "local",
+		Reason:      "forgelane runs approve",
 	})
 }
 
