@@ -965,7 +965,7 @@ func TestRequestAgentRunRetryCreatesNewRunSpecForTerminalRun(t *testing.T) {
 		t.Fatalf("expected prior AgentRun to be failed, got %q", failed.AgentRun.Status)
 	}
 
-	result, err := workflow.RequestAgentRunRetry(instanceStore, priorRunID)
+	result, err := workflow.RequestAgentRunRetry(instanceStore, priorRunID, workflow.RequestAgentRunRetryInput{})
 	if err != nil {
 		t.Fatalf("request AgentRun retry: %v", err)
 	}
@@ -997,6 +997,37 @@ func TestRequestAgentRunRetryCreatesNewRunSpecForTerminalRun(t *testing.T) {
 	}
 }
 
+func TestRequestAgentRunRetryUsesExplicitAgentPreset(t *testing.T) {
+	instanceStore, priorRunID := preparedAgentRun(t)
+	if _, err := workflow.ExecuteAgentRunCommand(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		nonZeroExitCommandRunner{},
+		priorRunID,
+	); err != nil {
+		t.Fatalf("fail prior AgentRun: %v", err)
+	}
+
+	result, err := workflow.RequestAgentRunRetry(instanceStore, priorRunID, workflow.RequestAgentRunRetryInput{
+		AgentPreset: "harmless-echo",
+	})
+	if err != nil {
+		t.Fatalf("request AgentRun retry: %v", err)
+	}
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(result.RunSpec.SpecJSON), &spec); err != nil {
+		t.Fatalf("decode retry RunSpec: %v\n%s", err, result.RunSpec.SpecJSON)
+	}
+	agentAdapter, ok := spec["agent_adapter"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected RunSpec agent_adapter object, got %#v", spec["agent_adapter"])
+	}
+	if got := agentAdapter["preset"]; got != "harmless-echo" {
+		t.Fatalf("expected retry RunSpec to use explicit preset, got %#v", got)
+	}
+}
+
 func TestRequestAgentRunRetryTargetsExistingActiveChangeSet(t *testing.T) {
 	instanceStore, priorRunID := preparedAgentRun(t)
 	completed, err := workflow.ExecuteAgentRunCommandAndMaterialize(
@@ -1014,7 +1045,7 @@ func TestRequestAgentRunRetryTargetsExistingActiveChangeSet(t *testing.T) {
 		t.Fatalf("expected prior AgentRun to create active ChangeSet")
 	}
 
-	result, err := workflow.RequestAgentRunRetry(instanceStore, priorRunID)
+	result, err := workflow.RequestAgentRunRetry(instanceStore, priorRunID, workflow.RequestAgentRunRetryInput{})
 	if err != nil {
 		t.Fatalf("request AgentRun retry: %v", err)
 	}
