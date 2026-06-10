@@ -1,4 +1,4 @@
-package github
+package gitlab
 
 import (
 	"bytes"
@@ -12,30 +12,30 @@ import (
 	"github.com/liiujinfu/forgelane/internal/workitems"
 )
 
-func TestIssueProviderReadsGitHubIssueSnapshot(t *testing.T) {
+func TestIssueProviderReadsGitLabIssueSnapshot(t *testing.T) {
 	client := fakeHTTPClient(func(r *http.Request) *http.Response {
-		if r.URL.Path != "/repos/owner/repo/issues/123" {
-			t.Fatalf("unexpected request path %s", r.URL.Path)
+		if r.URL.EscapedPath() != "/api/v4/projects/group%2Fsubgroup%2Fproject/issues/456" {
+			t.Fatalf("unexpected request path %s", r.URL.EscapedPath())
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
-			t.Fatalf("unexpected authorization header %q", got)
+		if got := r.Header.Get("PRIVATE-TOKEN"); got != "test-token" {
+			t.Fatalf("unexpected PRIVATE-TOKEN header %q", got)
 		}
 		return jsonResponse(http.StatusOK, `{
-			"number": 123,
-			"title": "Persist a GitHub WorkItem snapshot",
-			"body": "Import the provider-owned issue.",
-			"state": "open",
-			"html_url": "https://github.com/owner/repo/issues/123",
+			"iid": 456,
+			"title": "Persist a GitLab WorkItem snapshot",
+			"description": "Import the provider-owned GitLab issue.",
+			"state": "opened",
+			"web_url": "https://gitlab.com/group/subgroup/project/-/issues/456",
 			"updated_at": "2026-05-30T09:10:11Z"
 		}`)
 	})
 
 	provider := NewIssueProvider(Options{
-		BaseURL: "https://api.github.test",
+		BaseURL: "https://gitlab.test/api/v4",
 		Token:   "test-token",
 		Client:  client,
 	})
-	ref, err := workitems.ParseProviderRef("github://github.com/owner/repo/issues/123")
+	ref, err := workitems.ParseProviderRef("gitlab://gitlab.com/group/subgroup/project/issues/456")
 	if err != nil {
 		t.Fatalf("parse ProviderRef: %v", err)
 	}
@@ -45,22 +45,19 @@ func TestIssueProviderReadsGitHubIssueSnapshot(t *testing.T) {
 		t.Fatalf("expected issue read to succeed: %v", err)
 	}
 
-	if issue.ProviderRef != "github://github.com/owner/repo/issues/123" {
+	if issue.ProviderRef != "gitlab://gitlab.com/group/subgroup/project/issues/456" {
 		t.Fatalf("unexpected ProviderRef %q", issue.ProviderRef)
 	}
-	if issue.RepositoryRef != "github://github.com/owner/repo" {
+	if issue.RepositoryRef != "gitlab://gitlab.com/group/subgroup/project" {
 		t.Fatalf("unexpected RepositoryRef %q", issue.RepositoryRef)
 	}
-	if issue.ProviderIssueNumber != 123 {
+	if issue.ProviderIssueNumber != 456 {
 		t.Fatalf("unexpected issue number %d", issue.ProviderIssueNumber)
 	}
-	if issue.Title != "Persist a GitHub WorkItem snapshot" {
-		t.Fatalf("unexpected title %q", issue.Title)
+	if issue.Title != "Persist a GitLab WorkItem snapshot" || issue.Body != "Import the provider-owned GitLab issue." {
+		t.Fatalf("unexpected issue content %#v", issue)
 	}
-	if issue.Body != "Import the provider-owned issue." {
-		t.Fatalf("unexpected body %q", issue.Body)
-	}
-	if issue.Status != "open" || issue.RawStatus != "open" {
+	if issue.Status != "open" || issue.RawStatus != "opened" {
 		t.Fatalf("unexpected status %q raw %q", issue.Status, issue.RawStatus)
 	}
 	if !issue.ProviderUpdatedAt.Equal(time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC)) {
@@ -68,27 +65,27 @@ func TestIssueProviderReadsGitHubIssueSnapshot(t *testing.T) {
 	}
 }
 
-func TestIssueProviderPrefersForgeLaneGitHubToken(t *testing.T) {
-	t.Setenv("FORGELANE_GITHUB_TOKEN", "forgelane-token")
-	t.Setenv("GITHUB_TOKEN", "github-token")
+func TestIssueProviderPrefersForgeLaneGitLabToken(t *testing.T) {
+	t.Setenv("FORGELANE_GITLAB_TOKEN", "forgelane-token")
+	t.Setenv("GITLAB_TOKEN", "gitlab-token")
 
 	client := fakeHTTPClient(func(r *http.Request) *http.Response {
-		if got := r.Header.Get("Authorization"); got != "Bearer forgelane-token" {
-			t.Fatalf("unexpected authorization header %q", got)
+		if got := r.Header.Get("PRIVATE-TOKEN"); got != "forgelane-token" {
+			t.Fatalf("unexpected PRIVATE-TOKEN header %q", got)
 		}
 		return jsonResponse(http.StatusOK, `{
-			"number": 123,
-			"title": "Persist a GitHub WorkItem snapshot",
-			"state": "open",
-			"html_url": "https://github.com/owner/repo/issues/123",
+			"iid": 456,
+			"title": "Persist a GitLab WorkItem snapshot",
+			"state": "opened",
+			"web_url": "https://gitlab.com/group/project/-/issues/456",
 			"updated_at": "2026-05-30T09:10:11Z"
 		}`)
 	})
 	provider := NewIssueProvider(Options{
-		BaseURL: "https://api.github.test",
+		BaseURL: "https://gitlab.test/api/v4",
 		Client:  client,
 	})
-	ref, err := workitems.ParseProviderRef("github://github.com/owner/repo/issues/123")
+	ref, err := workitems.ParseProviderRef("gitlab://gitlab.com/group/project/issues/456")
 	if err != nil {
 		t.Fatalf("parse ProviderRef: %v", err)
 	}
@@ -98,37 +95,41 @@ func TestIssueProviderPrefersForgeLaneGitHubToken(t *testing.T) {
 	}
 }
 
-func TestIssueProviderRejectsPullRequestIssueResponses(t *testing.T) {
-	client := fakeHTTPClient(func(_ *http.Request) *http.Response {
+func TestIssueProviderDerivesBaseURLFromSelfHostedProviderRef(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) *http.Response {
+		if r.URL.Scheme != "https" || r.URL.Host != "gitlab.example.com" {
+			t.Fatalf("unexpected request URL %s", r.URL.String())
+		}
+		if r.URL.EscapedPath() != "/api/v4/projects/group%2Fsubgroup%2Fproject/issues/456" {
+			t.Fatalf("unexpected request path %s", r.URL.EscapedPath())
+		}
 		return jsonResponse(http.StatusOK, `{
-			"number": 123,
-			"title": "This is really a pull request",
-			"state": "open",
-			"html_url": "https://github.com/owner/repo/pull/123",
-			"updated_at": "2026-05-30T09:10:11Z",
-			"pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/123"}
+			"iid": 456,
+			"title": "Persist a self-hosted GitLab WorkItem snapshot",
+			"state": "opened",
+			"web_url": "https://gitlab.example.com/group/subgroup/project/-/issues/456",
+			"updated_at": "2026-05-30T09:10:11Z"
 		}`)
 	})
-
 	provider := NewIssueProvider(Options{
-		BaseURL: "https://api.github.test",
-		Client:  client,
+		Token:  "test-token",
+		Client: client,
 	})
-	ref, err := workitems.ParseProviderRef("github://github.com/owner/repo/issues/123")
+	ref, err := workitems.ParseProviderRef("gitlab://gitlab.example.com/group/subgroup/project/issues/456")
 	if err != nil {
 		t.Fatalf("parse ProviderRef: %v", err)
 	}
 
-	_, err = provider.GetIssue(context.Background(), ref)
-	if err == nil {
-		t.Fatal("expected pull request issue response to fail")
+	issue, err := provider.GetIssue(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("read issue: %v", err)
 	}
-	if !strings.Contains(err.Error(), "not an issue WorkItem") {
-		t.Fatalf("expected not-an-issue error, got %v", err)
+	if issue.RepositoryRef != "gitlab://gitlab.example.com/group/subgroup/project" {
+		t.Fatalf("unexpected RepositoryRef %q", issue.RepositoryRef)
 	}
 }
 
-func TestIssueProviderClassifiesProviderFailures(t *testing.T) {
+func TestIssueProviderClassifiesGitLabFailures(t *testing.T) {
 	tests := []struct {
 		name       string
 		statusCode int
@@ -137,7 +138,7 @@ func TestIssueProviderClassifiesProviderFailures(t *testing.T) {
 		{name: "not found", statusCode: http.StatusNotFound, want: "issue not found"},
 		{name: "unauthorized", statusCode: http.StatusUnauthorized, want: "auth or permission failure"},
 		{name: "forbidden", statusCode: http.StatusForbidden, want: "auth or permission failure"},
-		{name: "generic", statusCode: http.StatusInternalServerError, want: "GitHub provider failure"},
+		{name: "generic", statusCode: http.StatusInternalServerError, want: "GitLab provider failure"},
 	}
 
 	for _, tt := range tests {
@@ -149,12 +150,11 @@ func TestIssueProviderClassifiesProviderFailures(t *testing.T) {
 					Body:       io.NopCloser(strings.NewReader("provider error")),
 				}
 			})
-
 			provider := NewIssueProvider(Options{
-				BaseURL: "https://api.github.test",
+				BaseURL: "https://gitlab.test/api/v4",
 				Client:  client,
 			})
-			ref, err := workitems.ParseProviderRef("github://github.com/owner/repo/issues/123")
+			ref, err := workitems.ParseProviderRef("gitlab://gitlab.com/group/project/issues/456")
 			if err != nil {
 				t.Fatalf("parse ProviderRef: %v", err)
 			}

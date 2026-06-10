@@ -37,11 +37,12 @@ Teams need:
 ## v0 Direction
 
 The first version stays intentionally small and is tracked in
-[docs/roadmap/v0.md](docs/roadmap/v0.md). The current CLI has the first
+[docs/roadmap/v0.md](docs/roadmap/v0.md). The current CLI has the
 instance-global ForgeProject configuration path, WorkItem import/cache reads,
-planned AgentRun creation, local Workspace preparation, and run-scoped Event
-inspection. Agent process execution, commit materialization, branch push, and
-draft PR creation are still later v0 slices.
+planned AgentRun creation, local Workspace preparation, generic command
+AgentAdapter execution, log capture, commit materialization, provider-backed
+branch push, and draft PR/MR creation for the narrow GitHub and GitLab delivery
+paths.
 
 ## Architecture Bias
 
@@ -82,10 +83,12 @@ Stable core:
 
 ## Status
 
-This repository is currently in the early v0 CLI stage. The CLI exposes help,
-version, local repository initialization, WorkItem import/show, planned
-AgentRun creation/show, Workspace preparation, and run Event listing. It does
-not yet execute an agent command, push commits, or create draft PRs.
+This repository is currently in the v0 CLI delivery-loop stage. The CLI exposes
+help, version, local repository initialization, WorkItem import/show, planned
+AgentRun creation/show, Workspace preparation, agent command execution, log
+inspection, ChangeSet delivery, run Event listing, stop, and retry. Default
+tests use fake providers and local git remotes; real provider mutation is
+operator-driven and requires explicit provider tokens.
 
 See [docs/vision.md](docs/vision.md) for the long-term product direction.
 See [docs/roadmap/v0.md](docs/roadmap/v0.md) for the first version boundary
@@ -107,14 +110,20 @@ Inspect the current CLI surface:
 go run ./cmd/forgelane --help
 go run ./cmd/forgelane version
 go run ./cmd/forgelane init --repo-url https://github.com/owner/repo
+go run ./cmd/forgelane init --repo-url https://gitlab.com/group/project
+go run ./cmd/forgelane init --provider gitlab --repo-url https://gitlab.example.com/group/project.git
 go run ./cmd/forgelane work-items import github://github.com/owner/repo/issues/123
+go run ./cmd/forgelane work-items import gitlab://gitlab.com/group/project/issues/123
+go run ./cmd/forgelane work-items import gitlab://gitlab.example.com/group/project/issues/123
 go run ./cmd/forgelane work-items show github://github.com/owner/repo/issues/123
 go run ./cmd/forgelane work-items show --issue 123
 go run ./cmd/forgelane work-items show --id 1
 go run ./cmd/forgelane runs create github://github.com/owner/repo/issues/123
+go run ./cmd/forgelane runs start github://github.com/owner/repo/issues/123 --agent-preset harmless-echo
+go run ./cmd/forgelane runs start gitlab://gitlab.com/group/project/issues/123 --agent-preset harmless-echo
 go run ./cmd/forgelane runs show 1
 go run ./cmd/forgelane runs prepare 1
-go run ./cmd/forgelane runs start github://github.com/owner/repo/issues/123
+go run ./cmd/forgelane runs execute 1
 go run ./cmd/forgelane runs evidence 1
 go run ./cmd/forgelane runs logs 1
 go run ./cmd/forgelane events list --run 1
@@ -134,8 +143,25 @@ credentials.
 `runs create` creates a new planned AgentRun, a succeeded `start`
 ControlAction, and an immutable RunSpec snapshot. `runs prepare` allocates a
 RunnerJob and Workspace under `~/.forgelane/workspaces/run-<id>/`, clones the
-current repository into `repo/`, and records workspace Events. `events list
---run` reads the AgentRun timeline from SQLite without contacting providers.
+current repository into `repo/`, and records workspace Events. `runs execute`
+invokes the configured command AgentAdapter, captures stdout/stderr as log
+segments, materializes repository changes into commits, and asks the selected
+ChangeProvider to push the ForgeLane-managed branch and create or update the
+draft PR/MR. `runs start` performs the create, prepare, execute, materialize,
+push, and draft PR/MR path in one command. `events list --run` reads the
+AgentRun timeline from SQLite without contacting providers.
+
+Provider mutation credentials belong to the provider boundary, not the
+AgentAdapter process. GitHub delivery reads `FORGELANE_GITHUB_TOKEN` first and
+falls back to `GITHUB_TOKEN`; GitLab.com and self-hosted GitLab delivery read
+`FORGELANE_GITLAB_TOKEN` first and fall back to `GITLAB_TOKEN`. Self-hosted
+GitLab refs keep their host in the canonical `gitlab://host/group/project`
+reference, and `init` should use `--provider gitlab` when the repository URL is
+not on `gitlab.com`. GitHub tokens need repository-scoped contents write, pull
+request write, and issue read capabilities. GitLab tokens need API access for
+issues/MRs plus write repository access for Git push. Branch push uses git
+transport with a temporary credential helper, not persisted token URLs and not
+`gh`/`glab`.
 
 ## Agent Development Workflow
 

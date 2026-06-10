@@ -6,27 +6,23 @@ import (
 	"strconv"
 	"strings"
 
-	githubprovider "github.com/liiujinfu/forgelane/internal/provider/github"
 	"github.com/liiujinfu/forgelane/internal/repositoryconfig"
 	store "github.com/liiujinfu/forgelane/internal/store/sqlite"
 	"github.com/liiujinfu/forgelane/internal/workitems"
 	"github.com/spf13/cobra"
 )
 
-func newWorkItemsCommand(stdout io.Writer, provider workitems.Provider) *cobra.Command {
-	if provider == nil {
-		provider = githubprovider.NewIssueProvider(githubprovider.Options{})
-	}
+func newWorkItemsCommand(stdout io.Writer, options Options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "work-items",
 		Short: "Import and inspect provider-owned WorkItems.",
 	}
-	cmd.AddCommand(newWorkItemsImportCommand(stdout, provider))
+	cmd.AddCommand(newWorkItemsImportCommand(stdout, options))
 	cmd.AddCommand(newWorkItemsShowCommand(stdout))
 	return cmd
 }
 
-func newWorkItemsImportCommand(stdout io.Writer, provider workitems.Provider) *cobra.Command {
+func newWorkItemsImportCommand(stdout io.Writer, options Options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "import <provider-ref>",
 		Short: "Import a provider-owned WorkItem snapshot.",
@@ -39,6 +35,10 @@ func newWorkItemsImportCommand(stdout io.Writer, provider workitems.Provider) *c
 			defer instanceStore.Close()
 
 			ref, err := resolveWorkItemRef(args[0], instanceStore)
+			if err != nil {
+				return err
+			}
+			provider, err := workItemProviderForRef(options, ref)
 			if err != nil {
 				return err
 			}
@@ -143,8 +143,20 @@ func resolveIssueNumber(input string, instanceStore *store.Store) (workitems.Pro
 	}
 	forgeProject, err := repositoryconfig.InferForgeProjectFromOrigin("")
 	if err != nil {
+		gitLabProject, gitLabErr := repositoryconfig.InferForgeProjectFromOriginForProvider("", "gitlab")
+		if gitLabErr != nil {
+			return workitems.ProviderRef{}, fmt.Errorf("%w; pass a full ProviderRef or run forgelane init", err)
+		}
+		ref, lookupErr := resolveIssueNumberFromForgeProject(issueNumber, gitLabProject, instanceStore)
+		if lookupErr == nil {
+			return ref, nil
+		}
 		return workitems.ProviderRef{}, fmt.Errorf("%w; pass a full ProviderRef or run forgelane init", err)
 	}
+	return resolveIssueNumberFromForgeProject(issueNumber, forgeProject, instanceStore)
+}
+
+func resolveIssueNumberFromForgeProject(issueNumber int, forgeProject repositoryconfig.ForgeProject, instanceStore *store.Store) (workitems.ProviderRef, error) {
 	projectRef := repositoryconfig.ForgeProjectRef(forgeProject)
 	persistedProject, err := instanceStore.GetForgeProjectByRef(projectRef)
 	if err != nil {

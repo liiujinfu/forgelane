@@ -100,7 +100,7 @@ type credentialGrant struct {
 const harmlessEchoScript = `printf 'forgelane harmless stdout\n'
 printf 'forgelane harmless stderr\n' >&2
 printf 'cwd=%s\n' "$PWD"
-if [ -n "${GITHUB_TOKEN:-}" ] || [ -n "${GH_TOKEN:-}" ] || [ -n "${GITLAB_TOKEN:-}" ]; then
+if [ -n "${FORGELANE_GITHUB_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ] || [ -n "${GH_TOKEN:-}" ] || [ -n "${FORGELANE_GITLAB_TOKEN:-}" ] || [ -n "${GITLAB_TOKEN:-}" ]; then
   printf 'provider-token=present\n'
 else
   printf 'provider-token=absent\n'

@@ -10,8 +10,10 @@ import (
 )
 
 func TestCodexPresetPlansSmokeCommandWithScrubbedEnvironment(t *testing.T) {
+	t.Setenv("FORGELANE_GITHUB_TOKEN", "sensitive-forgelane-github-token")
 	t.Setenv("GITHUB_TOKEN", "sensitive-provider-token")
 	t.Setenv("GH_TOKEN", "sensitive-gh-token")
+	t.Setenv("FORGELANE_GITLAB_TOKEN", "sensitive-forgelane-gitlab-token")
 	t.Setenv("GITLAB_TOKEN", "sensitive-gitlab-token")
 	t.Setenv("HOME", "/host-home")
 	t.Setenv("CODEX_HOME", "/codex-home")
@@ -72,10 +74,14 @@ func TestCodexPresetPlansSmokeCommandWithScrubbedEnvironment(t *testing.T) {
 	}
 	for _, value := range plan.Env {
 		switch {
+		case strings.HasPrefix(value, "FORGELANE_GITHUB_TOKEN="):
+			t.Fatalf("expected FORGELANE_GITHUB_TOKEN to be scrubbed, got env %#v", plan.Env)
 		case strings.HasPrefix(value, "GITHUB_TOKEN="):
 			t.Fatalf("expected GITHUB_TOKEN to be scrubbed, got env %#v", plan.Env)
 		case strings.HasPrefix(value, "GH_TOKEN="):
 			t.Fatalf("expected GH_TOKEN to be scrubbed, got env %#v", plan.Env)
+		case strings.HasPrefix(value, "FORGELANE_GITLAB_TOKEN="):
+			t.Fatalf("expected FORGELANE_GITLAB_TOKEN to be scrubbed, got env %#v", plan.Env)
 		case strings.HasPrefix(value, "GITLAB_TOKEN="):
 			t.Fatalf("expected GITLAB_TOKEN to be scrubbed, got env %#v", plan.Env)
 		case strings.HasPrefix(value, "CODEX_HOME="):

@@ -3,6 +3,7 @@ package runner
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,7 +26,7 @@ func prepareWorkspaceRepository(paths workflow.WorkspacePaths, expectedRepositor
 			return fmt.Errorf("create Workspace directory %s: %w", path, err)
 		}
 	}
-	sourceProject, err := repositoryconfig.InferForgeProjectFromOrigin("")
+	sourceProject, err := inferWorkspaceSourceProject(expectedRepositoryRef)
 	if err != nil {
 		return fmt.Errorf("infer Workspace source repository: %w", err)
 	}
@@ -56,4 +57,29 @@ func writeWorkspacePrepareLog(paths workflow.WorkspacePaths, output []byte) {
 		return
 	}
 	_ = os.WriteFile(filepath.Join(paths.Logs, "checkout.log"), output, 0o644)
+}
+
+func inferWorkspaceSourceProject(expectedRepositoryRef string) (repositoryconfig.ForgeProject, error) {
+	sourceProject, err := repositoryconfig.InferForgeProjectFromOrigin("")
+	if err == nil {
+		return sourceProject, nil
+	}
+	originalErr := err
+	expectedProvider := providerFromRepositoryRef(expectedRepositoryRef)
+	if expectedProvider == "" {
+		return repositoryconfig.ForgeProject{}, originalErr
+	}
+	sourceProject, err = repositoryconfig.InferForgeProjectFromOriginForProvider("", expectedProvider)
+	if err != nil {
+		return repositoryconfig.ForgeProject{}, originalErr
+	}
+	return sourceProject, nil
+}
+
+func providerFromRepositoryRef(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.Scheme
 }

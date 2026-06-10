@@ -99,6 +99,41 @@ func TestCreatePlannedAgentRunCreatesRunSpecAndEvents(t *testing.T) {
 	}
 }
 
+func TestPlannedAgentRunRunSpecSupportsGitLabProjectPaths(t *testing.T) {
+	plan, err := workflow.NewPlannedAgentRunPlan(workflow.WorkItemSnapshot{
+		ID:                  1,
+		ProviderRef:         "gitlab://gitlab.com/group/subgroup/project/issues/456",
+		Provider:            "gitlab",
+		RepositoryRef:       "gitlab://gitlab.com/group/subgroup/project",
+		ProviderIssueNumber: 456,
+		Title:               "Deliver a GitLab draft MR",
+		Status:              "open",
+	}, "harmless-echo")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+
+	specJSON, err := plan.EncodeRunSpec(7)
+	if err != nil {
+		t.Fatalf("encode RunSpec: %v", err)
+	}
+
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(specJSON), &spec); err != nil {
+		t.Fatalf("decode RunSpec: %v", err)
+	}
+	repo, ok := spec["repo"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected repo object, got %#v", spec["repo"])
+	}
+	if repo["provider"] != "gitlab" || repo["owner"] != "group/subgroup" || repo["name"] != "project" || repo["ref"] != "gitlab://gitlab.com/group/subgroup/project" {
+		t.Fatalf("unexpected GitLab repo snapshot %#v", repo)
+	}
+	if spec["branch"] != "forgelane/issue-456" {
+		t.Fatalf("unexpected branch %#v", spec["branch"])
+	}
+}
+
 func TestExecuteAgentRunCommandFailsWhenStartedRunnerReportsCaptureError(t *testing.T) {
 	instanceStore, runID := preparedAgentRun(t)
 
