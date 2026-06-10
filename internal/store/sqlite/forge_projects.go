@@ -752,9 +752,6 @@ LIMIT 1`, agentRunID).Scan(&payloadJSON)
 	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
 		return false, "", fmt.Errorf("decode delivery skip Event for AgentRun %d: %w", agentRunID, err)
 	}
-	if payload.Reason == "" {
-		payload.Reason = "no_repository_changes"
-	}
 	return true, payload.Reason, nil
 }
 
