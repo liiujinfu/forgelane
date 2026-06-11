@@ -65,6 +65,61 @@ func TestIssueProviderReadsGitLabIssueSnapshot(t *testing.T) {
 	}
 }
 
+func TestIssueProviderListsGitLabReadyIssues(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) *http.Response {
+		if r.URL.EscapedPath() != "/api/v4/projects/group%2Fsubgroup%2Fproject/issues" {
+			t.Fatalf("unexpected request path %s", r.URL.EscapedPath())
+		}
+		query := r.URL.Query()
+		if query.Get("state") != "opened" {
+			t.Fatalf("expected opened state query, got %q", query.Get("state"))
+		}
+		if query.Get("labels") != "ready-for-agent" {
+			t.Fatalf("expected ready label query, got %q", query.Get("labels"))
+		}
+		if query.Get("per_page") != "100" {
+			t.Fatalf("expected per_page=100, got %q", query.Get("per_page"))
+		}
+		return jsonResponse(http.StatusOK, `[
+			{
+				"iid": 456,
+				"title": "Ready GitLab implementation slice",
+				"description": "Build the issue-first operator entry.",
+				"state": "opened",
+				"web_url": "https://gitlab.com/group/subgroup/project/-/issues/456",
+				"updated_at": "2026-05-30T09:10:11Z"
+			}
+		]`)
+	})
+
+	provider := NewIssueProvider(Options{
+		BaseURL: "https://gitlab.test/api/v4",
+		Token:   "test-token",
+		Client:  client,
+	})
+	issues, err := provider.ListIssues(context.Background(), workitems.ProviderIssueListInput{
+		Repository: workitems.ProviderRepositoryRef{
+			Provider:       "gitlab",
+			ProviderHost:   "gitlab.com",
+			RepositoryPath: "group/subgroup/project",
+		},
+		Labels: []string{"ready-for-agent"},
+	})
+	if err != nil {
+		t.Fatalf("expected issue list to succeed: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("expected one issue, got %#v", issues)
+	}
+	issue := issues[0]
+	if issue.ProviderRef != "gitlab://gitlab.com/group/subgroup/project/issues/456" {
+		t.Fatalf("unexpected ProviderRef %q", issue.ProviderRef)
+	}
+	if issue.Title != "Ready GitLab implementation slice" || issue.Status != "open" {
+		t.Fatalf("unexpected listed issue %#v", issue)
+	}
+}
+
 func TestIssueProviderPrefersForgeLaneGitLabToken(t *testing.T) {
 	t.Setenv("FORGELANE_GITLAB_TOKEN", "forgelane-token")
 	t.Setenv("GITLAB_TOKEN", "gitlab-token")

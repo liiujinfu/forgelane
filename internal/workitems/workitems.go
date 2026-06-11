@@ -15,6 +15,39 @@ type Provider interface {
 	GetIssue(context.Context, ProviderRef) (ProviderIssue, error)
 }
 
+// ProviderIssueLister reads provider-owned issue candidates without importing them.
+type ProviderIssueLister interface {
+	ListIssues(context.Context, ProviderIssueListInput) ([]ProviderIssue, error)
+}
+
+// ProviderRepositoryRef identifies a provider-backed repository without selecting one issue.
+type ProviderRepositoryRef struct {
+	Provider       string
+	ProviderHost   string
+	RepositoryPath string
+}
+
+// String returns the canonical provider-backed project reference.
+func (ref ProviderRepositoryRef) String() string {
+	return fmt.Sprintf("%s://%s/%s", ref.Provider, ref.ProviderHost, ref.RepositoryPath)
+}
+
+// IssueRef returns the canonical issue ProviderRef for an issue number in this repository.
+func (ref ProviderRepositoryRef) IssueRef(issueNumber int) ProviderRef {
+	return ProviderRef{
+		Provider:       ref.Provider,
+		ProviderHost:   ref.ProviderHost,
+		RepositoryPath: ref.RepositoryPath,
+		IssueNumber:    issueNumber,
+	}
+}
+
+// ProviderIssueListInput scopes a read-only provider issue candidate listing.
+type ProviderIssueListInput struct {
+	Repository ProviderRepositoryRef
+	Labels     []string
+}
+
 // ProviderRef is a canonical ForgeLane reference to a provider-owned issue.
 type ProviderRef struct {
 	Provider       string

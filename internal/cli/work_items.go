@@ -141,33 +141,41 @@ func resolveIssueNumber(input string, instanceStore *store.Store) (workitems.Pro
 	if err != nil || issueNumber <= 0 {
 		return workitems.ProviderRef{}, fmt.Errorf("invalid issue number %q", input)
 	}
-	forgeProject, err := repositoryconfig.InferForgeProjectFromOrigin("")
+	forgeProject, err := currentForgeProject(instanceStore)
 	if err != nil {
-		gitLabProject, gitLabErr := repositoryconfig.InferForgeProjectFromOriginForProvider("", "gitlab")
-		if gitLabErr != nil {
-			return workitems.ProviderRef{}, fmt.Errorf("%w; pass a full ProviderRef or run forgelane init", err)
-		}
-		ref, lookupErr := resolveIssueNumberFromForgeProject(issueNumber, gitLabProject, instanceStore)
-		if lookupErr == nil {
-			return ref, nil
-		}
-		return workitems.ProviderRef{}, fmt.Errorf("%w; pass a full ProviderRef or run forgelane init", err)
+		return workitems.ProviderRef{}, err
 	}
-	return resolveIssueNumberFromForgeProject(issueNumber, forgeProject, instanceStore)
+	return workitems.ProviderRef{
+		Provider:       forgeProject.Provider,
+		ProviderHost:   forgeProject.ProviderHost,
+		RepositoryPath: forgeProject.RepositoryPath,
+		IssueNumber:    issueNumber,
+	}, nil
 }
 
-func resolveIssueNumberFromForgeProject(issueNumber int, forgeProject repositoryconfig.ForgeProject, instanceStore *store.Store) (workitems.ProviderRef, error) {
+func currentForgeProject(instanceStore *store.Store) (store.ForgeProject, error) {
+	forgeProject, err := repositoryconfig.InferForgeProjectFromOrigin("")
+	if err == nil {
+		return lookupCurrentForgeProject(forgeProject, instanceStore)
+	}
+
+	gitLabProject, gitLabErr := repositoryconfig.InferForgeProjectFromOriginForProvider("", "gitlab")
+	if gitLabErr == nil {
+		persistedProject, lookupErr := lookupCurrentForgeProject(gitLabProject, instanceStore)
+		if lookupErr == nil {
+			return persistedProject, nil
+		}
+	}
+	return store.ForgeProject{}, fmt.Errorf("%w; pass a full ProviderRef or run forgelane init", err)
+}
+
+func lookupCurrentForgeProject(forgeProject repositoryconfig.ForgeProject, instanceStore *store.Store) (store.ForgeProject, error) {
 	projectRef := repositoryconfig.ForgeProjectRef(forgeProject)
 	persistedProject, err := instanceStore.GetForgeProjectByRef(projectRef)
 	if err != nil {
-		return workitems.ProviderRef{}, fmt.Errorf("%w; pass a full ProviderRef or run forgelane init", err)
+		return store.ForgeProject{}, fmt.Errorf("%w; pass a full ProviderRef or run forgelane init", err)
 	}
-	return workitems.ProviderRef{
-		Provider:       persistedProject.Provider,
-		ProviderHost:   persistedProject.ProviderHost,
-		RepositoryPath: persistedProject.RepositoryPath,
-		IssueNumber:    issueNumber,
-	}, nil
+	return persistedProject, nil
 }
 
 func isPositiveInteger(input string) bool {
