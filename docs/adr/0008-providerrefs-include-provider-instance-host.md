@@ -3,7 +3,7 @@
 ForgeLane will make canonical ProviderRefs URL-like and include the provider
 instance host, such as `github://github.com/owner/repo/issues/123`, instead of
 using hostless short refs such as `github:owner/repo#123`. This keeps WorkItem,
-PR/MR, commit, review, and CI references globally unambiguous across public
+PR, commit, review, and CI references globally unambiguous across public
 GitHub/GitLab, GitHub Enterprise, and private GitLab instances while still
 allowing CLI shorthand to resolve through repository config.
 

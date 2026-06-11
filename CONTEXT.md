@@ -9,7 +9,13 @@ ForgeLane is an agentic software delivery control plane.
   reference and snapshot before any AgentRun exists.
 - Agent run: one bounded attempt by a coding agent to move a work item forward.
 - Workspace: an isolated checkout and execution environment for an agent run.
-- Change set: the branch and draft PR produced or updated by an agent run.
+- Provider PR: ForgeLane's operator-facing name for a provider code-review
+  change request. GitHub names it a pull request; GitLab names it a merge
+  request. ForgeLane uses PR in human-facing docs and CLI.
+- Change set: the branch and draft provider PR produced or updated by an agent
+  run.
+- Change feedback: provider-owned PR review, comment, requested-changes, or
+  CI signal that can guide a follow-up AgentRun for an existing ChangeSet.
 - Agent adapter: the boundary that invokes a specific coding agent or command
   from a run spec.
 - Run attention loop: ForgeLane-owned interaction state that lets an AgentRun
@@ -44,7 +50,7 @@ ForgeLane is an agentic software delivery control plane.
 ## Invariants
 
 - Provider-owned data and ForgeLane-owned state must stay distinct.
-- GitHub/GitLab remain the source of truth for issues, PRs/MRs, reviews,
+- GitHub/GitLab remain the source of truth for issues, provider PRs, reviews,
   commits, and CI status.
 - Importing a WorkItem snapshot does not imply starting an AgentRun.
 - CLI shorthand such as issue number `123` must resolve to a canonical
@@ -58,8 +64,10 @@ ForgeLane is an agentic software delivery control plane.
 - A canonical WorkItem ProviderRef identifies one ForgeLane WorkItem; repeated
   imports refresh its provider-owned snapshot and append audit Events instead
   of creating duplicate WorkItems, even when provider content has not changed.
-- Provider pull requests and merge requests are delivery artifacts or later
-  review/fix inputs, not issue WorkItems in the v0 WorkItem import path.
+- Provider PRs are delivery artifacts or later review/fix inputs, not issue
+  WorkItems in the v0 WorkItem import path.
+- Change feedback belongs to the ChangeSet review loop, not to the WorkItem
+  import path and not to the Run attention loop.
 - ForgeLane instance state such as ForgeProjects, WorkItem snapshots, and
   Events belongs in the instance state store, not inside target source
   repositories and not in provider-owned systems.
@@ -76,6 +84,10 @@ ForgeLane is an agentic software delivery control plane.
 - Provider identity is the primary CLI lookup path for WorkItems. Local
   WorkItem ids may exist for storage, joins, and explicit debugging commands,
   but they are not the main user-facing identity.
+- Provider PR identity is the primary CLI lookup path for ChangeSet review
+  loops and Change feedback. Local ChangeSet ids may exist for storage, joins,
+  and explicit debugging commands, but they are not the main user-facing
+  identity.
 - A TargetRepository and DefaultWorkItemSource often point at the same
   GitHub/GitLab project, but they are distinct concepts and may diverge.
 - A ForgeProject is the preferred config shape when one GitHub/GitLab project
@@ -92,7 +104,7 @@ ForgeLane is an agentic software delivery control plane.
   responses must enter through ControlAction/Event records, not by attaching
   stdin or hidden interaction channels to the AgentAdapter process.
 - Run attention approval is distinct from provider mutation approval or
-  ChangeSet approval. Provider branch and PR/MR mutations remain ChangeProvider
+  ChangeSet approval. Provider branch and PR mutations remain ChangeProvider
   responsibilities after ForgeLane records the matching ControlAction boundary.
 - AgentRun and RunnerJob command execution use explicit runtime states:
   `running`, `completed`, `failed`, `timed_out`, and `cancelled`. Runtime
@@ -106,7 +118,7 @@ ForgeLane is an agentic software delivery control plane.
   ForgeLane records `repository_delivery.skipped` with reason
   `no_repository_changes` and does not create commit refs, a ChangeSet, branch
   push, or draft PR.
-- The first-class deliverable is a PR/MR, not a chat answer.
+- The first-class deliverable is a PR, not a chat answer.
 - Automated and privileged actions must be auditable through events.
 - Privileged actions must pass through an explicit permission or approval
   boundary.
@@ -116,9 +128,9 @@ ForgeLane is an agentic software delivery control plane.
 ## Early Product Boundaries
 
 - v0 targets GitHub first. Issue #40 adds only a narrow GitLab.com and
-  self-hosted GitLab path for the same WorkItem import plus branch-to-draft-MR
+  self-hosted GitLab path for the same WorkItem import plus branch-to-draft-PR
   ChangeProvider loop; this does not open general provider breadth.
-- v0 should prove one issue-to-draft-PR/MR loop before adding broader provider
+- v0 should prove one issue-to-draft-PR loop before adding broader provider
   breadth, including checks, reviews, comments, provider webhooks, or a plugin
   system.
 - v0 assumes a trusted single-user/self-hosted operator while still recording

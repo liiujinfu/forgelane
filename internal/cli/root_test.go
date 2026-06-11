@@ -390,7 +390,7 @@ func TestWorkItemImportRejectsPullRequestResponsesWithoutWritingState(t *testing
 		WorkItemProvider: fakeProvider,
 	}, "work-items", "import", "github://github.com/owner/repo/issues/123")
 	if err == nil {
-		t.Fatal("expected PR/MR issue response to fail import")
+		t.Fatal("expected PR issue response to fail import")
 	}
 	if stdout != "" {
 		t.Fatalf("expected no stdout, got %q", stdout)

@@ -1,7 +1,7 @@
 # ForgeLane Agent Instructions
 
 ForgeLane is an open control plane for agentic software delivery. Keep agent
-workflows observable, controllable, auditable, and centered on PR/MR delivery.
+workflows observable, controllable, auditable, and centered on PR delivery.
 
 ## Read First
 
@@ -28,12 +28,12 @@ issues, triage state, or domain-doc maintenance.
 
 - Do not build an independent issue tracker in the early product unless the
   plan explicitly changes.
-- Treat GitHub/GitLab issues, PRs/MRs, reviews, commits, and CI status as
+- Treat GitHub/GitLab issues, PRs, reviews, commits, and CI status as
   provider-owned source data. Store only ForgeLane-owned run, control, audit,
   and cached reference state locally.
-- The deliverable for an agent task is a PR/MR, not a chat answer.
+- The deliverable for an agent task is a PR, not a chat answer.
 - Keep the early workflow provider-backed: issue -> agent run -> branch ->
-  draft PR/MR -> commits -> CI/review -> revise/merge/close.
+  draft PR -> commits -> CI/review -> revise/merge/close.
 - Every automated action should be representable as an event.
 - Every privileged action should pass through an explicit permission or
   approval boundary.
