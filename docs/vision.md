@@ -17,7 +17,7 @@ Agentic software delivery should move from private agent conversations to team
 delivery loops that are observable, controllable, and deliverable.
 
 A user should be able to start from an issue, delegate implementation to an
-agent, watch the work unfold, intervene when needed, and receive a PR/MR that
+agent, watch the work unfold, intervene when needed, and receive a PR that
 can be reviewed, tested, revised, approved, or closed through normal engineering
 controls.
 
@@ -27,7 +27,7 @@ That means:
   while work is happening.
 - Controllable: humans can stop, retry, request changes, reassign, approve, or
   close the work.
-- Deliverable: the final unit of work is a PR/MR, not a chat answer.
+- Deliverable: the final unit of work is a PR, not a chat answer.
 
 ## What Changes
 
@@ -39,7 +39,7 @@ software delivery system:
 
 - the issue defines intent;
 - the run records execution;
-- the branch and PR/MR expose the change;
+- the branch and PR expose the change;
 - CI and review provide independent checks;
 - human control actions can stop, retry, redirect, or reject the work;
 - the event log preserves what happened and why.
@@ -52,7 +52,7 @@ ForgeLane should eventually provide:
 
 - a provider-backed work queue over GitHub, GitLab, and similar systems;
 - cloud or local agent execution with isolated workspaces;
-- draft PR/MR creation early in the run, not only at the end;
+- draft PR creation early in the run, not only at the end;
 - live run status, session logs, commits, diffs, CI state, and review state;
 - human controls such as stop, retry, request changes, reassign, close, and
   approve;
@@ -82,9 +82,9 @@ observable and governable.
 - Open: core workflows and interfaces should be inspectable and extensible.
 - Self-hostable: teams should be able to run ForgeLane on their own
   infrastructure.
-- Provider-backed: external issue, PR/MR, review, commit, and CI systems remain
+- Provider-backed: external issue, PR, review, commit, and CI systems remain
   the source of truth for their own data.
-- PR/MR-centered: the primary deliverable is a reviewable change, not a chat
+- PR-centered: the primary deliverable is a reviewable change, not a chat
   transcript.
 - Observable: progress should be visible through logs, events, commits, diffs,
   CI, and reviews.

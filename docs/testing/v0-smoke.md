@@ -60,7 +60,7 @@ Expected evidence matches the GitHub non-mutating smoke.
 ## Provider-Write Smoke
 
 Run this only against a disposable issue/repository or with an explicit cleanup
-plan. This path creates or updates a provider branch and draft PR/MR.
+plan. This path creates or updates a provider branch and draft PR.
 
 Set one provider token in the shell running ForgeLane. Do not pass tokens to the
 AgentAdapter process.
@@ -88,9 +88,9 @@ Expected evidence:
 - A local commit was materialized.
 - ChangeSet status reaches `draft_open`, or stays in a recoverable
   provider-failure status with retry guidance.
-- Provider branch and draft PR/MR refs are shown when delivery succeeds.
+- Provider branch and draft PR refs are shown when delivery succeeds.
 - Events include `repository_commit.materialized`, `change_set.created`,
-  branch push events, and draft PR/MR events.
+  branch push events, and draft PR events.
 
 ## Control Smoke
 

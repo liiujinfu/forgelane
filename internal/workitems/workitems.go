@@ -201,7 +201,7 @@ func (err NotFoundError) Error() string {
 	return fmt.Sprintf("issue not found: %s", err.ProviderRef)
 }
 
-// NotIssueError reports a provider response that points at a PR/MR, not an issue WorkItem.
+// NotIssueError reports a provider response that points at a PR, not an issue WorkItem.
 type NotIssueError struct {
 	ProviderRef string
 }
