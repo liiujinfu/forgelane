@@ -21,6 +21,9 @@ var ErrWorkItemNotFound = errors.New("WorkItem not found")
 // ErrAgentRunNotFound reports a missing AgentRun current-state row.
 var ErrAgentRunNotFound = errors.New("AgentRun not found")
 
+// ErrChangeSetNotFound reports a missing ChangeSet current-state row.
+var ErrChangeSetNotFound = errors.New("ChangeSet not found")
+
 // Store owns access to ForgeLane's instance-global SQLite database.
 type Store struct {
 	db *sql.DB
@@ -414,6 +417,15 @@ type AgentRunPrepareResult = workflow.AgentRunPrepareResult
 // AgentRunDetail is the read model for inspecting one AgentRun.
 type AgentRunDetail = workflow.AgentRunDetail
 
+// ChangeSetReport is the read model for a provider PR and its local delivery state.
+type ChangeSetReport struct {
+	ChangeSet      workflow.ChangeSet
+	WorkItem       workflow.WorkItemSnapshot
+	AgentRuns      []workflow.AgentRun
+	CommitRefs     []workflow.CommitRef
+	ActiveForRetry bool
+}
+
 // ControlAction is a persisted operator request to change the delivery loop.
 type ControlAction = workflow.ControlAction
 
@@ -737,6 +749,141 @@ WHERE agent_runs.id = ?`
 	}
 	detail.PendingAttention = pendingAttention
 	return detail, nil
+}
+
+// GetChangeSetReportByChangeRef returns local delivery state for a provider PR ref.
+func (store *Store) GetChangeSetReportByChangeRef(changeRef string) (ChangeSetReport, error) {
+	const query = `
+SELECT
+	c.id,
+	c.work_item_id,
+	c.work_item_ref,
+	c.provider,
+	c.repository_ref,
+	c.base_branch,
+	c.branch_ref,
+	c.branch_provider_ref,
+	c.change_ref,
+	c.change_draft,
+	c.provider_snapshot,
+	c.status,
+	c.created_by_run_id,
+	c.active_run_id,
+	c.created_at,
+	c.updated_at,
+	w.id,
+	w.forge_project_id,
+	w.provider_ref,
+	w.provider,
+	w.repository_ref,
+	w.provider_issue_number,
+	w.title,
+	w.body,
+	w.status,
+	w.provider_status_raw,
+	w.url,
+	w.provider_updated_at,
+	w.imported_at,
+	w.refreshed_at
+FROM change_sets c
+JOIN work_items w ON w.id = c.work_item_id
+WHERE c.change_ref = ?
+ORDER BY
+	CASE WHEN c.status NOT IN ('merged', 'closed', 'abandoned') THEN 0 ELSE 1 END,
+	c.id DESC
+LIMIT 1`
+
+	var report ChangeSetReport
+	err := store.db.QueryRow(query, changeRef).Scan(
+		&report.ChangeSet.ID,
+		&report.ChangeSet.WorkItemID,
+		&report.ChangeSet.WorkItemRef,
+		&report.ChangeSet.Provider,
+		&report.ChangeSet.RepositoryRef,
+		&report.ChangeSet.BaseBranch,
+		&report.ChangeSet.BranchRef,
+		&report.ChangeSet.BranchProviderRef,
+		&report.ChangeSet.ChangeRef,
+		&report.ChangeSet.ChangeDraft,
+		&report.ChangeSet.ProviderSnapshot,
+		&report.ChangeSet.Status,
+		&report.ChangeSet.CreatedByRunID,
+		&report.ChangeSet.ActiveRunID,
+		&report.ChangeSet.CreatedAt,
+		&report.ChangeSet.UpdatedAt,
+		&report.WorkItem.ID,
+		&report.WorkItem.ForgeProjectID,
+		&report.WorkItem.ProviderRef,
+		&report.WorkItem.Provider,
+		&report.WorkItem.RepositoryRef,
+		&report.WorkItem.ProviderIssueNumber,
+		&report.WorkItem.Title,
+		&report.WorkItem.Body,
+		&report.WorkItem.Status,
+		&report.WorkItem.ProviderStatusRaw,
+		&report.WorkItem.URL,
+		&report.WorkItem.ProviderUpdatedAt,
+		&report.WorkItem.ImportedAt,
+		&report.WorkItem.RefreshedAt,
+	)
+	if err == sql.ErrNoRows {
+		return ChangeSetReport{}, fmt.Errorf("%w: %s", ErrChangeSetNotFound, changeRef)
+	}
+	if err != nil {
+		return ChangeSetReport{}, fmt.Errorf("query ChangeSet report for %s: %w", changeRef, err)
+	}
+	report.ActiveForRetry = isActiveChangeSetStatus(report.ChangeSet.Status)
+
+	commitRefs, err := store.listCommitRefsForChangeSet(report.ChangeSet.ID)
+	if err != nil {
+		return ChangeSetReport{}, err
+	}
+	report.CommitRefs = commitRefs
+	report.ChangeSet.CommitRefs = commitRefs
+
+	agentRuns, err := store.listAgentRunsForChangeSet(report.ChangeSet)
+	if err != nil {
+		return ChangeSetReport{}, err
+	}
+	report.AgentRuns = agentRuns
+	return report, nil
+}
+
+func (store *Store) listAgentRunsForChangeSet(changeSet workflow.ChangeSet) ([]workflow.AgentRun, error) {
+	rows, err := store.db.Query(`
+SELECT DISTINCT a.id, a.work_item_id, a.status, a.created_at, a.updated_at
+FROM agent_runs a
+WHERE a.id IN (?, ?)
+	OR EXISTS (
+		SELECT 1
+		FROM commit_refs r
+		WHERE r.change_set_id = ?
+			AND r.agent_run_id = a.id
+	)
+ORDER BY a.id ASC`, changeSet.CreatedByRunID, changeSet.ActiveRunID, changeSet.ID)
+	if err != nil {
+		return nil, fmt.Errorf("query AgentRuns for ChangeSet %d: %w", changeSet.ID, err)
+	}
+	defer rows.Close()
+
+	var runs []workflow.AgentRun
+	for rows.Next() {
+		var run workflow.AgentRun
+		if err := rows.Scan(
+			&run.ID,
+			&run.WorkItemID,
+			&run.Status,
+			&run.CreatedAt,
+			&run.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan AgentRun for ChangeSet %d: %w", changeSet.ID, err)
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate AgentRuns for ChangeSet %d: %w", changeSet.ID, err)
+	}
+	return runs, nil
 }
 
 func (store *Store) listPendingAttentionForAgentRun(agentRunID int64) ([]workflow.RunAttentionRequest, error) {

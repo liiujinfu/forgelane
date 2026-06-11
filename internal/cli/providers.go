@@ -76,6 +76,35 @@ func changeProviderForProvider(options Options, provider string) (workflow.Chang
 	}
 }
 
+func changeReporterForProvider(options Options, provider string) (workflow.ProviderPRReporter, error) {
+	if options.ChangeProvider != nil {
+		reporter, ok := options.ChangeProvider.(workflow.ProviderPRReporter)
+		if !ok {
+			return nil, fmt.Errorf("configured ChangeProvider does not support PR reports")
+		}
+		return reporter, nil
+	}
+	if options.ChangeProviderFactory != nil {
+		changeProvider, err := options.ChangeProviderFactory(provider)
+		if err != nil {
+			return nil, err
+		}
+		reporter, ok := changeProvider.(workflow.ProviderPRReporter)
+		if !ok {
+			return nil, fmt.Errorf("configured ChangeProvider does not support PR reports")
+		}
+		return reporter, nil
+	}
+	switch provider {
+	case "github":
+		return githubprovider.NewChangeProvider(githubprovider.ChangeProviderOptions{}), nil
+	case "gitlab":
+		return gitlabprovider.NewChangeProvider(gitlabprovider.ChangeProviderOptions{}), nil
+	default:
+		return nil, fmt.Errorf("unsupported ChangeProvider %q", provider)
+	}
+}
+
 func changeProviderForRun(options Options, instanceStore *store.Store, runID int64) (workflow.ChangeProvider, error) {
 	if options.ChangeProvider != nil {
 		return options.ChangeProvider, nil

@@ -14,6 +14,25 @@ import (
 	"github.com/liiujinfu/forgelane/internal/workitems"
 )
 
+func TestParseProviderPRRefAcceptsSelfHostedGitHub(t *testing.T) {
+	ref, err := workflow.ParseProviderPRRef("github://github.enterprise.test/owner/repo/pulls/42")
+	if err != nil {
+		t.Fatalf("parse self-hosted GitHub PR ref: %v", err)
+	}
+	if ref.Provider != "github" ||
+		ref.ProviderHost != "github.enterprise.test" ||
+		ref.RepositoryPath != "owner/repo" ||
+		ref.Number != 42 {
+		t.Fatalf("unexpected PR ref %#v", ref)
+	}
+	if ref.String() != "github://github.enterprise.test/owner/repo/pulls/42" {
+		t.Fatalf("unexpected canonical PR ref %q", ref.String())
+	}
+	if ref.RepositoryRef() != "github://github.enterprise.test/owner/repo" {
+		t.Fatalf("unexpected repository ref %q", ref.RepositoryRef())
+	}
+}
+
 func TestCreatePlannedAgentRunCreatesRunSpecAndEvents(t *testing.T) {
 	instanceStore, err := store.Open(filepath.Join(t.TempDir(), "forgelane.db"))
 	if err != nil {

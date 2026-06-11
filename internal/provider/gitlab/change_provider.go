@@ -149,6 +149,61 @@ func (provider *ChangeProvider) CreateOrUpdateDraftPR(ctx context.Context, plan 
 	}, nil
 }
 
+// GetProviderPR reads current GitLab merge request state without mutating provider data.
+func (provider *ChangeProvider) GetProviderPR(ctx context.Context, ref workflow.ProviderPRRef) (workflow.ProviderPRReport, error) {
+	if ref.Provider != "gitlab" || ref.ProviderHost == "" {
+		return workflow.ProviderPRReport{}, fmt.Errorf("unsupported GitLab PR ref %s", ref.String())
+	}
+	repo, err := parseGitLabRepositoryRef(ref.RepositoryRef())
+	if err != nil {
+		return workflow.ProviderPRReport{}, err
+	}
+	endpoint := fmt.Sprintf("%s/projects/%s/merge_requests/%d", provider.apiBaseURL(repo.host), url.PathEscape(repo.path), ref.Number)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return workflow.ProviderPRReport{}, fmt.Errorf("create GitLab MR report request: %w", err)
+	}
+	if provider.token != "" {
+		request.Header.Set("PRIVATE-TOKEN", provider.token)
+	}
+
+	response, err := provider.client.Do(request)
+	if err != nil {
+		return workflow.ProviderPRReport{}, fmt.Errorf("GitLab provider failure reading PR %s: %w", ref.String(), err)
+	}
+	defer response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return workflow.ProviderPRReport{}, fmt.Errorf("GitLab merge request not found: %s", ref.String())
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return workflow.ProviderPRReport{}, fmt.Errorf("auth or permission failure reading GitLab merge request: %s", ref.String())
+	default:
+		return workflow.ProviderPRReport{}, fmt.Errorf("GitLab provider failure reading PR %s: HTTP %d", ref.String(), response.StatusCode)
+	}
+
+	var payload gitLabMergeRequestReportPayload
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return workflow.ProviderPRReport{}, fmt.Errorf("decode GitLab merge request %s: %w", ref.String(), err)
+	}
+	headSHA := payload.SHA
+	if headSHA == "" {
+		headSHA = payload.DiffRefs.HeadSHA
+	}
+	return workflow.ProviderPRReport{
+		Ref:         ref.String(),
+		Provider:    ref.Provider,
+		Repository:  ref.RepositoryRef(),
+		Number:      ref.Number,
+		Title:       payload.Title,
+		State:       payload.State,
+		Draft:       payload.Draft,
+		URL:         payload.WebURL,
+		HeadSHA:     headSHA,
+		CheckStatus: "unknown",
+	}, nil
+}
+
 func (provider *ChangeProvider) apiBaseURL(providerHost string) string {
 	if provider.baseURL != "" {
 		return provider.baseURL
@@ -285,6 +340,18 @@ func numberFromSnapshot(value any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+type gitLabMergeRequestReportPayload struct {
+	IID      int    `json:"iid"`
+	Title    string `json:"title"`
+	State    string `json:"state"`
+	Draft    bool   `json:"draft"`
+	WebURL   string `json:"web_url"`
+	SHA      string `json:"sha"`
+	DiffRefs struct {
+		HeadSHA string `json:"head_sha"`
+	} `json:"diff_refs"`
 }
 
 func compactSnapshot(snapshot map[string]any, keys ...string) map[string]any {

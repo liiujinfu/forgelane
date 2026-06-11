@@ -35,9 +35,6 @@ type ChangeProvider struct {
 // NewChangeProvider creates a GitHub ChangeProvider.
 func NewChangeProvider(options ChangeProviderOptions) *ChangeProvider {
 	baseURL := strings.TrimRight(options.BaseURL, "/")
-	if baseURL == "" {
-		baseURL = defaultAPIBaseURL
-	}
 	token := options.Token
 	if token == "" {
 		token = os.Getenv("FORGELANE_GITHUB_TOKEN")
@@ -65,7 +62,7 @@ func (provider *ChangeProvider) PushChangeSetBranch(ctx context.Context, plan wo
 	}
 	remoteURL := provider.pushRemoteURL
 	if remoteURL == "" {
-		remoteURL = "https://github.com/" + repo + ".git"
+		remoteURL = "https://" + repo.host + "/" + repo.path + ".git"
 	}
 	if requiresToken(remoteURL) && provider.token == "" {
 		return workflow.ChangeBranchPushResult{}, fmt.Errorf("missing GitHub token for branch push")
@@ -82,7 +79,7 @@ func (provider *ChangeProvider) PushChangeSetBranch(ctx context.Context, plan wo
 	}
 	return workflow.ChangeBranchPushResult{
 		ChangeSetID:       plan.ChangeSetID,
-		BranchProviderRef: fmt.Sprintf("github://github.com/%s/branches/%s", repo, plan.BranchRef),
+		BranchProviderRef: fmt.Sprintf("github://%s/%s/branches/%s", repo.host, repo.path, plan.BranchRef),
 		PushedCommitSHAs:  append([]string(nil), plan.CommitSHAs...),
 	}, nil
 }
@@ -98,7 +95,7 @@ func (provider *ChangeProvider) CreateOrUpdateDraftPR(ctx context.Context, plan 
 	}
 
 	method := http.MethodPost
-	endpoint := fmt.Sprintf("%s/repos/%s/pulls", provider.baseURL, escapeRepositoryPath(repo))
+	endpoint := fmt.Sprintf("%s/repos/%s/pulls", provider.apiBaseURL(repo.host), escapeRepositoryPath(repo.path))
 	payload := map[string]any{
 		"title": titleForChange(plan.WorkItemRef),
 		"body":  bodyForChange(plan.WorkItemRef, plan.CommitSHAs),
@@ -112,7 +109,7 @@ func (provider *ChangeProvider) CreateOrUpdateDraftPR(ctx context.Context, plan 
 			return workflow.ChangeDraftPRResult{}, err
 		}
 		method = http.MethodPatch
-		endpoint = fmt.Sprintf("%s/repos/%s/pulls/%d", provider.baseURL, escapeRepositoryPath(repo), number)
+		endpoint = fmt.Sprintf("%s/repos/%s/pulls/%d", provider.apiBaseURL(repo.host), escapeRepositoryPath(repo.path), number)
 		delete(payload, "head")
 		delete(payload, "draft")
 	}
@@ -150,10 +147,205 @@ func (provider *ChangeProvider) CreateOrUpdateDraftPR(ctx context.Context, plan 
 	draft, _ := snapshot["draft"].(bool)
 	return workflow.ChangeDraftPRResult{
 		ChangeSetID:      plan.ChangeSetID,
-		ChangeRef:        fmt.Sprintf("github://github.com/%s/pulls/%d", repo, number),
+		ChangeRef:        fmt.Sprintf("github://%s/%s/pulls/%d", repo.host, repo.path, number),
 		Draft:            draft,
 		ProviderSnapshot: compactSnapshot(snapshot, "number", "state", "draft", "html_url"),
 	}, nil
+}
+
+// GetProviderPR reads current GitHub PR state without mutating provider data.
+func (provider *ChangeProvider) GetProviderPR(ctx context.Context, ref workflow.ProviderPRRef) (workflow.ProviderPRReport, error) {
+	if ref.Provider != "github" || ref.ProviderHost == "" {
+		return workflow.ProviderPRReport{}, fmt.Errorf("unsupported GitHub PR ref %s", ref.String())
+	}
+	repo, err := parseGitHubRepositoryRef(ref.RepositoryRef())
+	if err != nil {
+		return workflow.ProviderPRReport{}, err
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/pulls/%d", provider.apiBaseURL(repo.host), escapeRepositoryPath(repo.path), ref.Number)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return workflow.ProviderPRReport{}, fmt.Errorf("create GitHub PR report request: %w", err)
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	if provider.token != "" {
+		request.Header.Set("Authorization", "Bearer "+provider.token)
+	}
+
+	response, err := provider.client.Do(request)
+	if err != nil {
+		return workflow.ProviderPRReport{}, fmt.Errorf("GitHub provider failure reading PR %s: %w", ref.String(), err)
+	}
+	defer response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return workflow.ProviderPRReport{}, fmt.Errorf("GitHub PR not found: %s", ref.String())
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return workflow.ProviderPRReport{}, fmt.Errorf("auth or permission failure reading GitHub PR: %s", ref.String())
+	default:
+		return workflow.ProviderPRReport{}, fmt.Errorf("GitHub provider failure reading PR %s: HTTP %d", ref.String(), response.StatusCode)
+	}
+
+	var payload githubPullReportPayload
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return workflow.ProviderPRReport{}, fmt.Errorf("decode GitHub PR %s: %w", ref.String(), err)
+	}
+	checkStatus := "unknown"
+	checkWarning := ""
+	if payload.Head.SHA != "" {
+		checkStatus, checkWarning = provider.gitHubPRCheckStatus(ctx, repo, payload.Head.SHA)
+	}
+	return workflow.ProviderPRReport{
+		Ref:          ref.String(),
+		Provider:     ref.Provider,
+		Repository:   ref.RepositoryRef(),
+		Number:       ref.Number,
+		Title:        payload.Title,
+		State:        payload.State,
+		Draft:        payload.Draft,
+		URL:          payload.HTMLURL,
+		HeadSHA:      payload.Head.SHA,
+		CheckStatus:  checkStatus,
+		CheckWarning: checkWarning,
+	}, nil
+}
+
+func (provider *ChangeProvider) gitHubPRCheckStatus(ctx context.Context, repo gitHubRepositoryRef, sha string) (string, string) {
+	commitStatus := provider.gitHubCombinedStatus(ctx, repo, sha)
+	checkRuns := provider.gitHubCheckRunsStatus(ctx, repo, sha)
+
+	warnings := make([]string, 0, 2)
+	if commitStatus.Warning != "" {
+		warnings = append(warnings, commitStatus.Warning)
+	}
+	if checkRuns.Warning != "" {
+		warnings = append(warnings, checkRuns.Warning)
+	}
+
+	switch {
+	case commitStatus.State == "error":
+		return "error", strings.Join(warnings, "; ")
+	case commitStatus.State == "failure" || checkRuns.State == "failure":
+		return "failure", strings.Join(warnings, "; ")
+	case checkRuns.State == "pending" || (commitStatus.State == "pending" && commitStatus.Contexts > 0):
+		return "pending", strings.Join(warnings, "; ")
+	case checkRuns.State == "success" || commitStatus.State == "success":
+		return "success", strings.Join(warnings, "; ")
+	default:
+		return "unknown", strings.Join(warnings, "; ")
+	}
+}
+
+type gitHubCommitStatusSummary struct {
+	State    string
+	Contexts int
+	Warning  string
+}
+
+func (provider *ChangeProvider) gitHubCombinedStatus(ctx context.Context, repo gitHubRepositoryRef, sha string) gitHubCommitStatusSummary {
+	endpoint := fmt.Sprintf("%s/repos/%s/commits/%s/status", provider.apiBaseURL(repo.host), escapeRepositoryPath(repo.path), url.PathEscape(sha))
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return gitHubCommitStatusSummary{Warning: fmt.Sprintf("create GitHub commit status request: %v", err)}
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	if provider.token != "" {
+		request.Header.Set("Authorization", "Bearer "+provider.token)
+	}
+	response, err := provider.client.Do(request)
+	if err != nil {
+		return gitHubCommitStatusSummary{Warning: fmt.Sprintf("GitHub commit status failure for %s: %v", sha, err)}
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return gitHubCommitStatusSummary{Warning: fmt.Sprintf("GitHub commit status unavailable for %s: HTTP %d", sha, response.StatusCode)}
+	}
+	var payload struct {
+		State    string `json:"state"`
+		Statuses []struct {
+			Context string `json:"context"`
+		} `json:"statuses"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return gitHubCommitStatusSummary{Warning: fmt.Sprintf("decode GitHub commit status for %s: %v", sha, err)}
+	}
+	return gitHubCommitStatusSummary{
+		State:    payload.State,
+		Contexts: len(payload.Statuses),
+	}
+}
+
+type gitHubCheckRunsSummary struct {
+	State   string
+	Warning string
+}
+
+func (provider *ChangeProvider) gitHubCheckRunsStatus(ctx context.Context, repo gitHubRepositoryRef, sha string) gitHubCheckRunsSummary {
+	endpoint := fmt.Sprintf("%s/repos/%s/commits/%s/check-runs?per_page=100", provider.apiBaseURL(repo.host), escapeRepositoryPath(repo.path), url.PathEscape(sha))
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return gitHubCheckRunsSummary{Warning: fmt.Sprintf("create GitHub check runs request: %v", err)}
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	if provider.token != "" {
+		request.Header.Set("Authorization", "Bearer "+provider.token)
+	}
+	response, err := provider.client.Do(request)
+	if err != nil {
+		return gitHubCheckRunsSummary{Warning: fmt.Sprintf("GitHub check runs failure for %s: %v", sha, err)}
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return gitHubCheckRunsSummary{Warning: fmt.Sprintf("GitHub check runs unavailable for %s: HTTP %d", sha, response.StatusCode)}
+	}
+	var payload struct {
+		TotalCount int `json:"total_count"`
+		CheckRuns  []struct {
+			Status     string  `json:"status"`
+			Conclusion *string `json:"conclusion"`
+		} `json:"check_runs"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return gitHubCheckRunsSummary{Warning: fmt.Sprintf("decode GitHub check runs for %s: %v", sha, err)}
+	}
+	return gitHubCheckRunsSummary{State: rollUpGitHubCheckRuns(payload.TotalCount, payload.CheckRuns)}
+}
+
+func rollUpGitHubCheckRuns(totalCount int, checkRuns []struct {
+	Status     string  `json:"status"`
+	Conclusion *string `json:"conclusion"`
+}) string {
+	if totalCount == 0 && len(checkRuns) == 0 {
+		return ""
+	}
+	hasSuccess := false
+	hasPending := false
+	for _, checkRun := range checkRuns {
+		if checkRun.Status != "completed" {
+			hasPending = true
+			continue
+		}
+		if checkRun.Conclusion == nil {
+			hasPending = true
+			continue
+		}
+		switch *checkRun.Conclusion {
+		case "success", "neutral", "skipped":
+			hasSuccess = true
+		case "failure", "cancelled", "timed_out", "action_required", "startup_failure":
+			return "failure"
+		default:
+			hasPending = true
+		}
+	}
+	if hasPending {
+		return "pending"
+	}
+	if hasSuccess {
+		return "success"
+	}
+	return ""
 }
 
 func (provider *ChangeProvider) gitCredentialEnv(remoteURL string) ([]string, func(), error) {
@@ -193,20 +385,25 @@ func runGitPush(ctx context.Context, repo string, env []string, remoteURL string
 	return nil
 }
 
-func parseGitHubRepositoryRef(raw string) (string, error) {
+type gitHubRepositoryRef struct {
+	host string
+	path string
+}
+
+func parseGitHubRepositoryRef(raw string) (gitHubRepositoryRef, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid GitHub repository ref %q", raw)
+		return gitHubRepositoryRef{}, fmt.Errorf("invalid GitHub repository ref %q", raw)
 	}
-	if parsed.Scheme != "github" || parsed.Host != "github.com" {
-		return "", fmt.Errorf("invalid GitHub repository ref %q", raw)
+	if parsed.Scheme != "github" || parsed.Host == "" {
+		return gitHubRepositoryRef{}, fmt.Errorf("invalid GitHub repository ref %q", raw)
 	}
 	repo := strings.Trim(parsed.Path, "/")
 	parts := strings.Split(repo, "/")
 	if len(parts) != 2 || !validProviderPathPart(parts[0]) || !validProviderPathPart(parts[1]) {
-		return "", fmt.Errorf("invalid GitHub repository ref %q", raw)
+		return gitHubRepositoryRef{}, fmt.Errorf("invalid GitHub repository ref %q", raw)
 	}
-	return repo, nil
+	return gitHubRepositoryRef{host: parsed.Host, path: repo}, nil
 }
 
 func parseGitHubPullNumber(raw string) (int, error) {
@@ -215,7 +412,7 @@ func parseGitHubPullNumber(raw string) (int, error) {
 		return 0, fmt.Errorf("invalid GitHub pull ref %q", raw)
 	}
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if parsed.Scheme != "github" || parsed.Host != "github.com" || len(parts) != 4 || parts[2] != "pulls" {
+	if parsed.Scheme != "github" || parsed.Host == "" || len(parts) != 4 || parts[2] != "pulls" {
 		return 0, fmt.Errorf("invalid GitHub pull ref %q", raw)
 	}
 	number, err := strconv.Atoi(parts[3])
@@ -223,6 +420,16 @@ func parseGitHubPullNumber(raw string) (int, error) {
 		return 0, fmt.Errorf("invalid GitHub pull ref %q", raw)
 	}
 	return number, nil
+}
+
+func (provider *ChangeProvider) apiBaseURL(providerHost string) string {
+	if provider.baseURL != "" {
+		return provider.baseURL
+	}
+	if providerHost == "" || providerHost == "github.com" {
+		return defaultAPIBaseURL
+	}
+	return "https://" + providerHost + "/api/v3"
 }
 
 func requiresToken(remoteURL string) bool {
@@ -268,6 +475,17 @@ func numberFromSnapshot(value any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+type githubPullReportPayload struct {
+	Number  int    `json:"number"`
+	Title   string `json:"title"`
+	State   string `json:"state"`
+	Draft   bool   `json:"draft"`
+	HTMLURL string `json:"html_url"`
+	Head    struct {
+		SHA string `json:"sha"`
+	} `json:"head"`
 }
 
 func compactSnapshot(snapshot map[string]any, keys ...string) map[string]any {
