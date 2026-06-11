@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -247,6 +249,119 @@ type ChangeDraftPRResult struct {
 	ChangeRef        string
 	Draft            bool
 	ProviderSnapshot map[string]any
+}
+
+// ProviderPRRef identifies a provider-owned code review change request.
+type ProviderPRRef struct {
+	Provider       string
+	ProviderHost   string
+	RepositoryPath string
+	Number         int
+}
+
+// ParseProviderPRRef parses a canonical provider-owned PR/MR reference.
+func ParseProviderPRRef(raw string) (ProviderPRRef, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ProviderPRRef{}, err
+	}
+	if parsed.Scheme != "github" && parsed.Scheme != "gitlab" {
+		return ProviderPRRef{}, fmt.Errorf("unsupported provider PR ref %q", raw)
+	}
+	if parsed.Scheme == "github" && parsed.Host == "" {
+		return ProviderPRRef{}, fmt.Errorf("unsupported GitHub PR host %q", parsed.Host)
+	}
+	if parsed.Scheme == "gitlab" && parsed.Host == "" {
+		return ProviderPRRef{}, fmt.Errorf("unsupported GitLab PR host %q", parsed.Host)
+	}
+
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	marker := "pulls"
+	if parsed.Scheme == "gitlab" {
+		marker = "merge_requests"
+	}
+	markerIndex := -1
+	for index, part := range parts {
+		if part == marker {
+			markerIndex = index
+			break
+		}
+	}
+	if markerIndex < 0 || markerIndex != len(parts)-2 {
+		return ProviderPRRef{}, fmt.Errorf("invalid provider PR ref %q", raw)
+	}
+	repositoryParts := parts[:markerIndex]
+	if parsed.Scheme == "github" && len(repositoryParts) != 2 {
+		return ProviderPRRef{}, fmt.Errorf("invalid GitHub PR ref %q", raw)
+	}
+	if parsed.Scheme == "gitlab" && len(repositoryParts) < 2 {
+		return ProviderPRRef{}, fmt.Errorf("invalid GitLab PR ref %q", raw)
+	}
+	for _, part := range repositoryParts {
+		if !validProviderPRRefPart(part) {
+			return ProviderPRRef{}, fmt.Errorf("invalid provider PR ref %q", raw)
+		}
+	}
+	number, err := strconv.Atoi(parts[len(parts)-1])
+	if err != nil || number <= 0 {
+		return ProviderPRRef{}, fmt.Errorf("invalid provider PR ref %q", raw)
+	}
+
+	return ProviderPRRef{
+		Provider:       parsed.Scheme,
+		ProviderHost:   parsed.Host,
+		RepositoryPath: strings.Join(repositoryParts, "/"),
+		Number:         number,
+	}, nil
+}
+
+func validProviderPRRefPart(part string) bool {
+	if part == "" || part == "." || part == ".." || strings.TrimSpace(part) != part {
+		return false
+	}
+	for _, char := range part {
+		if char < 0x21 || char > 0x7e || strings.ContainsRune(`\/?#[]@!$&'()*+,;=`, char) {
+			return false
+		}
+	}
+	return true
+}
+
+// String returns the canonical provider-owned PR reference.
+func (ref ProviderPRRef) String() string {
+	switch ref.Provider {
+	case "github":
+		return fmt.Sprintf("github://%s/%s/pulls/%d", ref.ProviderHost, ref.RepositoryPath, ref.Number)
+	case "gitlab":
+		return fmt.Sprintf("gitlab://%s/%s/merge_requests/%d", ref.ProviderHost, ref.RepositoryPath, ref.Number)
+	default:
+		return fmt.Sprintf("%s://%s/%s/pr/%d", ref.Provider, ref.ProviderHost, ref.RepositoryPath, ref.Number)
+	}
+}
+
+// RepositoryRef returns the provider-backed repository reference for the PR.
+func (ref ProviderPRRef) RepositoryRef() string {
+	return fmt.Sprintf("%s://%s/%s", ref.Provider, ref.ProviderHost, ref.RepositoryPath)
+}
+
+// ProviderPRReport is a compact read-only provider PR snapshot for operator reports.
+type ProviderPRReport struct {
+	Ref          string
+	Provider     string
+	Repository   string
+	Number       int
+	Title        string
+	State        string
+	Draft        bool
+	URL          string
+	HeadSHA      string
+	CheckStatus  string
+	CheckWarning string
+}
+
+// ProviderPRReporter reads provider-owned PR state without mutating provider data.
+type ProviderPRReporter interface {
+	GetProviderPR(context.Context, ProviderPRRef) (ProviderPRReport, error)
 }
 
 // CommitRefPlan is a local commit ref ready to persist after repository materialization.

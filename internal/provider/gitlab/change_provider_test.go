@@ -291,6 +291,53 @@ func TestChangeProviderUpdatesExistingGitLabDraftMergeRequest(t *testing.T) {
 	}
 }
 
+func TestChangeProviderReadsGitLabMergeRequestReportReadOnly(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) *http.Response {
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+		if r.URL.EscapedPath() != "/api/v4/projects/group%2Fsubgroup%2Fproject/merge_requests/11" {
+			t.Fatalf("unexpected path %s", r.URL.EscapedPath())
+		}
+		if got := r.Header.Get("PRIVATE-TOKEN"); got != "provider-token" {
+			t.Fatalf("unexpected PRIVATE-TOKEN header %q", got)
+		}
+		return jsonResponse(http.StatusOK, `{
+			"iid": 11,
+			"title": "Draft: ForgeLane delivery",
+			"state": "opened",
+			"draft": true,
+			"web_url": "https://gitlab.com/group/subgroup/project/-/merge_requests/11",
+			"sha": "abc123"
+		}`)
+	})
+	provider := NewChangeProvider(ChangeProviderOptions{
+		BaseURL: "https://gitlab.test/api/v4",
+		Token:   "provider-token",
+		Client:  client,
+	})
+
+	report, err := provider.GetProviderPR(context.Background(), workflow.ProviderPRRef{
+		Provider:       "gitlab",
+		ProviderHost:   "gitlab.com",
+		RepositoryPath: "group/subgroup/project",
+		Number:         11,
+	})
+	if err != nil {
+		t.Fatalf("read MR report: %v", err)
+	}
+	if report.Ref != "gitlab://gitlab.com/group/subgroup/project/merge_requests/11" ||
+		report.Repository != "gitlab://gitlab.com/group/subgroup/project" ||
+		report.Title != "Draft: ForgeLane delivery" ||
+		report.State != "opened" ||
+		!report.Draft ||
+		report.URL != "https://gitlab.com/group/subgroup/project/-/merge_requests/11" ||
+		report.HeadSHA != "abc123" ||
+		report.CheckStatus != "unknown" {
+		t.Fatalf("unexpected MR report %#v", report)
+	}
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 

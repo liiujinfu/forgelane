@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2352,6 +2353,630 @@ func TestRunsEvidenceSummarizesCompletedDraftPRDelivery(t *testing.T) {
 	})
 }
 
+func TestRunsReportSummarizesOperatorRun(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Summarize run status for operators",
+			Body:                "Show the run without piecing together raw commands.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true, "state": "open"},
+		},
+		providerPRReport: workflow.ProviderPRReport{
+			Ref:         "github://github.com/owner/repo/pulls/10",
+			Title:       "Draft: ForgeLane delivery",
+			State:       "open",
+			Draft:       true,
+			HeadSHA:     "abc123",
+			CheckStatus: "success",
+		},
+	}
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: tokenCheckingChangingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "start", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		ChangeProvider: changeProvider,
+	}, "runs", "report", "1")
+	if err != nil {
+		t.Fatalf("expected runs report to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Run report for AgentRun 1",
+		"WorkItem: github://github.com/owner/repo/issues/123",
+		"Run status: completed",
+		"ChangeSet status: draft_open",
+		"Provider branch: github://github.com/owner/repo/branches/forgelane/issue-123",
+		"PR: github://github.com/owner/repo/pulls/10",
+		"Check status: success",
+		"Check source: provider_pr",
+		"Commits:",
+		"github://github.com/owner/repo@",
+		"Materialize AgentRun 1 repository changes",
+		"Logs: forgelane runs logs 1",
+		"Key events:",
+		"change_set.draft_pr_succeeded",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected runs report output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestRunsReportJSONSummarizesOperatorRun(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Summarize run status as JSON",
+			Body:                "Show a stable report for scripts.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true, "state": "open"},
+		},
+		providerPRReport: workflow.ProviderPRReport{
+			Ref:         "github://github.com/owner/repo/pulls/10",
+			Title:       "Draft: ForgeLane delivery",
+			State:       "open",
+			Draft:       true,
+			HeadSHA:     "abc123",
+			CheckStatus: "success",
+		},
+	}
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: tokenCheckingChangingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "start", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		ChangeProvider: changeProvider,
+	}, "runs", "report", "1", "--json")
+	if err != nil {
+		t.Fatalf("expected runs report --json to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+
+	var report map[string]any
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("expected runs report JSON to decode: %v\n%s", err, stdout)
+	}
+	agentRun := report["agent_run"].(map[string]any)
+	if agentRun["id"] != float64(1) || agentRun["status"] != "completed" {
+		t.Fatalf("unexpected agent_run summary: %#v", agentRun)
+	}
+	workItem := report["work_item"].(map[string]any)
+	if workItem["provider_ref"] != "github://github.com/owner/repo/issues/123" || workItem["title"] != "Summarize run status as JSON" {
+		t.Fatalf("unexpected work_item summary: %#v", workItem)
+	}
+	changeSet := report["change_set"].(map[string]any)
+	if changeSet["status"] != "draft_open" ||
+		changeSet["provider_branch"] != "github://github.com/owner/repo/branches/forgelane/issue-123" ||
+		changeSet["pr_ref"] != "github://github.com/owner/repo/pulls/10" {
+		t.Fatalf("unexpected change_set summary: %#v", changeSet)
+	}
+	providerPR := report["provider_pr"].(map[string]any)
+	if providerPR["ref"] != "github://github.com/owner/repo/pulls/10" || providerPR["check_status"] != "success" {
+		t.Fatalf("unexpected provider_pr summary: %#v", providerPR)
+	}
+	checkStatus := report["check_status"].(map[string]any)
+	if checkStatus["status"] != "success" || checkStatus["source"] != "provider_pr" {
+		t.Fatalf("unexpected top-level check_status summary: %#v", checkStatus)
+	}
+	commits := report["commits"].([]any)
+	if len(commits) != 1 {
+		t.Fatalf("expected one commit, got %#v", commits)
+	}
+	logs := report["logs"].(map[string]any)
+	if logs["command"] != "forgelane runs logs 1" {
+		t.Fatalf("unexpected logs summary: %#v", logs)
+	}
+	keyEvents := report["key_events"].([]any)
+	if len(keyEvents) == 0 {
+		t.Fatalf("expected key_events in JSON report: %#v", report)
+	}
+}
+
+func TestPRReportSummarizesMappedProviderPR(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init"); err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Summarize PR status for operators",
+			Body:                "Show PR state with local delivery state.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true, "state": "open"},
+		},
+		providerPRReport: workflow.ProviderPRReport{
+			Ref:         "github://github.com/owner/repo/pulls/10",
+			Title:       "Draft: ForgeLane delivery",
+			State:       "open",
+			Draft:       true,
+			URL:         "https://github.com/owner/repo/pull/10",
+			HeadSHA:     "abc123",
+			CheckStatus: "success",
+		},
+	}
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: tokenCheckingChangingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "start", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		ChangeProvider: changeProvider,
+	}, "pr", "report", "10")
+	if err != nil {
+		t.Fatalf("expected pr report to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"PR report for github://github.com/owner/repo/pulls/10",
+		"Provider state: open",
+		"Draft: true",
+		"Check status: success",
+		"Actionable feedback: not_available",
+		"Warning: " + prReportFeedbackNotSyncedWarning,
+		"ChangeSet: 1 draft_open forgelane/issue-123",
+		"WorkItem: github://github.com/owner/repo/issues/123",
+		"Related AgentRuns:",
+		"- AgentRun 1 completed",
+		"Commits:",
+		"github://github.com/owner/repo@",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected pr report output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if len(changeProvider.prReportCalls) != 1 || changeProvider.prReportCalls[0].String() != "github://github.com/owner/repo/pulls/10" {
+		t.Fatalf("expected one provider PR report call, got %#v", changeProvider.prReportCalls)
+	}
+}
+
+func TestPRReportJSONSummarizesMappedProviderPR(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init"); err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Summarize PR status as JSON",
+			Body:                "Show PR state with local delivery state.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true, "state": "open"},
+		},
+		providerPRReport: workflow.ProviderPRReport{
+			Ref:         "github://github.com/owner/repo/pulls/10",
+			Title:       "Draft: ForgeLane delivery",
+			State:       "open",
+			Draft:       true,
+			URL:         "https://github.com/owner/repo/pull/10",
+			HeadSHA:     "abc123",
+			CheckStatus: "success",
+		},
+	}
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: tokenCheckingChangingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "start", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		ChangeProvider: changeProvider,
+	}, "pr", "report", "10", "--json")
+	if err != nil {
+		t.Fatalf("expected pr report --json to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	var report map[string]any
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("expected pr report JSON to decode: %v\n%s", err, stdout)
+	}
+	providerPR := report["provider_pr"].(map[string]any)
+	if providerPR["ref"] != "github://github.com/owner/repo/pulls/10" || providerPR["check_status"] != "success" {
+		t.Fatalf("unexpected provider_pr summary: %#v", providerPR)
+	}
+	changeSet := report["change_set"].(map[string]any)
+	if changeSet["status"] != "draft_open" || changeSet["active_for_retry"] != true {
+		t.Fatalf("unexpected change_set summary: %#v", changeSet)
+	}
+	relatedRuns := report["related_agent_runs"].([]any)
+	if len(relatedRuns) != 1 {
+		t.Fatalf("expected one related run, got %#v", relatedRuns)
+	}
+	commits := report["commits"].([]any)
+	if len(commits) != 1 {
+		t.Fatalf("expected one commit, got %#v", commits)
+	}
+	feedback := report["actionable_feedback"].(map[string]any)
+	if feedback["status"] != prReportFeedbackStatusNotAvailable || feedback["warning"] != prReportFeedbackNotSyncedWarning {
+		t.Fatalf("unexpected actionable_feedback summary: %#v", feedback)
+	}
+	warnings := report["warnings"].([]any)
+	if len(warnings) != 1 || warnings[0] != prReportFeedbackNotSyncedWarning {
+		t.Fatalf("expected actionable feedback warning, got %#v", warnings)
+	}
+}
+
+func TestPRReportShowsUnmappedProviderPRReadOnly(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init"); err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	changeProvider := &recordingChangeProvider{
+		providerPRReport: workflow.ProviderPRReport{
+			Ref:         "github://github.com/owner/repo/pulls/99",
+			Title:       "A provider-owned PR",
+			State:       "open",
+			Draft:       false,
+			URL:         "https://github.com/owner/repo/pull/99",
+			HeadSHA:     "def456",
+			CheckStatus: "pending",
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		ChangeProvider: changeProvider,
+	}, "pr", "report", "99")
+	if err != nil {
+		t.Fatalf("expected unmapped pr report to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"PR report for github://github.com/owner/repo/pulls/99",
+		"Provider state: open",
+		"Check status: pending",
+		"Actionable feedback: not_available",
+		"Warning: " + prReportFeedbackNotSyncedWarning,
+		"ChangeSet: none (unmapped)",
+		"Warning: PR is not mapped to an active ForgeLane ChangeSet for retry",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected unmapped pr report output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if len(changeProvider.prReportCalls) != 1 || changeProvider.prReportCalls[0].String() != "github://github.com/owner/repo/pulls/99" {
+		t.Fatalf("expected one provider PR report call, got %#v", changeProvider.prReportCalls)
+	}
+	assertTableCount(t, homeDir, "change_sets", 0)
+	assertTableCount(t, homeDir, "work_items", 0)
+}
+
+func TestPRReportWarnsForInactiveMappedChangeSet(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init"); err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Close stale PR mapping",
+			Body:                "Show historical state but no retry mapping.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true, "state": "open"},
+		},
+		providerPRReport: workflow.ProviderPRReport{
+			Ref:         "github://github.com/owner/repo/pulls/10",
+			Title:       "Draft: ForgeLane delivery",
+			State:       "closed",
+			Draft:       false,
+			CheckStatus: "success",
+		},
+	}
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: tokenCheckingChangingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "start", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if _, stderr, err := executeForTest(t, "runs", "close", "1", "operator closed"); err != nil {
+		t.Fatalf("expected runs close to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		ChangeProvider: changeProvider,
+	}, "pr", "report", "10", "--json")
+	if err != nil {
+		t.Fatalf("expected pr report to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	var report map[string]any
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("expected pr report JSON to decode: %v\n%s", err, stdout)
+	}
+	changeSet := report["change_set"].(map[string]any)
+	if changeSet["status"] != "closed" || changeSet["active_for_retry"] != false {
+		t.Fatalf("unexpected inactive change_set summary: %#v", changeSet)
+	}
+	warnings := report["warnings"].([]any)
+	if len(warnings) != 2 ||
+		warnings[0] != prReportFeedbackNotSyncedWarning ||
+		warnings[1] != "PR is not mapped to an active ForgeLane ChangeSet for retry" {
+		t.Fatalf("expected feedback and inactive retry warnings, got %#v", warnings)
+	}
+}
+
+func TestPRReportRejectsInvalidPRNumber(t *testing.T) {
+	stdout, stderr, err := executeForTest(t, "pr", "report", "abc")
+	if err == nil {
+		t.Fatal("expected invalid PR number to fail")
+	}
+	if !strings.Contains(err.Error(), "invalid PR number") {
+		t.Fatalf("expected invalid PR number error, got %v\nstderr:\n%s", err, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout for invalid PR number, got:\n%s", stdout)
+	}
+}
+
+func TestPRReportReturnsClearProviderErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "provider PR not found",
+			err:  fmt.Errorf("GitHub PR not found: github://github.com/owner/repo/pulls/404"),
+			want: "GitHub PR not found",
+		},
+		{
+			name: "provider auth failure",
+			err:  fmt.Errorf("auth or permission failure reading GitHub PR: github://github.com/owner/repo/pulls/10"),
+			want: "auth or permission failure reading GitHub PR",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			homeDir := t.TempDir()
+			runGit(t, workingDir, "init")
+			runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+			withWorkingDir(t, workingDir)
+			withHomeDir(t, homeDir)
+
+			if _, stderr, err := executeForTest(t, "init"); err != nil {
+				t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+			}
+
+			stdout, stderr, err := executeForTestWithOptions(t, Options{
+				ChangeProvider: &recordingChangeProvider{providerPRErr: tc.err},
+			}, "pr", "report", "10")
+			if err == nil {
+				t.Fatal("expected provider error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected error containing %q, got %v\nstderr:\n%s", tc.want, err, stderr)
+			}
+			if stdout != "" {
+				t.Fatalf("expected no stdout for provider error, got:\n%s", stdout)
+			}
+		})
+	}
+}
+
+func TestPRReportRejectsConfiguredProviderWithoutReporter(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init"); err != nil {
+		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		ChangeProvider: changeProviderWithoutReporter{},
+	}, "pr", "report", "10")
+	if err == nil {
+		t.Fatal("expected unsupported configured provider error")
+	}
+	if !strings.Contains(err.Error(), "configured ChangeProvider does not support PR reports") {
+		t.Fatalf("unexpected error %v\nstderr:\n%s", err, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout for unsupported configured provider, got:\n%s", stdout)
+	}
+}
+
 func TestRunsEvidenceReportsNoChangeDeliverySkip(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -2965,6 +3590,11 @@ func TestRunReadCommandsReturnClearErrorsForInvalidAndUnknownRunIDs(t *testing.T
 			want: "invalid AgentRun id: abc",
 		},
 		{
+			name: "runs report invalid id",
+			args: []string{"runs", "report", "abc"},
+			want: "invalid AgentRun id: abc",
+		},
+		{
 			name: "events list invalid id",
 			args: []string{"events", "list", "--run", "abc"},
 			want: "invalid AgentRun id: abc",
@@ -2977,6 +3607,11 @@ func TestRunReadCommandsReturnClearErrorsForInvalidAndUnknownRunIDs(t *testing.T
 		{
 			name: "runs evidence unknown id",
 			args: []string{"runs", "evidence", "999"},
+			want: "AgentRun not found: 999",
+		},
+		{
+			name: "runs report unknown id",
+			args: []string{"runs", "report", "999"},
 			want: "AgentRun not found: 999",
 		},
 		{
@@ -4093,12 +4728,15 @@ printf 'forgelane test change\n' > forgelane-agent-output.txt
 }
 
 type recordingChangeProvider struct {
-	pushResult    workflow.ChangeBranchPushResult
-	pushErr       error
-	calls         []workflow.ChangeBranchPushPlan
-	draftPRResult workflow.ChangeDraftPRResult
-	draftPRErr    error
-	draftPRCalls  []workflow.ChangeDraftPRPlan
+	pushResult       workflow.ChangeBranchPushResult
+	pushErr          error
+	calls            []workflow.ChangeBranchPushPlan
+	draftPRResult    workflow.ChangeDraftPRResult
+	draftPRErr       error
+	draftPRCalls     []workflow.ChangeDraftPRPlan
+	providerPRReport workflow.ProviderPRReport
+	providerPRErr    error
+	prReportCalls    []workflow.ProviderPRRef
 }
 
 func (provider *recordingChangeProvider) PushChangeSetBranch(_ context.Context, plan workflow.ChangeBranchPushPlan) (workflow.ChangeBranchPushResult, error) {
@@ -4115,6 +4753,37 @@ func (provider *recordingChangeProvider) CreateOrUpdateDraftPR(_ context.Context
 		return workflow.ChangeDraftPRResult{}, provider.draftPRErr
 	}
 	return provider.draftPRResult, nil
+}
+
+func (provider *recordingChangeProvider) GetProviderPR(_ context.Context, ref workflow.ProviderPRRef) (workflow.ProviderPRReport, error) {
+	provider.prReportCalls = append(provider.prReportCalls, ref)
+	if provider.providerPRErr != nil {
+		return workflow.ProviderPRReport{}, provider.providerPRErr
+	}
+	report := provider.providerPRReport
+	if report.Ref == "" {
+		report.Ref = ref.String()
+	}
+	if report.Provider == "" {
+		report.Provider = ref.Provider
+	}
+	if report.Repository == "" {
+		report.Repository = ref.RepositoryRef()
+	}
+	if report.Number == 0 {
+		report.Number = ref.Number
+	}
+	return report, nil
+}
+
+type changeProviderWithoutReporter struct{}
+
+func (changeProviderWithoutReporter) PushChangeSetBranch(context.Context, workflow.ChangeBranchPushPlan) (workflow.ChangeBranchPushResult, error) {
+	return workflow.ChangeBranchPushResult{}, nil
+}
+
+func (changeProviderWithoutReporter) CreateOrUpdateDraftPR(context.Context, workflow.ChangeDraftPRPlan) (workflow.ChangeDraftPRResult, error) {
+	return workflow.ChangeDraftPRResult{}, nil
 }
 
 func gitOutput(t *testing.T, workingDir string, args ...string) string {

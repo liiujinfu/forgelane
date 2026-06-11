@@ -40,6 +40,7 @@ func newRunsCommand(stdout io.Writer, options Options) *cobra.Command {
 	cmd.AddCommand(newRunsApproveCommand(stdout))
 	cmd.AddCommand(newRunsRetryCommand(stdout))
 	cmd.AddCommand(newRunsLogsCommand(stdout))
+	cmd.AddCommand(newRunsReportCommand(stdout, options))
 	return cmd
 }
 
@@ -579,6 +580,43 @@ func newRunsEvidenceCommand(stdout io.Writer) *cobra.Command {
 	}
 }
 
+func newRunsReportCommand(stdout io.Writer, options Options) *cobra.Command {
+	var jsonOutput bool
+	cmd := &cobra.Command{
+		Use:   "report <run_id>",
+		Short: "Show an operator-facing AgentRun report.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+
+			instanceStore, err := openReadOnlyStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			detail, err := instanceStore.GetAgentRunDetail(runID)
+			if err != nil {
+				return err
+			}
+			events, err := instanceStore.ListEventsForAgentRun(runID)
+			if err != nil {
+				return err
+			}
+			providerPRReport, providerPRWarning := providerPRReportForRun(cmd, options, detail)
+			if jsonOutput {
+				return printRunReportJSON(stdout, detail, events, providerPRReport, providerPRWarning)
+			}
+			return printRunReport(stdout, detail, events, providerPRReport, providerPRWarning)
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Emit a stable JSON report")
+	return cmd
+}
+
 func agentCommandPlanner(options Options) workflow.AgentCommandPlanner {
 	if options.AgentCommandPlanner != nil {
 		return options.AgentCommandPlanner
@@ -948,6 +986,268 @@ func printRunEvidence(stdout io.Writer, detail store.AgentRunDetail, segments []
 		}
 	}
 	return nil
+}
+
+func printRunReport(stdout io.Writer, detail store.AgentRunDetail, events []store.Event, providerPRReport *workflow.ProviderPRReport, providerPRWarning string) error {
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(detail.RunSpec.SpecJSON), &spec); err != nil {
+		return fmt.Errorf("decode RunSpec %d: %w", detail.RunSpec.ID, err)
+	}
+
+	fmt.Fprintf(stdout, "Run report for AgentRun %d\n", detail.AgentRun.ID)
+	fmt.Fprintf(stdout, "WorkItem: %s\n", detail.WorkItem.ProviderRef)
+	fmt.Fprintf(stdout, "WorkItem title: %s\n", detail.WorkItem.Title)
+	fmt.Fprintf(stdout, "Run status: %s\n", detail.AgentRun.Status)
+	fmt.Fprintf(stdout, "Branch: %s\n", stringField(spec, "branch"))
+	if detail.ChangeSet == nil {
+		if detail.DeliverySkipped {
+			fmt.Fprintln(stdout, "ChangeSet status: none (delivery skipped)")
+		} else {
+			fmt.Fprintln(stdout, "ChangeSet status: none")
+		}
+	} else {
+		fmt.Fprintf(stdout, "ChangeSet: %d\n", detail.ChangeSet.ID)
+		fmt.Fprintf(stdout, "ChangeSet status: %s\n", detail.ChangeSet.Status)
+		if detail.ChangeSet.BranchProviderRef != "" {
+			fmt.Fprintf(stdout, "Provider branch: %s\n", detail.ChangeSet.BranchProviderRef)
+		}
+		if detail.ChangeSet.ChangeRef != "" {
+			fmt.Fprintf(stdout, "PR: %s\n", detail.ChangeSet.ChangeRef)
+		}
+	}
+	checkStatus := runCheckStatusForReport(providerPRReport, providerPRWarning)
+	fmt.Fprintf(stdout, "Check status: %s\n", checkStatus.Status)
+	fmt.Fprintf(stdout, "Check source: %s\n", checkStatus.Source)
+	if checkStatus.Warning != "" {
+		fmt.Fprintf(stdout, "Check warning: %s\n", checkStatus.Warning)
+	}
+	if len(detail.CommitRefs) == 0 {
+		fmt.Fprintln(stdout, "Commits: none")
+	} else {
+		fmt.Fprintln(stdout, "Commits:")
+		for _, ref := range detail.CommitRefs {
+			fmt.Fprintf(stdout, "- %s@%s %s\n", ref.RepositoryRef, ref.SHA, ref.Subject)
+		}
+	}
+	if detail.Workspace != nil {
+		fmt.Fprintf(stdout, "Logs: forgelane runs logs %d\n", detail.AgentRun.ID)
+		fmt.Fprintf(stdout, "Workspace logs: %s\n", detail.Workspace.Paths.Logs)
+	} else {
+		fmt.Fprintln(stdout, "Logs: workspace not prepared")
+	}
+	keyEvents := filteredEvidenceEvents(events)
+	if len(keyEvents) == 0 {
+		fmt.Fprintln(stdout, "Key events: none")
+		return nil
+	}
+	fmt.Fprintln(stdout, "Key events:")
+	for _, event := range keyEvents {
+		fmt.Fprintf(stdout, "- #%d %s %s\n", event.ID, event.Type, event.SubjectRef)
+	}
+	return nil
+}
+
+type runReport struct {
+	AgentRun    runReportAgentRun    `json:"agent_run"`
+	WorkItem    runReportWorkItem    `json:"work_item"`
+	ChangeSet   *runReportChangeSet  `json:"change_set"`
+	CheckStatus runReportCheckStatus `json:"check_status"`
+	ProviderPR  *prReportProviderPR  `json:"provider_pr"`
+	Commits     []runReportCommit    `json:"commits"`
+	Logs        runReportLogs        `json:"logs"`
+	KeyEvents   []runReportEvent     `json:"key_events"`
+	Warnings    []string             `json:"warnings"`
+}
+
+type runReportAgentRun struct {
+	ID        int64  `json:"id"`
+	Status    string `json:"status"`
+	Branch    string `json:"branch"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type runReportWorkItem struct {
+	ID          int64  `json:"id"`
+	ProviderRef string `json:"provider_ref"`
+	Title       string `json:"title"`
+	Status      string `json:"status"`
+}
+
+type runReportChangeSet struct {
+	ID             int64  `json:"id"`
+	Status         string `json:"status"`
+	Branch         string `json:"branch"`
+	ProviderBranch string `json:"provider_branch"`
+	PRRef          string `json:"pr_ref"`
+	Draft          bool   `json:"draft"`
+	ActiveRunID    int64  `json:"active_run_id"`
+}
+
+type runReportCheckStatus struct {
+	Status  string `json:"status"`
+	Source  string `json:"source"`
+	Warning string `json:"warning,omitempty"`
+}
+
+type runReportCommit struct {
+	RepositoryRef string `json:"repository_ref"`
+	SHA           string `json:"sha"`
+	Subject       string `json:"subject"`
+	AuthorName    string `json:"author_name"`
+	AuthorEmail   string `json:"author_email"`
+}
+
+type runReportLogs struct {
+	Command       string `json:"command"`
+	WorkspaceLogs string `json:"workspace_logs"`
+}
+
+type runReportEvent struct {
+	ID         int64  `json:"id"`
+	Type       string `json:"type"`
+	SubjectRef string `json:"subject_ref"`
+}
+
+func printRunReportJSON(stdout io.Writer, detail store.AgentRunDetail, events []store.Event, providerPRReport *workflow.ProviderPRReport, providerPRWarning string) error {
+	report, err := buildRunReport(detail, events, providerPRReport, providerPRWarning)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(stdout)
+	return encoder.Encode(report)
+}
+
+func buildRunReport(detail store.AgentRunDetail, events []store.Event, providerPRReport *workflow.ProviderPRReport, providerPRWarning string) (runReport, error) {
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(detail.RunSpec.SpecJSON), &spec); err != nil {
+		return runReport{}, fmt.Errorf("decode RunSpec %d: %w", detail.RunSpec.ID, err)
+	}
+	report := runReport{
+		AgentRun: runReportAgentRun{
+			ID:        detail.AgentRun.ID,
+			Status:    detail.AgentRun.Status,
+			Branch:    stringField(spec, "branch"),
+			CreatedAt: detail.AgentRun.CreatedAt,
+			UpdatedAt: detail.AgentRun.UpdatedAt,
+		},
+		WorkItem: runReportWorkItem{
+			ID:          detail.WorkItem.ID,
+			ProviderRef: detail.WorkItem.ProviderRef,
+			Title:       detail.WorkItem.Title,
+			Status:      detail.WorkItem.Status,
+		},
+		Commits:     make([]runReportCommit, 0, len(detail.CommitRefs)),
+		KeyEvents:   make([]runReportEvent, 0, len(events)),
+		CheckStatus: runCheckStatusForReport(providerPRReport, providerPRWarning),
+		Warnings:    runReportWarnings(providerPRReport, providerPRWarning),
+	}
+	if detail.ChangeSet != nil {
+		report.ChangeSet = &runReportChangeSet{
+			ID:             detail.ChangeSet.ID,
+			Status:         detail.ChangeSet.Status,
+			Branch:         detail.ChangeSet.BranchRef,
+			ProviderBranch: detail.ChangeSet.BranchProviderRef,
+			PRRef:          detail.ChangeSet.ChangeRef,
+			Draft:          detail.ChangeSet.ChangeDraft,
+			ActiveRunID:    detail.ChangeSet.ActiveRunID,
+		}
+	}
+	if providerPRReport != nil {
+		checkStatus := providerPRReport.CheckStatus
+		if checkStatus == "" {
+			checkStatus = "unknown"
+		}
+		report.ProviderPR = &prReportProviderPR{
+			Ref:          providerPRReport.Ref,
+			Provider:     providerPRReport.Provider,
+			Repository:   providerPRReport.Repository,
+			Number:       providerPRReport.Number,
+			Title:        providerPRReport.Title,
+			State:        providerPRReport.State,
+			Draft:        providerPRReport.Draft,
+			URL:          providerPRReport.URL,
+			HeadSHA:      providerPRReport.HeadSHA,
+			CheckStatus:  checkStatus,
+			CheckWarning: providerPRReport.CheckWarning,
+		}
+	}
+	for _, ref := range detail.CommitRefs {
+		report.Commits = append(report.Commits, runReportCommit{
+			RepositoryRef: ref.RepositoryRef,
+			SHA:           ref.SHA,
+			Subject:       ref.Subject,
+			AuthorName:    ref.AuthorName,
+			AuthorEmail:   ref.AuthorEmail,
+		})
+	}
+	if detail.Workspace != nil {
+		report.Logs = runReportLogs{
+			Command:       fmt.Sprintf("forgelane runs logs %d", detail.AgentRun.ID),
+			WorkspaceLogs: detail.Workspace.Paths.Logs,
+		}
+	}
+	for _, event := range filteredEvidenceEvents(events) {
+		report.KeyEvents = append(report.KeyEvents, runReportEvent{
+			ID:         event.ID,
+			Type:       event.Type,
+			SubjectRef: event.SubjectRef,
+		})
+	}
+	return report, nil
+}
+
+func runCheckStatusForReport(providerPRReport *workflow.ProviderPRReport, providerPRWarning string) runReportCheckStatus {
+	if providerPRReport == nil {
+		source := "none"
+		if providerPRWarning != "" {
+			source = "provider_pr_lookup"
+		}
+		return runReportCheckStatus{
+			Status:  "unknown",
+			Source:  source,
+			Warning: providerPRWarning,
+		}
+	}
+	status := providerPRReport.CheckStatus
+	if status == "" {
+		status = "unknown"
+	}
+	return runReportCheckStatus{
+		Status:  status,
+		Source:  "provider_pr",
+		Warning: providerPRReport.CheckWarning,
+	}
+}
+
+func providerPRReportForRun(cmd *cobra.Command, options Options, detail store.AgentRunDetail) (*workflow.ProviderPRReport, string) {
+	if detail.ChangeSet == nil || detail.ChangeSet.ChangeRef == "" {
+		return nil, ""
+	}
+	ref, err := workflow.ParseProviderPRRef(detail.ChangeSet.ChangeRef)
+	if err != nil {
+		return nil, err.Error()
+	}
+	reporter, err := changeReporterForProvider(options, ref.Provider)
+	if err != nil {
+		return nil, err.Error()
+	}
+	providerReport, err := reporter.GetProviderPR(cmd.Context(), ref)
+	if err != nil {
+		return nil, err.Error()
+	}
+	return &providerReport, ""
+}
+
+func runReportWarnings(providerPRReport *workflow.ProviderPRReport, providerPRWarning string) []string {
+	warnings := []string{}
+	if providerPRWarning != "" {
+		warnings = append(warnings, providerPRWarning)
+	}
+	if providerPRReport != nil && providerPRReport.CheckWarning != "" {
+		warnings = append(warnings, providerPRReport.CheckWarning)
+	}
+	return warnings
 }
 
 func printEvidenceDelivery(stdout io.Writer, detail store.AgentRunDetail, events []store.Event) {

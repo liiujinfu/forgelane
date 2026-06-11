@@ -212,6 +212,236 @@ func TestChangeProviderUpdatesExistingGitHubDraftPR(t *testing.T) {
 	}
 }
 
+func TestChangeProviderReadsGitHubPRReportWithCheckStatus(t *testing.T) {
+	requests := 0
+	client := fakeHTTPClient(func(r *http.Request) *http.Response {
+		requests++
+		if got := r.Header.Get("Authorization"); got != "Bearer provider-token" {
+			t.Fatalf("unexpected authorization header %q", got)
+		}
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls/10":
+			if r.Method != http.MethodGet {
+				t.Fatalf("unexpected PR report method %s", r.Method)
+			}
+			return jsonResponse(http.StatusOK, `{
+				"number": 10,
+				"title": "Draft: ForgeLane delivery",
+				"state": "open",
+				"draft": true,
+				"html_url": "https://github.com/owner/repo/pull/10",
+				"head": {"sha": "abc123"}
+			}`)
+		case "/repos/owner/repo/commits/abc123/status":
+			if r.Method != http.MethodGet {
+				t.Fatalf("unexpected status method %s", r.Method)
+			}
+			return jsonResponse(http.StatusOK, `{"state":"success"}`)
+		case "/repos/owner/repo/commits/abc123/check-runs":
+			if r.Method != http.MethodGet {
+				t.Fatalf("unexpected check-runs method %s", r.Method)
+			}
+			return jsonResponse(http.StatusOK, `{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success"}]}`)
+		default:
+			t.Fatalf("unexpected request path %s", r.URL.Path)
+		}
+		return jsonResponse(http.StatusInternalServerError, `{}`)
+	})
+	provider := NewChangeProvider(ChangeProviderOptions{
+		BaseURL: "https://api.github.test",
+		Token:   "provider-token",
+		Client:  client,
+	})
+
+	report, err := provider.GetProviderPR(context.Background(), workflow.ProviderPRRef{
+		Provider:       "github",
+		ProviderHost:   "github.com",
+		RepositoryPath: "owner/repo",
+		Number:         10,
+	})
+	if err != nil {
+		t.Fatalf("read PR report: %v", err)
+	}
+
+	if report.Ref != "github://github.com/owner/repo/pulls/10" ||
+		report.Repository != "github://github.com/owner/repo" ||
+		report.Title != "Draft: ForgeLane delivery" ||
+		report.State != "open" ||
+		!report.Draft ||
+		report.URL != "https://github.com/owner/repo/pull/10" ||
+		report.HeadSHA != "abc123" ||
+		report.CheckStatus != "success" {
+		t.Fatalf("unexpected PR report %#v", report)
+	}
+	if requests != 3 {
+		t.Fatalf("expected PR, status, and check-runs requests, got %d", requests)
+	}
+}
+
+func TestChangeProviderReadsSelfHostedGitHubPRReport(t *testing.T) {
+	requests := 0
+	client := fakeHTTPClient(func(r *http.Request) *http.Response {
+		requests++
+		if r.URL.Scheme != "https" || r.URL.Host != "github.enterprise.test" {
+			t.Fatalf("unexpected self-hosted GitHub URL %s", r.URL.String())
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer provider-token" {
+			t.Fatalf("unexpected authorization header %q", got)
+		}
+		switch r.URL.Path {
+		case "/api/v3/repos/owner/repo/pulls/10":
+			return jsonResponse(http.StatusOK, `{
+				"number": 10,
+				"title": "Enterprise GitHub delivery",
+				"state": "open",
+				"draft": false,
+				"html_url": "https://github.enterprise.test/owner/repo/pull/10",
+				"head": {"sha": "abc123"}
+			}`)
+		case "/api/v3/repos/owner/repo/commits/abc123/status":
+			return jsonResponse(http.StatusOK, `{"state":"success"}`)
+		case "/api/v3/repos/owner/repo/commits/abc123/check-runs":
+			return jsonResponse(http.StatusOK, `{"total_count":0,"check_runs":[]}`)
+		default:
+			t.Fatalf("unexpected request path %s", r.URL.Path)
+		}
+		return jsonResponse(http.StatusInternalServerError, `{}`)
+	})
+	provider := NewChangeProvider(ChangeProviderOptions{
+		Token:  "provider-token",
+		Client: client,
+	})
+
+	report, err := provider.GetProviderPR(context.Background(), workflow.ProviderPRRef{
+		Provider:       "github",
+		ProviderHost:   "github.enterprise.test",
+		RepositoryPath: "owner/repo",
+		Number:         10,
+	})
+	if err != nil {
+		t.Fatalf("read self-hosted GitHub PR report: %v", err)
+	}
+
+	if report.Ref != "github://github.enterprise.test/owner/repo/pulls/10" ||
+		report.Repository != "github://github.enterprise.test/owner/repo" ||
+		report.Title != "Enterprise GitHub delivery" ||
+		report.CheckStatus != "success" {
+		t.Fatalf("unexpected self-hosted PR report %#v", report)
+	}
+	if requests != 3 {
+		t.Fatalf("expected PR, status, and check-runs requests, got %d", requests)
+	}
+}
+
+func TestChangeProviderReadsGitHubCheckRunsWhenCommitStatusesAreEmpty(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) *http.Response {
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls/10":
+			return jsonResponse(http.StatusOK, `{
+				"number": 10,
+				"title": "Draft: ForgeLane delivery",
+				"state": "open",
+				"draft": true,
+				"html_url": "https://github.com/owner/repo/pull/10",
+				"head": {"sha": "abc123"}
+			}`)
+		case "/repos/owner/repo/commits/abc123/status":
+			return jsonResponse(http.StatusOK, `{"state":"pending","statuses":[]}`)
+		case "/repos/owner/repo/commits/abc123/check-runs":
+			return jsonResponse(http.StatusOK, `{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success"}]}`)
+		default:
+			t.Fatalf("unexpected request path %s", r.URL.Path)
+		}
+		return jsonResponse(http.StatusInternalServerError, `{}`)
+	})
+	provider := NewChangeProvider(ChangeProviderOptions{
+		BaseURL: "https://api.github.test",
+		Token:   "provider-token",
+		Client:  client,
+	})
+
+	report, err := provider.GetProviderPR(context.Background(), workflow.ProviderPRRef{
+		Provider:       "github",
+		ProviderHost:   "github.com",
+		RepositoryPath: "owner/repo",
+		Number:         10,
+	})
+	if err != nil {
+		t.Fatalf("read PR report: %v", err)
+	}
+	if report.CheckStatus != "success" {
+		t.Fatalf("expected check-runs status success, got %#v", report)
+	}
+}
+
+func TestChangeProviderWarnsWhenGitHubStatusLookupFails(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) *http.Response {
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls/10":
+			return jsonResponse(http.StatusOK, `{
+				"number": 10,
+				"title": "Draft: ForgeLane delivery",
+				"state": "open",
+				"draft": true,
+				"html_url": "https://github.com/owner/repo/pull/10",
+				"head": {"sha": "abc123"}
+			}`)
+		case "/repos/owner/repo/commits/abc123/status":
+			return jsonResponse(http.StatusForbidden, `{"message":"forbidden"}`)
+		case "/repos/owner/repo/commits/abc123/check-runs":
+			return jsonResponse(http.StatusOK, `{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success"}]}`)
+		default:
+			t.Fatalf("unexpected request path %s", r.URL.Path)
+		}
+		return jsonResponse(http.StatusInternalServerError, `{}`)
+	})
+	provider := NewChangeProvider(ChangeProviderOptions{
+		BaseURL: "https://api.github.test",
+		Token:   "provider-token",
+		Client:  client,
+	})
+
+	report, err := provider.GetProviderPR(context.Background(), workflow.ProviderPRRef{
+		Provider:       "github",
+		ProviderHost:   "github.com",
+		RepositoryPath: "owner/repo",
+		Number:         10,
+	})
+	if err != nil {
+		t.Fatalf("read PR report: %v", err)
+	}
+	if report.CheckStatus != "success" {
+		t.Fatalf("expected check status success from check runs, got %#v", report)
+	}
+	if !strings.Contains(report.CheckWarning, "GitHub commit status unavailable") {
+		t.Fatalf("expected commit status warning, got %#v", report)
+	}
+}
+
+func TestChangeProviderReportsGitHubPRAuthFailure(t *testing.T) {
+	client := fakeHTTPClient(func(_ *http.Request) *http.Response {
+		return jsonResponse(http.StatusForbidden, `{"message":"forbidden"}`)
+	})
+	provider := NewChangeProvider(ChangeProviderOptions{
+		BaseURL: "https://api.github.test",
+		Token:   "provider-token",
+		Client:  client,
+	})
+
+	_, err := provider.GetProviderPR(context.Background(), workflow.ProviderPRRef{
+		Provider:       "github",
+		ProviderHost:   "github.com",
+		RepositoryPath: "owner/repo",
+		Number:         10,
+	})
+	if err == nil {
+		t.Fatal("expected PR auth failure")
+	}
+	if !strings.Contains(err.Error(), "auth or permission failure reading GitHub PR") {
+		t.Fatalf("unexpected error %v", err)
+	}
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 
