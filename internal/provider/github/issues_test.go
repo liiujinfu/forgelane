@@ -68,6 +68,69 @@ func TestIssueProviderReadsGitHubIssueSnapshot(t *testing.T) {
 	}
 }
 
+func TestIssueProviderListsGitHubReadyIssues(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) *http.Response {
+		if r.URL.Path != "/repos/owner/repo/issues" {
+			t.Fatalf("unexpected request path %s", r.URL.Path)
+		}
+		query := r.URL.Query()
+		if query.Get("state") != "open" {
+			t.Fatalf("expected open state query, got %q", query.Get("state"))
+		}
+		if query.Get("labels") != "ready-for-agent" {
+			t.Fatalf("expected ready label query, got %q", query.Get("labels"))
+		}
+		if query.Get("per_page") != "100" {
+			t.Fatalf("expected per_page=100, got %q", query.Get("per_page"))
+		}
+		return jsonResponse(http.StatusOK, `[
+			{
+				"number": 123,
+				"title": "Ready implementation slice",
+				"body": "Build the issue-first operator entry.",
+				"state": "open",
+				"html_url": "https://github.com/owner/repo/issues/123",
+				"updated_at": "2026-05-30T09:10:11Z"
+			},
+			{
+				"number": 124,
+				"title": "Pull request returned by issues API",
+				"state": "open",
+				"html_url": "https://github.com/owner/repo/pull/124",
+				"updated_at": "2026-05-30T09:10:11Z",
+				"pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/124"}
+			}
+		]`)
+	})
+
+	provider := NewIssueProvider(Options{
+		BaseURL: "https://api.github.test",
+		Token:   "test-token",
+		Client:  client,
+	})
+	issues, err := provider.ListIssues(context.Background(), workitems.ProviderIssueListInput{
+		Repository: workitems.ProviderRepositoryRef{
+			Provider:       "github",
+			ProviderHost:   "github.com",
+			RepositoryPath: "owner/repo",
+		},
+		Labels: []string{"ready-for-agent"},
+	})
+	if err != nil {
+		t.Fatalf("expected issue list to succeed: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("expected one non-PR issue, got %#v", issues)
+	}
+	issue := issues[0]
+	if issue.ProviderRef != "github://github.com/owner/repo/issues/123" {
+		t.Fatalf("unexpected ProviderRef %q", issue.ProviderRef)
+	}
+	if issue.Title != "Ready implementation slice" || issue.Status != "open" {
+		t.Fatalf("unexpected listed issue %#v", issue)
+	}
+}
+
 func TestIssueProviderPrefersForgeLaneGitHubToken(t *testing.T) {
 	t.Setenv("FORGELANE_GITHUB_TOKEN", "forgelane-token")
 	t.Setenv("GITHUB_TOKEN", "github-token")

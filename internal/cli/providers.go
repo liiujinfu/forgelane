@@ -27,6 +27,35 @@ func workItemProviderForRef(options Options, ref workitems.ProviderRef) (workite
 	}
 }
 
+func workItemIssueListerForRepository(options Options, repository workitems.ProviderRepositoryRef) (workitems.ProviderIssueLister, error) {
+	if options.WorkItemProvider != nil {
+		lister, ok := options.WorkItemProvider.(workitems.ProviderIssueLister)
+		if !ok {
+			return nil, fmt.Errorf("configured WorkItem provider does not support issue listing")
+		}
+		return lister, nil
+	}
+	if options.WorkItemProviderFactory != nil {
+		provider, err := options.WorkItemProviderFactory(repository.IssueRef(1))
+		if err != nil {
+			return nil, err
+		}
+		lister, ok := provider.(workitems.ProviderIssueLister)
+		if !ok {
+			return nil, fmt.Errorf("configured WorkItem provider does not support issue listing")
+		}
+		return lister, nil
+	}
+	switch repository.Provider {
+	case "github":
+		return githubprovider.NewIssueProvider(githubprovider.Options{}), nil
+	case "gitlab":
+		return gitlabprovider.NewIssueProvider(gitlabprovider.Options{}), nil
+	default:
+		return nil, fmt.Errorf("unsupported WorkItem provider %q", repository.Provider)
+	}
+}
+
 func changeProviderForProvider(options Options, provider string) (workflow.ChangeProvider, error) {
 	if options.ChangeProvider != nil {
 		return options.ChangeProvider, nil

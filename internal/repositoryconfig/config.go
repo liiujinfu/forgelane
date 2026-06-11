@@ -87,7 +87,7 @@ func forgeProjectFromOptions(options InitOptions) (ForgeProject, error) {
 		}
 	}
 	if provider == "" && options.RepoURL == "" && options.Repo == "" {
-		return ForgeProject{}, fmt.Errorf("missing repository; pass --repo-url")
+		return InferForgeProjectFromOrigin(options.WorkingDir)
 	}
 	if provider != "github" && provider != "gitlab" {
 		return ForgeProject{}, fmt.Errorf("unsupported provider %q", provider)

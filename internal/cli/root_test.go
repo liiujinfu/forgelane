@@ -295,6 +295,259 @@ func TestWorkItemImportAndShowResolveIssueNumberThroughCurrentForgeProject(t *te
 	}
 }
 
+func TestIssueListReadyUsesDefaultReadinessLabelWithoutWritingWorkItems(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "git@github.com:owner/repo.git")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init"); err != nil {
+		t.Fatalf("expected bare init to persist current ForgeProject: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		listIssues: []workitems.ProviderIssue{
+			{
+				ProviderRef:         "github://github.com/owner/repo/issues/123",
+				RepositoryRef:       "github://github.com/owner/repo",
+				Provider:            "github",
+				ProviderIssueNumber: 123,
+				Title:               "Ready implementation slice",
+				Status:              "open",
+				RawStatus:           "open",
+				URL:                 "https://github.com/owner/repo/issues/123",
+				ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+			},
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "issue", "list", "--ready")
+	if err != nil {
+		t.Fatalf("expected ready issue list to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Ready issues for github://github.com/owner/repo",
+		"#123 Ready implementation slice",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected issue list output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if fakeProvider.calls != 0 {
+		t.Fatalf("expected issue list not to import selected issues, got %d GetIssue calls", fakeProvider.calls)
+	}
+	if fakeProvider.listCalls != 1 {
+		t.Fatalf("expected one provider issue list call, got %d", fakeProvider.listCalls)
+	}
+	if got := fakeProvider.lastList.Repository.String(); got != "github://github.com/owner/repo" {
+		t.Fatalf("unexpected issue list repository %q", got)
+	}
+	if strings.Join(fakeProvider.lastList.Labels, ",") != "ready-for-agent" {
+		t.Fatalf("expected default ready-for-agent label, got %#v", fakeProvider.lastList.Labels)
+	}
+	assertTableCount(t, homeDir, "work_items", 0)
+	assertTableCount(t, homeDir, "agent_runs", 0)
+	assertTableCount(t, homeDir, "events", 0)
+}
+
+func TestIssueListReadyUsesWorkflowContractReadinessLabel(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	contract := `{
+  "version": 1,
+  "agent": {"default_preset": "harmless-echo"},
+  "tracker": {"labels": {"ready_for_agent": "agent-ready"}},
+  "verification": {"test_command": "go test ./...", "evidence": [], "manual_review": []},
+  "approvals": {"provider_mutations": "", "privileged_actions": ""}
+}
+`
+	if err := os.WriteFile(filepath.Join(workingDir, "forgelane.workflow.json"), []byte(contract), 0o644); err != nil {
+		t.Fatalf("write workflow contract: %v", err)
+	}
+	if _, stderr, err := executeForTest(t, "init"); err != nil {
+		t.Fatalf("expected bare init to persist current ForgeProject: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{}
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "issue", "list", "--ready")
+	if err != nil {
+		t.Fatalf("expected ready issue list to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "No ready issues for github://github.com/owner/repo") {
+		t.Fatalf("expected empty ready issue output, got:\n%s", stdout)
+	}
+	if strings.Join(fakeProvider.lastList.Labels, ",") != "agent-ready" {
+		t.Fatalf("expected workflow contract ready label, got %#v", fakeProvider.lastList.Labels)
+	}
+	assertTableCount(t, homeDir, "work_items", 0)
+}
+
+func TestIssueStartImportsSelectedWorkItemAndUsesDraftPRDeliveryPath(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "git@github.com:owner/repo.git")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init"); err != nil {
+		t.Fatalf("expected bare init to persist current ForgeProject: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Start issue-first delivery",
+			Body:                "Issue start should reuse the existing delivery path.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true},
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "issue", "start", "--agent-preset", "harmless-echo", "123")
+	if err != nil {
+		t.Fatalf("expected issue start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Started AgentRun 1",
+		"WorkItem: github://github.com/owner/repo/issues/123",
+		"Status: completed",
+		"Branch: forgelane/issue-123",
+		"Delivery: draft PR ready",
+		"ChangeSet ID: 1",
+		"Provider branch: github://github.com/owner/repo/branches/forgelane/issue-123",
+		"Draft PR: github://github.com/owner/repo/pulls/10",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected issue start output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if fakeProvider.calls != 1 {
+		t.Fatalf("expected issue start to import only the selected WorkItem, got %d GetIssue calls", fakeProvider.calls)
+	}
+	if fakeProvider.listCalls != 0 {
+		t.Fatalf("expected issue start not to list candidate issues, got %d list calls", fakeProvider.listCalls)
+	}
+	if len(changeProvider.calls) != 1 {
+		t.Fatalf("expected one fake Change Provider push, got %#v", changeProvider.calls)
+	}
+	if len(changeProvider.draftPRCalls) != 1 {
+		t.Fatalf("expected one fake Change Provider draft PR call, got %#v", changeProvider.draftPRCalls)
+	}
+	assertTableCount(t, homeDir, "work_items", 1)
+	assertTableCount(t, homeDir, "agent_runs", 1)
+	assertTableCount(t, homeDir, "change_sets", 1)
+}
+
+func TestIssueStartRefreshesSelectedWorkItemWhenCached(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	if _, stderr, err := executeForTest(t, "init"); err != nil {
+		t.Fatalf("expected bare init to persist current ForgeProject: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Old cached title",
+			Body:                "The cached WorkItem should not be reused by issue start.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "work-items", "import", "123"); err != nil {
+		t.Fatalf("expected initial work item import to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider.issue.Title = "Fresh selected title"
+	fakeProvider.issue.ProviderUpdatedAt = time.Date(2026, 5, 31, 9, 10, 11, 0, time.UTC)
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "issue", "start", "--agent-preset", "harmless-echo", "123")
+	if err != nil {
+		t.Fatalf("expected issue start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if !strings.Contains(stdout, "Started AgentRun 1") {
+		t.Fatalf("expected issue start output, got:\n%s", stdout)
+	}
+	if fakeProvider.calls != 2 {
+		t.Fatalf("expected issue start to refresh the selected provider issue after initial import, got %d GetIssue calls", fakeProvider.calls)
+	}
+	if got := readWorkItemTitle(t, homeDir, "github://github.com/owner/repo/issues/123"); got != "Fresh selected title" {
+		t.Fatalf("expected issue start to refresh cached WorkItem title, got %q", got)
+	}
+	assertTableCount(t, homeDir, "work_items", 1)
+	assertTableCount(t, homeDir, "agent_runs", 1)
+}
+
 func TestWorkItemImportIssueNumberDoesNotGuessSingleForgeProject(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -3466,7 +3719,7 @@ func TestInitInfersGitLabForgeProjectFromOriginRemote(t *testing.T) {
 	withWorkingDir(t, workingDir)
 	withHomeDir(t, homeDir)
 
-	stdout, stderr, err := executeForTest(t, "init", "--provider", "gitlab")
+	stdout, stderr, err := executeForTest(t, "init")
 	if err != nil {
 		t.Fatalf("expected init to succeed: %v\nstderr:\n%s", err, stderr)
 	}
@@ -3656,6 +3909,30 @@ func TestInitInferenceInspectsOnlyOrigin(t *testing.T) {
 	}
 }
 
+func TestBareInitRejectsUnsupportedOriginRemote(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "https://git.example.com/owner/repo")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	stdout, stderr, err := executeForTest(t, "init")
+	if err == nil {
+		t.Fatal("expected bare init with unsupported origin to fail")
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, `unsupported repository URL "https://git.example.com/owner/repo"`) {
+		t.Fatalf("expected unsupported origin error, got:\n%s", stderr)
+	}
+	stateDir := filepath.Join(homeDir, ".forgelane")
+	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+		t.Fatalf("unsupported bare init should not create state directory %s, stat err: %v", stateDir, err)
+	}
+}
+
 func TestInitExplicitRepositoryWinsOverInferredOrigin(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -3679,23 +3956,27 @@ func TestInitExplicitRepositoryWinsOverInferredOrigin(t *testing.T) {
 	assertForgeProjects(t, homeDir, []string{"github://github.com/explicit/repo"})
 }
 
-func TestInitDoesNotInferOriginWithoutProvider(t *testing.T) {
+func TestInitInfersOriginWithoutProvider(t *testing.T) {
 	workingDir := t.TempDir()
+	homeDir := t.TempDir()
 	runGit(t, workingDir, "init")
 	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
 	withWorkingDir(t, workingDir)
-	withHomeDir(t, t.TempDir())
+	withHomeDir(t, homeDir)
 
 	stdout, stderr, err := executeForTest(t, "init")
-	if err == nil {
-		t.Fatal("expected init to fail")
+	if err != nil {
+		t.Fatalf("expected bare init to infer origin: %v\nstderr:\n%s", err, stderr)
 	}
-	if stdout != "" {
-		t.Fatalf("expected no stdout, got %q", stdout)
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
 	}
-	if !strings.Contains(stderr, "missing repository; pass --repo-url") {
-		t.Fatalf("expected missing repository error, got:\n%s", stderr)
+	if !strings.Contains(stdout, "Configured ForgeProject github://github.com/owner/repo") {
+		t.Fatalf("expected init output to describe inferred ForgeProject, got:\n%s", stdout)
 	}
+
+	assertNoRepoLocalConfig(t, workingDir)
+	assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
 }
 
 func TestInitIsIdempotentForMatchingForgeProject(t *testing.T) {
@@ -3940,6 +4221,23 @@ func readWorkItemStatus(t *testing.T, homeDir string, providerRef string) (strin
 	return status, rawStatus
 }
 
+func readWorkItemTitle(t *testing.T, homeDir string, providerRef string) string {
+	t.Helper()
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	var title string
+	err := db.QueryRow(
+		"SELECT title FROM work_items WHERE provider_ref = ?",
+		providerRef,
+	).Scan(&title)
+	if err != nil {
+		t.Fatalf("query WorkItem title %s: %v", providerRef, err)
+	}
+	return title
+}
+
 func assertEventTypes(t *testing.T, homeDir string, wantTypes []string) {
 	t.Helper()
 
@@ -4150,9 +4448,13 @@ func assertInOrder(t *testing.T, text string, values []string) {
 }
 
 type recordingWorkItemProvider struct {
-	issue workitems.ProviderIssue
-	err   error
-	calls int
+	issue      workitems.ProviderIssue
+	listIssues []workitems.ProviderIssue
+	err        error
+	listErr    error
+	calls      int
+	listCalls  int
+	lastList   workitems.ProviderIssueListInput
 }
 
 func (provider *recordingWorkItemProvider) GetIssue(_ context.Context, providerRef workitems.ProviderRef) (workitems.ProviderIssue, error) {
@@ -4164,4 +4466,13 @@ func (provider *recordingWorkItemProvider) GetIssue(_ context.Context, providerR
 		return workitems.ProviderIssue{}, workitems.NotFoundError{ProviderRef: got}
 	}
 	return provider.issue, nil
+}
+
+func (provider *recordingWorkItemProvider) ListIssues(_ context.Context, input workitems.ProviderIssueListInput) ([]workitems.ProviderIssue, error) {
+	provider.listCalls++
+	provider.lastList = input
+	if provider.listErr != nil {
+		return nil, provider.listErr
+	}
+	return slices.Clone(provider.listIssues), nil
 }
