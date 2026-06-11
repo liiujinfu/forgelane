@@ -86,15 +86,18 @@ Stable core:
 This repository is currently in the v0 CLI delivery-loop stage. The CLI exposes
 help, version, local repository initialization, WorkItem import/show, planned
 AgentRun creation/show, Workspace preparation, agent command execution, log
-inspection, ChangeSet delivery, run Event listing, stop, and retry. Default
-tests use fake providers and local git remotes; real provider mutation is
-operator-driven and requires explicit provider tokens.
+inspection, ChangeSet delivery, run Event listing, stop, retry,
+request-changes, and close. Default tests use fake providers and local git
+remotes; real provider mutation is operator-driven and requires explicit
+provider tokens.
 
 See [docs/vision.md](docs/vision.md) for the long-term product direction.
 See [docs/roadmap/v0.md](docs/roadmap/v0.md) for the first version boundary
 and planned milestones.
 See [docs/architecture/v0.md](docs/architecture/v0.md) for the first
 architecture boundary.
+See [docs/testing/v0-smoke.md](docs/testing/v0-smoke.md) for GitHub/GitLab v0
+smoke-test steps.
 
 ## Local Development
 
@@ -130,10 +133,15 @@ go run ./cmd/forgelane runs request-attention 1 feedback "Which test boundary sh
 go run ./cmd/forgelane runs send 1 "Use the CLI boundary."
 go run ./cmd/forgelane runs request-attention 1 approval "May I continue with the requested cleanup?"
 go run ./cmd/forgelane runs approve 1 approve "Approved for this run."
+go run ./cmd/forgelane runs request-changes 1 "Please add focused regression tests."
+go run ./cmd/forgelane runs retry 1
 go run ./cmd/forgelane runs evidence 1
 go run ./cmd/forgelane runs logs 1
 go run ./cmd/forgelane events list --run 1
 ```
+
+Use `runs close <terminal-run-id>` instead of `runs retry` when abandoning the
+active local ChangeSet path.
 
 After `runs start`, prefer `forgelane runs evidence <run_id>` as the review and
 debugging summary before dropping into raw `runs show`, `runs logs`, or

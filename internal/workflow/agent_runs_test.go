@@ -1028,6 +1028,29 @@ func TestRequestAgentRunRetryUsesExplicitAgentPreset(t *testing.T) {
 	}
 }
 
+func TestRequestAgentRunRetryPreservesPriorAgentPresetByDefault(t *testing.T) {
+	instanceStore, priorRunID := preparedAgentRunWithOptions(t, preparedAgentRunOptions{
+		AgentPreset: "harmless-echo",
+	})
+	if _, err := workflow.ExecuteAgentRunCommand(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		nonZeroExitCommandRunner{},
+		priorRunID,
+	); err != nil {
+		t.Fatalf("fail prior AgentRun: %v", err)
+	}
+
+	result, err := workflow.RequestAgentRunRetry(instanceStore, priorRunID, workflow.RequestAgentRunRetryInput{})
+	if err != nil {
+		t.Fatalf("request AgentRun retry: %v", err)
+	}
+	if got := runSpecAgentPreset(t, result.RunSpec.SpecJSON); got != "harmless-echo" {
+		t.Fatalf("expected retry RunSpec to preserve prior preset, got %q", got)
+	}
+}
+
 func TestRequestAgentRunRetryTargetsExistingActiveChangeSet(t *testing.T) {
 	instanceStore, priorRunID := preparedAgentRun(t)
 	completed, err := workflow.ExecuteAgentRunCommandAndMaterialize(
@@ -1069,6 +1092,109 @@ func TestRequestAgentRunRetryTargetsExistingActiveChangeSet(t *testing.T) {
 		retryDetail.ChangeSet.ID != completed.ChangeSet.ID ||
 		retryDetail.ChangeSet.ActiveRunID != result.AgentRun.ID {
 		t.Fatalf("expected retry detail to show targeted active ChangeSet, got %#v", retryDetail.ChangeSet)
+	}
+}
+
+func TestRequestChangeSetChangesKeepsChangeSetActiveForRetry(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+	completed, err := workflow.ExecuteAgentRunCommandAndMaterialize(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("complete AgentRun with ChangeSet: %v", err)
+	}
+	if completed.ChangeSet == nil {
+		t.Fatalf("expected AgentRun to create active ChangeSet")
+	}
+
+	result, err := workflow.RequestChangeSetChanges(instanceStore, runID, "Please tighten the tests.")
+	if err != nil {
+		t.Fatalf("request ChangeSet changes: %v", err)
+	}
+	if result.ControlAction.Type != "request_changes" || result.ControlAction.Status != "succeeded" {
+		t.Fatalf("unexpected request-changes ControlAction: %#v", result.ControlAction)
+	}
+	if result.ChangeSet.ID != completed.ChangeSet.ID || result.ChangeSet.Status != "changes_requested" {
+		t.Fatalf("expected changes_requested ChangeSet %d, got %#v", completed.ChangeSet.ID, result.ChangeSet)
+	}
+	if got := eventTypes(result.Events); got != "control_action.succeeded,change_set.changes_requested" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	detail, err := instanceStore.GetAgentRunDetail(runID)
+	if err != nil {
+		t.Fatalf("get AgentRun detail: %v", err)
+	}
+	if detail.ChangeSet == nil || detail.ChangeSet.Status != "changes_requested" {
+		t.Fatalf("expected changes_requested ChangeSet to remain active, got %#v", detail.ChangeSet)
+	}
+
+	retry, err := workflow.RequestAgentRunRetry(instanceStore, runID, workflow.RequestAgentRunRetryInput{})
+	if err != nil {
+		t.Fatalf("request retry after changes requested: %v", err)
+	}
+	if retry.ChangeSet == nil ||
+		retry.ChangeSet.ID != completed.ChangeSet.ID ||
+		retry.ChangeSet.ActiveRunID != retry.AgentRun.ID {
+		t.Fatalf("expected retry to target changes_requested ChangeSet, got %#v", retry.ChangeSet)
+	}
+	if _, err := workflow.CloseChangeSet(instanceStore, runID, "Close old run path."); err == nil {
+		t.Fatalf("expected old AgentRun not to close ChangeSet after retry targets it")
+	} else if !strings.Contains(err.Error(), "active for AgentRun") {
+		t.Fatalf("expected active-run mismatch, got %v", err)
+	}
+}
+
+func TestCloseChangeSetRemovesChangeSetFromActiveDeliveryPath(t *testing.T) {
+	instanceStore, runID := preparedAgentRun(t)
+	completed, err := workflow.ExecuteAgentRunCommandAndMaterialize(
+		context.Background(),
+		instanceStore,
+		staticCommandPlanner{},
+		successfulCommandRunner{},
+		staticRepositoryChangeMaterializer{},
+		runID,
+	)
+	if err != nil {
+		t.Fatalf("complete AgentRun with ChangeSet: %v", err)
+	}
+	if completed.ChangeSet == nil {
+		t.Fatalf("expected AgentRun to create active ChangeSet")
+	}
+
+	result, err := workflow.CloseChangeSet(instanceStore, runID, "Close local delivery path.")
+	if err != nil {
+		t.Fatalf("close ChangeSet: %v", err)
+	}
+	if result.ControlAction.Type != "close" || result.ControlAction.Status != "succeeded" {
+		t.Fatalf("unexpected close ControlAction: %#v", result.ControlAction)
+	}
+	if result.ChangeSet.ID != completed.ChangeSet.ID || result.ChangeSet.Status != "closed" {
+		t.Fatalf("expected closed ChangeSet %d, got %#v", completed.ChangeSet.ID, result.ChangeSet)
+	}
+	if got := eventTypes(result.Events); got != "control_action.succeeded,change_set.closed" {
+		t.Fatalf("unexpected Event sequence %s", got)
+	}
+
+	detail, err := instanceStore.GetAgentRunDetail(runID)
+	if err != nil {
+		t.Fatalf("get AgentRun detail: %v", err)
+	}
+	if detail.ChangeSet == nil || detail.ChangeSet.Status != "closed" {
+		t.Fatalf("expected run detail to retain closed ChangeSet evidence, got %#v", detail.ChangeSet)
+	}
+
+	retry, err := workflow.RequestAgentRunRetry(instanceStore, runID, workflow.RequestAgentRunRetryInput{})
+	if err != nil {
+		t.Fatalf("request retry after closed ChangeSet: %v", err)
+	}
+	if retry.ChangeSet != nil {
+		t.Fatalf("expected closed ChangeSet not to be targeted by retry, got %#v", retry.ChangeSet)
 	}
 }
 
@@ -1210,12 +1336,31 @@ func eventTypes(events []workflow.Event) string {
 	return types
 }
 
+func runSpecAgentPreset(t *testing.T, specJSON string) string {
+	t.Helper()
+
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(specJSON), &spec); err != nil {
+		t.Fatalf("decode RunSpec: %v\n%s", err, specJSON)
+	}
+	agentAdapter, ok := spec["agent_adapter"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected RunSpec agent_adapter object, got %#v", spec["agent_adapter"])
+	}
+	preset, ok := agentAdapter["preset"].(string)
+	if !ok {
+		t.Fatalf("expected RunSpec agent_adapter.preset string, got %#v", agentAdapter["preset"])
+	}
+	return preset
+}
+
 func preparedAgentRun(t *testing.T) (*store.Store, int64) {
 	return preparedAgentRunWithOptions(t, preparedAgentRunOptions{})
 }
 
 type preparedAgentRunOptions struct {
 	CommandTimeout time.Duration
+	AgentPreset    string
 }
 
 func preparedAgentRunWithOptions(t *testing.T, options preparedAgentRunOptions) (*store.Store, int64) {
@@ -1251,6 +1396,7 @@ func preparedAgentRunWithOptions(t *testing.T, options preparedAgentRunOptions) 
 	}
 	createResult, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
 		WorkItem:       importResult.WorkItem,
+		AgentPreset:    options.AgentPreset,
 		CommandTimeout: options.CommandTimeout,
 	})
 	if err != nil {
