@@ -33,6 +33,8 @@ func newRunsCommand(stdout io.Writer, options Options) *cobra.Command {
 	cmd.AddCommand(newRunsPrepareCommand(stdout))
 	cmd.AddCommand(newRunsExecuteCommand(stdout, options))
 	cmd.AddCommand(newRunsStopCommand(stdout))
+	cmd.AddCommand(newRunsRequestChangesCommand(stdout))
+	cmd.AddCommand(newRunsCloseCommand(stdout))
 	cmd.AddCommand(newRunsRequestAttentionCommand(stdout))
 	cmd.AddCommand(newRunsSendCommand(stdout))
 	cmd.AddCommand(newRunsApproveCommand(stdout))
@@ -294,6 +296,64 @@ func newRunsStopCommand(stdout io.Writer) *cobra.Command {
 	}
 }
 
+func newRunsRequestChangesCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "request-changes <run_id> <message>",
+		Short: "Record local requested changes for an active ChangeSet.",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+
+			instanceStore, err := openInitializedStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			result, err := workflow.RequestChangeSetChanges(instanceStore, runID, args[1])
+			if err != nil {
+				return err
+			}
+			printRequestedChangeSetChanges(stdout, result)
+			return nil
+		},
+	}
+}
+
+func newRunsCloseCommand(stdout io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "close <run_id> [message]",
+		Short: "Close the active local ChangeSet for a terminal AgentRun.",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			runID, err := parseAgentRunID(args[0])
+			if err != nil {
+				return err
+			}
+			message := ""
+			if len(args) == 2 {
+				message = args[1]
+			}
+
+			instanceStore, err := openInitializedStore()
+			if err != nil {
+				return err
+			}
+			defer instanceStore.Close()
+
+			result, err := workflow.CloseChangeSet(instanceStore, runID, message)
+			if err != nil {
+				return err
+			}
+			printClosedChangeSet(stdout, result)
+			return nil
+		},
+	}
+}
+
 func newRunsRequestAttentionCommand(stdout io.Writer) *cobra.Command {
 	return &cobra.Command{
 		Use:   "request-attention <run_id> <feedback|approval> <message>",
@@ -380,7 +440,8 @@ func newRunsApproveCommand(stdout io.Writer) *cobra.Command {
 }
 
 func newRunsRetryCommand(stdout io.Writer) *cobra.Command {
-	return &cobra.Command{
+	var agentPreset string
+	cmd := &cobra.Command{
 		Use:   "retry <run_id>",
 		Short: "Create a fresh AgentRun retry for a terminal AgentRun.",
 		Args:  cobra.ExactArgs(1),
@@ -396,13 +457,8 @@ func newRunsRetryCommand(stdout io.Writer) *cobra.Command {
 			}
 			defer instanceStore.Close()
 
-			selectedPreset, err := agentPresetForRun("")
-			if err != nil {
-				return err
-			}
-
 			result, err := workflow.RequestAgentRunRetry(instanceStore, runID, workflow.RequestAgentRunRetryInput{
-				AgentPreset: selectedPreset,
+				AgentPreset: agentPreset,
 			})
 			if err != nil {
 				return err
@@ -411,6 +467,8 @@ func newRunsRetryCommand(stdout io.Writer) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&agentPreset, "agent-preset", "", "Override AgentAdapter preset for the retry RunSpec")
+	return cmd
 }
 
 func agentPresetForRun(explicitPreset string) (string, error) {
@@ -611,6 +669,32 @@ func printStoppedAgentRun(stdout io.Writer, result workflow.AgentRunControlResul
 	fmt.Fprintf(stdout, "Stop requested for AgentRun %d\n", result.AgentRun.ID)
 	fmt.Fprintf(stdout, "Status: %s\n", result.AgentRun.Status)
 	fmt.Fprintf(stdout, "ControlAction ID: %d\n", result.ControlAction.ID)
+	for _, event := range result.Events {
+		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
+		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
+	}
+}
+
+func printRequestedChangeSetChanges(stdout io.Writer, result workflow.ChangeSetControlResult) {
+	fmt.Fprintf(stdout, "Requested changes for ChangeSet %d\n", result.ChangeSet.ID)
+	fmt.Fprintf(stdout, "AgentRun: %d\n", result.AgentRun.ID)
+	fmt.Fprintf(stdout, "Status: %s\n", result.ChangeSet.Status)
+	fmt.Fprintf(stdout, "ControlAction ID: %d\n", result.ControlAction.ID)
+	fmt.Fprintf(stdout, "Branch: %s\n", result.ChangeSet.BranchRef)
+	printChangeSetProviderRefs(stdout, result.ChangeSet)
+	for _, event := range result.Events {
+		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
+		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)
+	}
+}
+
+func printClosedChangeSet(stdout io.Writer, result workflow.ChangeSetControlResult) {
+	fmt.Fprintf(stdout, "Closed ChangeSet %d\n", result.ChangeSet.ID)
+	fmt.Fprintf(stdout, "AgentRun: %d\n", result.AgentRun.ID)
+	fmt.Fprintf(stdout, "Status: %s\n", result.ChangeSet.Status)
+	fmt.Fprintf(stdout, "ControlAction ID: %d\n", result.ControlAction.ID)
+	fmt.Fprintf(stdout, "Branch: %s\n", result.ChangeSet.BranchRef)
+	printChangeSetProviderRefs(stdout, result.ChangeSet)
 	for _, event := range result.Events {
 		fmt.Fprintf(stdout, "Event: %s\n", event.Type)
 		fmt.Fprintf(stdout, "Event ID: %d\n", event.ID)

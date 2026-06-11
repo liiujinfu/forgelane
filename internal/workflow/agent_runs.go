@@ -288,6 +288,14 @@ type AgentRunControlResult struct {
 	Events        []Event
 }
 
+// ChangeSetControlResult is the outcome of a human ControlAction against a ChangeSet.
+type ChangeSetControlResult struct {
+	ControlAction ControlAction
+	AgentRun      AgentRun
+	ChangeSet     ChangeSet
+	Events        []Event
+}
+
 // RunAttentionRequest is a pending request for user attention attached to an AgentRun.
 type RunAttentionRequest struct {
 	ControlActionID int64
@@ -464,6 +472,13 @@ type AgentRunControlStore interface {
 	RequestAgentRunStop(int64, ControlActionPlan) (AgentRunControlResult, error)
 }
 
+// ChangeSetControlStore persists human ChangeSet ControlActions and matching Events.
+type ChangeSetControlStore interface {
+	GetAgentRunDetail(int64) (AgentRunDetail, error)
+	RequestChangeSetChanges(int64, int64, ControlActionPlan) (ChangeSetControlResult, error)
+	CloseChangeSet(int64, int64, ControlActionPlan) (ChangeSetControlResult, error)
+}
+
 // AgentRunAttentionStore persists pending user-attention requests for an AgentRun.
 type AgentRunAttentionStore interface {
 	RequestAgentRunAttention(int64, RunAttentionRequestPlan) (AgentRunAttentionResult, error)
@@ -494,6 +509,75 @@ func RequestAgentRunStop(store AgentRunControlStore, runID int64) (AgentRunContr
 		},
 		Status: "succeeded",
 	})
+}
+
+// RequestChangeSetChanges records local reviewer feedback against the active ChangeSet for a terminal AgentRun.
+func RequestChangeSetChanges(store ChangeSetControlStore, runID int64, message string) (ChangeSetControlResult, error) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ChangeSetControlResult{}, fmt.Errorf("request-changes message is required")
+	}
+	detail, err := terminalRunWithActiveChangeSet(store, runID)
+	if err != nil {
+		return ChangeSetControlResult{}, err
+	}
+	return store.RequestChangeSetChanges(runID, detail.ChangeSet.ID, ControlActionPlan{
+		Type:        "request_changes",
+		TargetType:  "change_set",
+		TargetRef:   fmt.Sprintf("change_set:%d", detail.ChangeSet.ID),
+		RequestedBy: "local",
+		Reason:      "forgelane runs request-changes",
+		Input: map[string]any{
+			"agent_run_id":  runID,
+			"change_set_id": detail.ChangeSet.ID,
+			"message":       message,
+		},
+		Status: "succeeded",
+	})
+}
+
+// CloseChangeSet records a local close decision against the active ChangeSet for a terminal AgentRun.
+func CloseChangeSet(store ChangeSetControlStore, runID int64, message string) (ChangeSetControlResult, error) {
+	message = strings.TrimSpace(message)
+	detail, err := terminalRunWithActiveChangeSet(store, runID)
+	if err != nil {
+		return ChangeSetControlResult{}, err
+	}
+	return store.CloseChangeSet(runID, detail.ChangeSet.ID, ControlActionPlan{
+		Type:        "close",
+		TargetType:  "change_set",
+		TargetRef:   fmt.Sprintf("change_set:%d", detail.ChangeSet.ID),
+		RequestedBy: "local",
+		Reason:      "forgelane runs close",
+		Input: map[string]any{
+			"agent_run_id":  runID,
+			"change_set_id": detail.ChangeSet.ID,
+			"message":       message,
+		},
+		Status: "succeeded",
+	})
+}
+
+func terminalRunWithActiveChangeSet(store interface {
+	GetAgentRunDetail(int64) (AgentRunDetail, error)
+}, runID int64) (AgentRunDetail, error) {
+	detail, err := store.GetAgentRunDetail(runID)
+	if err != nil {
+		return AgentRunDetail{}, err
+	}
+	if !isTerminalAgentRunStatus(detail.AgentRun.Status) {
+		return AgentRunDetail{}, fmt.Errorf("AgentRun %d is %s; expected terminal run", runID, detail.AgentRun.Status)
+	}
+	if detail.ChangeSet == nil {
+		return AgentRunDetail{}, fmt.Errorf("AgentRun %d has no active ChangeSet", runID)
+	}
+	if !isActiveChangeSetStatus(detail.ChangeSet.Status) {
+		return AgentRunDetail{}, fmt.Errorf("AgentRun %d has no active ChangeSet", runID)
+	}
+	if detail.ChangeSet.ActiveRunID != runID {
+		return AgentRunDetail{}, fmt.Errorf("ChangeSet %d is active for AgentRun %d; expected AgentRun %d", detail.ChangeSet.ID, detail.ChangeSet.ActiveRunID, runID)
+	}
+	return detail, nil
 }
 
 // RequestAgentRunAttention records a pending request for user feedback or approval.
@@ -550,7 +634,14 @@ func RequestAgentRunRetry(store AgentRunRetryStore, priorRunID int64, input Requ
 	if !isTerminalAgentRunStatus(prior.AgentRun.Status) {
 		return AgentRunCreateResult{}, fmt.Errorf("AgentRun %d is %s; expected terminal run", priorRunID, prior.AgentRun.Status)
 	}
-	plan, err := NewPlannedAgentRunPlan(prior.WorkItem, input.AgentPreset)
+	agentPreset := strings.TrimSpace(input.AgentPreset)
+	if agentPreset == "" {
+		agentPreset, err = agentPresetFromRunSpec(prior.RunSpec.SpecJSON)
+		if err != nil {
+			return AgentRunCreateResult{}, err
+		}
+	}
+	plan, err := NewPlannedAgentRunPlan(prior.WorkItem, agentPreset)
 	if err != nil {
 		return AgentRunCreateResult{}, err
 	}
@@ -569,12 +660,33 @@ func RequestAgentRunRetry(store AgentRunRetryStore, priorRunID int64, input Requ
 	return store.CreateRetryAgentRun(priorRunID, plan)
 }
 
+func agentPresetFromRunSpec(specJSON string) (string, error) {
+	var spec struct {
+		AgentAdapter struct {
+			Preset string `json:"preset"`
+		} `json:"agent_adapter"`
+	}
+	if err := json.Unmarshal([]byte(specJSON), &spec); err != nil {
+		return "", fmt.Errorf("decode prior RunSpec AgentAdapter preset: %w", err)
+	}
+	return strings.TrimSpace(spec.AgentAdapter.Preset), nil
+}
+
 func isTerminalAgentRunStatus(status string) bool {
 	switch status {
 	case "completed", "failed", "cancelled", "timed_out":
 		return true
 	default:
 		return false
+	}
+}
+
+func isActiveChangeSetStatus(status string) bool {
+	switch status {
+	case "merged", "closed", "abandoned":
+		return false
+	default:
+		return true
 	}
 }
 

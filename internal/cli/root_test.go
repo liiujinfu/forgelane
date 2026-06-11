@@ -1791,6 +1791,119 @@ func TestRunsExecuteMaterializesRepositoryChangesIntoLocalCommit(t *testing.T) {
 	assertTableCount(t, homeDir, "control_actions", 3)
 }
 
+func TestRunsRequestChangesAndCloseExposeChangeSetControls(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Review and close a ChangeSet",
+			Body:                "ChangeSet controls should be auditable CLI controls.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true},
+		},
+	}
+
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "start", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+
+	requestStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "request-changes", "1", "Please add focused regression tests.")
+	if err != nil {
+		t.Fatalf("expected runs request-changes to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Requested changes for ChangeSet 1",
+		"AgentRun: 1",
+		"Status: changes_requested",
+		"ControlAction ID:",
+		"Branch: forgelane/issue-123",
+		"ChangeSet provider branch: github://github.com/owner/repo/branches/forgelane/issue-123",
+		"ChangeSet provider change: github://github.com/owner/repo/pulls/10",
+		"Event: control_action.succeeded",
+		"Event: change_set.changes_requested",
+	} {
+		if !strings.Contains(requestStdout, want) {
+			t.Fatalf("expected runs request-changes output to contain %q, got:\n%s", want, requestStdout)
+		}
+	}
+
+	closeStdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider: fakeProvider,
+	}, "runs", "close", "1", "Close local delivery path.")
+	if err != nil {
+		t.Fatalf("expected runs close to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Closed ChangeSet 1",
+		"AgentRun: 1",
+		"Status: closed",
+		"ControlAction ID:",
+		"Branch: forgelane/issue-123",
+		"ChangeSet provider branch: github://github.com/owner/repo/branches/forgelane/issue-123",
+		"ChangeSet provider change: github://github.com/owner/repo/pulls/10",
+		"Event: control_action.succeeded",
+		"Event: change_set.closed",
+	} {
+		if !strings.Contains(closeStdout, want) {
+			t.Fatalf("expected runs close output to contain %q, got:\n%s", want, closeStdout)
+		}
+	}
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+	var status string
+	if err := db.QueryRow("SELECT status FROM change_sets WHERE id = 1").Scan(&status); err != nil {
+		t.Fatalf("query ChangeSet status: %v", err)
+	}
+	if status != "closed" {
+		t.Fatalf("expected ChangeSet to be closed, got %q", status)
+	}
+	assertTableCount(t, homeDir, "control_actions", 5)
+}
+
 func TestRunsStartDeliversRepositoryChangesToDraftPR(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()

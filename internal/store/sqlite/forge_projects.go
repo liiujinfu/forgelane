@@ -75,6 +75,10 @@ func open(dsn string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("enable SQLite foreign keys: %w", err)
 	}
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure SQLite busy timeout: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -3223,6 +3227,167 @@ func controlActionStatusEventType(status string) (string, error) {
 	}
 }
 
+// RequestChangeSetChanges records local review feedback and keeps the ChangeSet active for a later retry.
+func (store *Store) RequestChangeSetChanges(agentRunID int64, changeSetID int64, plan workflow.ControlActionPlan) (workflow.ChangeSetControlResult, error) {
+	return store.applyChangeSetControl(agentRunID, changeSetID, plan, "changes_requested", "change_set.changes_requested")
+}
+
+// CloseChangeSet records a local close decision and removes the ChangeSet from the active delivery path.
+func (store *Store) CloseChangeSet(agentRunID int64, changeSetID int64, plan workflow.ControlActionPlan) (workflow.ChangeSetControlResult, error) {
+	return store.applyChangeSetControl(agentRunID, changeSetID, plan, "closed", "change_set.closed")
+}
+
+func (store *Store) applyChangeSetControl(agentRunID int64, changeSetID int64, plan workflow.ControlActionPlan, nextStatus string, changeEventType string) (workflow.ChangeSetControlResult, error) {
+	detail, err := store.GetAgentRunDetail(agentRunID)
+	if err != nil {
+		return workflow.ChangeSetControlResult{}, err
+	}
+	if !isTerminalAgentRunStatus(detail.AgentRun.Status) {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("AgentRun %d is %s; expected terminal run", agentRunID, detail.AgentRun.Status)
+	}
+	if detail.ChangeSet == nil {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("AgentRun %d has no active ChangeSet", agentRunID)
+	}
+	if !isActiveChangeSetStatus(detail.ChangeSet.Status) {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("AgentRun %d has no active ChangeSet", agentRunID)
+	}
+	if detail.ChangeSet.ActiveRunID != agentRunID {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("ChangeSet %d is active for AgentRun %d; expected AgentRun %d", detail.ChangeSet.ID, detail.ChangeSet.ActiveRunID, agentRunID)
+	}
+	if detail.ChangeSet.ID != changeSetID {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("ChangeSet %d does not match active ChangeSet %d for AgentRun %d", changeSetID, detail.ChangeSet.ID, agentRunID)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("begin ChangeSet control transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	actionInput, err := json.Marshal(plan.Input)
+	if err != nil {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("encode ChangeSet ControlAction input: %w", err)
+	}
+	actionResult, err := tx.Exec(`
+INSERT INTO control_actions (
+	type,
+	target_type,
+	target_ref,
+	requested_by,
+	reason,
+	input,
+	status,
+	created_at,
+	decided_at,
+	result_event_refs
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		plan.Type,
+		plan.TargetType,
+		plan.TargetRef,
+		plan.RequestedBy,
+		plan.Reason,
+		string(actionInput),
+		plan.Status,
+		now,
+		now,
+		"[]",
+	)
+	if err != nil {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("insert ChangeSet ControlAction: %w", err)
+	}
+	controlActionID, err := actionResult.LastInsertId()
+	if err != nil {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("read inserted ChangeSet ControlAction id: %w", err)
+	}
+
+	updateResult, err := tx.Exec("UPDATE change_sets SET status = ?, updated_at = ? WHERE id = ? AND status NOT IN ('merged', 'closed', 'abandoned')", nextStatus, now, changeSetID)
+	if err != nil {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("update ChangeSet %d status: %w", changeSetID, err)
+	}
+	affected, err := updateResult.RowsAffected()
+	if err != nil {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("read ChangeSet %d status update count: %w", changeSetID, err)
+	}
+	if affected != 1 {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("ChangeSet %d is not active", changeSetID)
+	}
+
+	actionEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            "control_action.succeeded",
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "control_action",
+		SubjectRef:      fmt.Sprintf("control_action:%d", controlActionID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		ChangeSetID:     changeSetID,
+		Payload: map[string]any{
+			"control_action_id": controlActionID,
+			"type":              plan.Type,
+			"status":            plan.Status,
+			"agent_run_id":      agentRunID,
+			"change_set_id":     changeSetID,
+			"previous_status":   detail.ChangeSet.Status,
+			"next_status":       nextStatus,
+			"provider_mutated":  false,
+		},
+	})
+	if err != nil {
+		return workflow.ChangeSetControlResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, actionEvent.ID); err != nil {
+		return workflow.ChangeSetControlResult{}, err
+	}
+
+	changeEvent, err := appendAgentRunEventTx(tx, agentRunEventInput{
+		Type:            changeEventType,
+		OccurredAt:      now,
+		ForgeProjectID:  detail.WorkItem.ForgeProjectID,
+		SubjectType:     "change_set",
+		SubjectRef:      fmt.Sprintf("change_set:%d", changeSetID),
+		WorkItemID:      detail.WorkItem.ID,
+		WorkItemRef:     detail.WorkItem.ProviderRef,
+		AgentRunID:      agentRunID,
+		ControlActionID: controlActionID,
+		ChangeSetID:     changeSetID,
+		Payload: map[string]any{
+			"agent_run_id":      agentRunID,
+			"change_set_id":     changeSetID,
+			"previous_status":   detail.ChangeSet.Status,
+			"status":            nextStatus,
+			"control_action_id": controlActionID,
+			"provider_mutated":  false,
+		},
+	})
+	if err != nil {
+		return workflow.ChangeSetControlResult{}, err
+	}
+	if err := appendControlActionEventRefTx(tx, controlActionID, changeEvent.ID); err != nil {
+		return workflow.ChangeSetControlResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return workflow.ChangeSetControlResult{}, fmt.Errorf("commit ChangeSet control request: %w", err)
+	}
+
+	updatedChangeSet := *detail.ChangeSet
+	updatedChangeSet.Status = nextStatus
+	updatedChangeSet.UpdatedAt = now
+	return workflow.ChangeSetControlResult{
+		ControlAction: workflow.ControlAction{
+			ID:     controlActionID,
+			Type:   plan.Type,
+			Status: plan.Status,
+		},
+		AgentRun:  detail.AgentRun,
+		ChangeSet: updatedChangeSet,
+		Events:    []workflow.Event{actionEvent, changeEvent},
+	}, nil
+}
+
 // RequestAgentRunStop records a human stop ControlAction and marks the AgentRun for cancellation.
 func (store *Store) RequestAgentRunStop(agentRunID int64, plan workflow.ControlActionPlan) (workflow.AgentRunControlResult, error) {
 	detail, err := store.GetAgentRunDetail(agentRunID)
@@ -3407,6 +3572,15 @@ func isTerminalAgentRunStatus(status string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func isActiveChangeSetStatus(status string) bool {
+	switch status {
+	case "merged", "closed", "abandoned":
+		return false
+	default:
+		return true
 	}
 }
 
