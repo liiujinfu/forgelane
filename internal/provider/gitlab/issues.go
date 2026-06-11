@@ -108,6 +108,82 @@ func (provider *IssueProvider) GetIssue(ctx context.Context, ref workitems.Provi
 	}, nil
 }
 
+// ListIssues reads issue candidates from GitLab without importing local WorkItem state.
+func (provider *IssueProvider) ListIssues(ctx context.Context, input workitems.ProviderIssueListInput) ([]workitems.ProviderIssue, error) {
+	endpoint, err := url.Parse(fmt.Sprintf(
+		"%s/projects/%s/issues",
+		provider.apiBaseURL(input.Repository.ProviderHost),
+		url.PathEscape(input.Repository.RepositoryPath),
+	))
+	if err != nil {
+		return nil, fmt.Errorf("create GitLab issue list URL: %w", err)
+	}
+	query := endpoint.Query()
+	query.Set("state", "opened")
+	query.Set("per_page", "100")
+	if len(input.Labels) > 0 {
+		query.Set("labels", strings.Join(input.Labels, ","))
+	}
+	endpoint.RawQuery = query.Encode()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create GitLab issue list request: %w", err)
+	}
+	if provider.token != "" {
+		request.Header.Set("PRIVATE-TOKEN", provider.token)
+	}
+
+	response, err := provider.client.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("GitLab provider failure listing issues %s: %w", input.Repository.String(), err)
+	}
+	defer response.Body.Close()
+
+	switch response.StatusCode {
+	case http.StatusOK:
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return nil, fmt.Errorf("auth or permission failure listing GitLab issues: %s", input.Repository.String())
+	default:
+		return nil, fmt.Errorf("GitLab provider failure listing issues %s: HTTP %d", input.Repository.String(), response.StatusCode)
+	}
+
+	var payloads []issuePayload
+	if err := json.NewDecoder(response.Body).Decode(&payloads); err != nil {
+		return nil, fmt.Errorf("decode GitLab issue list %s: %w", input.Repository.String(), err)
+	}
+
+	issues := make([]workitems.ProviderIssue, 0, len(payloads))
+	for _, payload := range payloads {
+		issue, err := gitlabIssueFromPayload(input.Repository, payload)
+		if err != nil {
+			return nil, err
+		}
+		issues = append(issues, issue)
+	}
+	return issues, nil
+}
+
+func gitlabIssueFromPayload(repository workitems.ProviderRepositoryRef, payload issuePayload) (workitems.ProviderIssue, error) {
+	ref := repository.IssueRef(payload.IID)
+	updatedAt, err := time.Parse(time.RFC3339, payload.UpdatedAt)
+	if err != nil {
+		return workitems.ProviderIssue{}, fmt.Errorf("decode GitLab issue updated_at for %s: %w", ref.String(), err)
+	}
+	return workitems.ProviderIssue{
+		ProviderRef:         ref.String(),
+		RepositoryRef:       ref.RepositoryRef(),
+		Provider:            ref.Provider,
+		ProviderIssueNumber: payload.IID,
+		Title:               payload.Title,
+		Body:                payload.Description,
+		Status:              normalizeGitLabIssueState(payload.State),
+		RawStatus:           payload.State,
+		URL:                 payload.WebURL,
+		ProviderUpdatedAt:   updatedAt,
+	}, nil
+}
+
 func (provider *IssueProvider) apiBaseURL(providerHost string) string {
 	if provider.baseURL != "" {
 		return provider.baseURL

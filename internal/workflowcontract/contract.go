@@ -190,3 +190,20 @@ func DefaultAgentPreset(workingDir string) (string, error) {
 	}
 	return contract.Agent.DefaultPreset, nil
 }
+
+// ReadyForAgentLabels returns provider labels that mark issue candidates as ready.
+func ReadyForAgentLabels(workingDir string) ([]string, error) {
+	defaultLabel := Default().Tracker.Labels[RoleReadyForAgent]
+	contract, err := Load(workingDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return []string{defaultLabel}, nil
+		}
+		return nil, err
+	}
+	label := strings.TrimSpace(contract.Tracker.Labels[RoleReadyForAgent])
+	if label == "" {
+		label = defaultLabel
+	}
+	return []string{label}, nil
+}

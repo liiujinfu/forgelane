@@ -97,71 +97,87 @@ func newRunsStartCommand(stdout io.Writer, options Options) *cobra.Command {
 		Short: "Start an AgentRun and deliver its draft PR path.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			instanceStore, err := openInitializedStore()
-			if err != nil {
-				return err
-			}
-			defer instanceStore.Close()
-
-			ref, err := resolveWorkItemRef(args[0], instanceStore)
-			if err != nil {
-				return err
-			}
-			provider, err := workItemProviderForRef(options, ref)
-			if err != nil {
-				return err
-			}
-			workItem, err := getOrImportWorkItem(cmd, instanceStore, provider, ref)
-			if err != nil {
-				return err
-			}
-			selectedPreset, err := agentPresetForRun(agentPreset)
-			if err != nil {
-				return err
-			}
-
-			created, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
-				WorkItem:    workItem,
-				AgentPreset: selectedPreset,
-			})
-			if err != nil {
-				return err
-			}
-
-			paths, err := workspacePathsForRun(created.AgentRun.ID)
-			if err != nil {
-				return err
-			}
-			if _, err := workflow.PrepareAgentRunWorkspace(instanceStore, runner.LocalWorkspacePreparer{}, created.AgentRun.ID, paths); err != nil {
-				return err
-			}
-
-			changeProvider, err := changeProviderForProvider(options, workItem.Provider)
-			if err != nil {
-				return err
-			}
-			result, err := workflow.ExecuteAgentRunCommandAndDeliver(
-				cmd.Context(),
-				instanceStore,
-				agentCommandPlanner(options),
-				agentCommandRunner(options),
-				repositoryChangeMaterializer(options),
-				changeProvider,
-				created.AgentRun.ID,
-			)
-			if err != nil {
-				if result.AgentRun.ID != 0 {
-					printStartedAgentRun(stdout, workItem, created.Branch, result, err)
-				}
-				return err
-			}
-
-			printStartedAgentRun(stdout, workItem, created.Branch, result, nil)
-			return nil
+			return startAgentRunFromWorkItem(cmd, stdout, options, args[0], agentPreset, useCachedWorkItemSnapshot)
 		},
 	}
 	cmd.Flags().StringVar(&agentPreset, "agent-preset", "", "AgentAdapter preset for the RunSpec")
 	return cmd
+}
+
+type workItemSnapshotMode int
+
+const (
+	useCachedWorkItemSnapshot workItemSnapshotMode = iota
+	refreshSelectedWorkItemSnapshot
+)
+
+func startAgentRunFromWorkItem(cmd *cobra.Command, stdout io.Writer, options Options, input string, agentPreset string, snapshotMode workItemSnapshotMode) error {
+	instanceStore, err := openInitializedStore()
+	if err != nil {
+		return err
+	}
+	defer instanceStore.Close()
+
+	ref, err := resolveWorkItemRef(input, instanceStore)
+	if err != nil {
+		return err
+	}
+	provider, err := workItemProviderForRef(options, ref)
+	if err != nil {
+		return err
+	}
+	var workItem store.WorkItem
+	if snapshotMode == refreshSelectedWorkItemSnapshot {
+		workItem, err = importWorkItemSnapshot(cmd, instanceStore, provider, ref)
+	} else {
+		workItem, err = getOrImportWorkItem(cmd, instanceStore, provider, ref)
+	}
+	if err != nil {
+		return err
+	}
+	selectedPreset, err := agentPresetForRun(agentPreset)
+	if err != nil {
+		return err
+	}
+
+	created, err := workflow.CreatePlannedAgentRun(instanceStore, workflow.CreatePlannedAgentRunInput{
+		WorkItem:    workItem,
+		AgentPreset: selectedPreset,
+	})
+	if err != nil {
+		return err
+	}
+
+	paths, err := workspacePathsForRun(created.AgentRun.ID)
+	if err != nil {
+		return err
+	}
+	if _, err := workflow.PrepareAgentRunWorkspace(instanceStore, runner.LocalWorkspacePreparer{}, created.AgentRun.ID, paths); err != nil {
+		return err
+	}
+
+	changeProvider, err := changeProviderForProvider(options, workItem.Provider)
+	if err != nil {
+		return err
+	}
+	result, err := workflow.ExecuteAgentRunCommandAndDeliver(
+		cmd.Context(),
+		instanceStore,
+		agentCommandPlanner(options),
+		agentCommandRunner(options),
+		repositoryChangeMaterializer(options),
+		changeProvider,
+		created.AgentRun.ID,
+	)
+	if err != nil {
+		if result.AgentRun.ID != 0 {
+			printStartedAgentRun(stdout, workItem, created.Branch, result, err)
+		}
+		return err
+	}
+
+	printStartedAgentRun(stdout, workItem, created.Branch, result, nil)
+	return nil
 }
 
 func getOrImportWorkItem(cmd *cobra.Command, instanceStore *store.Store, provider workitems.Provider, ref workitems.ProviderRef) (store.WorkItem, error) {
@@ -173,6 +189,10 @@ func getOrImportWorkItem(cmd *cobra.Command, instanceStore *store.Store, provide
 		return store.WorkItem{}, err
 	}
 
+	return importWorkItemSnapshot(cmd, instanceStore, provider, ref)
+}
+
+func importWorkItemSnapshot(cmd *cobra.Command, instanceStore *store.Store, provider workitems.Provider, ref workitems.ProviderRef) (store.WorkItem, error) {
 	issue, err := provider.GetIssue(cmd.Context(), ref)
 	if err != nil {
 		return store.WorkItem{}, err

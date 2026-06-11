@@ -57,6 +57,7 @@ func NewRootCommand(options Options) *cobra.Command {
 	root.AddCommand(newInitCommand(stdout))
 	root.AddCommand(newWorkflowCommand(stdout))
 	root.AddCommand(newVersionCommand(stdout))
+	root.AddCommand(newIssueCommand(stdout, options))
 	root.AddCommand(newWorkItemsCommand(stdout, options))
 	root.AddCommand(newRunsCommand(stdout, options))
 	root.AddCommand(newEventsCommand(stdout))
