@@ -228,7 +228,7 @@ type ChangeBranchPushResult struct {
 	PushedCommitSHAs  []string
 }
 
-// ChangeDraftPRPlan is the workflow request to create or update the reviewable draft PR/MR.
+// ChangeDraftPRPlan is the workflow request to create or update the reviewable draft PR.
 type ChangeDraftPRPlan struct {
 	ChangeSetID       int64
 	WorkItemRef       string
@@ -241,7 +241,7 @@ type ChangeDraftPRPlan struct {
 	CommitSHAs        []string
 }
 
-// ChangeDraftPRResult is the provider evidence from a successful draft PR/MR create or update.
+// ChangeDraftPRResult is the provider evidence from a successful draft PR create or update.
 type ChangeDraftPRResult struct {
 	ChangeSetID      int64
 	ChangeRef        string

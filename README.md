@@ -6,12 +6,16 @@ It is designed for teams that want coding agents to deliver software through
 observable, reviewable, and controllable engineering workflows instead of
 ending with a chat response.
 
-The first-class deliverable is a pull request or merge request.
+The first-class deliverable is a PR.
+
+In ForgeLane user-facing language, `PR` is the unified name for a provider
+code-review change request. GitHub calls it a pull request; GitLab calls it a
+merge request.
 
 ## What It Coordinates
 
 ForgeLane does not try to replace GitHub or GitLab in the first version. It
-uses them as the source of truth for issues, branches, PRs/MRs, reviews, and
+uses them as the source of truth for issues, branches, PRs, reviews, and
 CI status, while ForgeLane owns the agent execution and control layer around
 that workflow.
 
@@ -20,7 +24,7 @@ Core concepts:
 - Work item: an issue, ticket, or task from a provider such as GitHub or GitLab.
 - Agent run: one attempt by a coding agent to move a work item forward.
 - Workspace: an isolated checkout and sandbox where the agent works.
-- Change set: a branch plus the draft PR/MR produced by the run.
+- Change set: a branch plus the draft provider PR produced by the run.
 - Gate: review, CI, policy, approval, or request-changes decision.
 - Event: an immutable audit record of what happened, when, and why.
 
@@ -32,7 +36,7 @@ Teams need:
 - Observable progress: diffs, commits, CI, run logs, and session traces.
 - Control points: review comments, request changes, retry, stop, reassign, close.
 - Auditability: who approved what, which agent acted, which sandbox produced it.
-- Delivery discipline: work flows through PR/MR review, not private chat history.
+- Delivery discipline: work flows through PR review, not private chat history.
 
 ## v0 Direction
 
@@ -41,7 +45,7 @@ The first version stays intentionally small and is tracked in
 instance-global ForgeProject configuration path, WorkItem import/cache reads,
 planned AgentRun creation, local Workspace preparation, generic command
 AgentAdapter execution, log capture, commit materialization, provider-backed
-branch push, and draft PR/MR creation for the narrow GitHub and GitLab delivery
+branch push, and draft PR creation for the narrow GitHub and GitLab delivery
 paths.
 
 ## Architecture Bias
@@ -79,7 +83,7 @@ Stable core:
 - Event log.
 - Approval decisions.
 - Permission checks.
-- PR/MR delivery model.
+- PR delivery model.
 
 ## Status
 
@@ -94,10 +98,63 @@ provider tokens.
 See [docs/vision.md](docs/vision.md) for the long-term product direction.
 See [docs/roadmap/v0.md](docs/roadmap/v0.md) for the first version boundary
 and planned milestones.
+See [docs/roadmap/v0.1.md](docs/roadmap/v0.1.md) for the provider-backed
+review-loop roadmap.
 See [docs/architecture/v0.md](docs/architecture/v0.md) for the first
 architecture boundary.
 See [docs/testing/v0-smoke.md](docs/testing/v0-smoke.md) for GitHub/GitLab v0
 smoke-test steps.
+
+## Current v0 Operator Flow
+
+Start from a provider issue. Initialize the local ForgeLane instance for the
+target repository, then start a run:
+
+```bash
+export FORGELANE_GITHUB_TOKEN="..."
+
+forgelane init --repo-url https://github.com/owner/repo.git
+forgelane runs start github://github.com/owner/repo/issues/123
+```
+
+When the current checkout has a matching `origin` remote, initialize with the
+provider and use numeric issue shorthand:
+
+```bash
+forgelane init --provider github
+forgelane runs start 123
+```
+
+`runs start` imports the WorkItem snapshot when it is missing and reuses the
+local snapshot when it already exists. Use `work-items import` when an operator
+needs an explicit provider refresh or cache-management/debugging command.
+
+`runs start` performs the v0 delivery loop: create the AgentRun and immutable
+RunSpec, prepare an isolated Workspace, invoke the AgentAdapter, capture logs,
+materialize repository changes into commits, push the ForgeLane-managed branch,
+and create or update the draft PR.
+
+Use evidence first when reviewing a run:
+
+```bash
+forgelane runs evidence 1
+forgelane runs logs 1
+forgelane events list --run 1
+```
+
+The main operator decisions after a terminal run are:
+
+- `forgelane runs request-changes 1 "..."` to keep the ChangeSet active and
+  record requested changes.
+- `forgelane runs retry 1` to create a follow-up AgentRun against the active
+  ChangeSet.
+- `forgelane runs close 1 "..."` to abandon the active local ChangeSet path
+  while preserving local evidence.
+
+For staged debugging, split `runs start` into `runs create`, `runs prepare`,
+and `runs execute`. That lets an operator inspect or adjust the prepared
+Workspace before delivery, while still keeping provider mutation inside the
+ChangeProvider boundary.
 
 ## Local Development
 
@@ -171,8 +228,8 @@ current repository into `repo/`, and records workspace Events. `runs execute`
 invokes the configured command AgentAdapter, captures stdout/stderr as log
 segments, materializes repository changes into commits, and asks the selected
 ChangeProvider to push the ForgeLane-managed branch and create or update the
-draft PR/MR. `runs start` performs the create, prepare, execute, materialize,
-push, and draft PR/MR path in one command. `events list --run` reads the
+draft PR. `runs start` performs the create, prepare, execute, materialize,
+push, and draft PR path in one command. `events list --run` reads the
 AgentRun timeline from SQLite without contacting providers.
 
 When a workflow contract exists, new RunSpecs use its default AgentAdapter
@@ -190,9 +247,9 @@ GitLab refs keep their host in the canonical `gitlab://host/group/project`
 reference, and `init` should use `--provider gitlab` when the repository URL is
 not on `gitlab.com`. GitHub tokens need repository-scoped contents write, pull
 request write, and issue read capabilities. GitLab tokens need API access for
-issues/MRs plus write repository access for Git push. Branch push uses git
-transport with a temporary credential helper, not persisted token URLs and not
-`gh`/`glab`.
+issues and merge requests, the GitLab API name for PRs, plus write repository
+access for Git push. Branch push uses git transport with a temporary credential
+helper, not persisted token URLs and not `gh`/`glab`.
 
 The Run attention loop records pending feedback or approval requests as
 AgentRun-targeted ControlActions and Events. `runs show` surfaces pending

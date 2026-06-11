@@ -89,7 +89,7 @@ func Default() Contract {
 			},
 		},
 		Approvals: ApprovalPolicyHints{
-			ProviderMutations: "Record an explicit ControlAction before mutating provider-owned branches, PRs, or MRs.",
+			ProviderMutations: "Record an explicit ControlAction before mutating provider-owned branches or PRs.",
 			PrivilegedActions: "Route privileged or irreversible actions through an approval boundary before execution.",
 		},
 		AutomationNotes: []string{
