@@ -2261,6 +2261,330 @@ func TestRunsStartDeliversRepositoryChangesToDraftPR(t *testing.T) {
 	})
 }
 
+func TestPRRetrySyncsActionableFeedbackAndTargetsExistingChangeSet(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+	if _, stderr, err := executeForTest(t, "init", "--provider", "github"); err != nil {
+		t.Fatalf("expected init to configure current ForgeProject: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Retry a PR from provider feedback",
+			Body:                "Provider PR feedback should drive a follow-up AgentRun.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true, "head_sha": "abc123"},
+		},
+	}
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "start", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	headSHA := readLatestCommitRefSHA(t, homeDir, 1)
+
+	feedbackProvider := &recordingChangeFeedbackProvider{
+		snapshot: workflow.ChangeFeedbackSnapshot{
+			ChangeRef:     "github://github.com/owner/repo/pulls/10",
+			RepositoryRef: "github://github.com/owner/repo",
+			Provider:      "github",
+			HeadSHA:       headSHA,
+			Items: []workflow.ChangeFeedbackItem{
+				{
+					ProviderRef: "github://github.com/owner/repo/pulls/10/reviews/80",
+					Kind:        "requested_changes",
+					Actionable:  true,
+					Summary:     "octocat requested changes",
+					Body:        "Please add focused retry tests.",
+					State:       "CHANGES_REQUESTED",
+					CommitSHA:   headSHA,
+				},
+				{
+					ProviderRef: "github://github.com/owner/repo/pulls/10/comments/200",
+					Kind:        "review_comment",
+					Actionable:  true,
+					Summary:     "internal/cli/root.go:42",
+					Body:        "Retry output should mention Change feedback.",
+					Path:        "internal/cli/root.go",
+					Line:        42,
+					CommitSHA:   headSHA,
+				},
+				{
+					ProviderRef: "github://github.com/owner/repo/check-runs/4",
+					Kind:        "check_run",
+					Actionable:  true,
+					Summary:     "ci/test failed",
+					Body:        "go test ./... failed",
+					State:       "failure",
+					CommitSHA:   headSHA,
+				},
+				{
+					ProviderRef: "github://github.com/owner/repo/pulls/10/reviews/81",
+					Kind:        "approval",
+					Actionable:  false,
+					Summary:     "octocat approved",
+					State:       "APPROVED",
+					CommitSHA:   headSHA,
+				},
+			},
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:       fakeProvider,
+		ChangeFeedbackProvider: feedbackProvider,
+	}, "pr", "retry", "10")
+	if err != nil {
+		t.Fatalf("expected pr retry to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	for _, want := range []string{
+		"Retried PR 10 as AgentRun 2",
+		"ChangeSet: 1 draft_open forgelane/issue-123",
+		"Actionable feedback: 3",
+		"Event: change_feedback.synced",
+		"Event: change_set.retry_targeted",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected pr retry output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	if len(feedbackProvider.calls) != 1 {
+		t.Fatalf("expected one Change feedback provider call, got %#v", feedbackProvider.calls)
+	}
+	if feedbackProvider.calls[0].ChangeRef != "github://github.com/owner/repo/pulls/10" ||
+		feedbackProvider.calls[0].HeadSHA == "" {
+		t.Fatalf("unexpected Change feedback read plan: %#v", feedbackProvider.calls[0])
+	}
+
+	assertTableCount(t, homeDir, "agent_runs", 2)
+	assertTableCount(t, homeDir, "change_sets", 1)
+	assertTableCount(t, homeDir, "change_feedback_items", 4)
+	assertTableCount(t, homeDir, "control_actions", 5)
+	assertChangeFeedbackRelationships(t, homeDir, headSHA, 4)
+
+	retrySpec := readRunSpecJSON(t, homeDir, 2)
+	var spec struct {
+		ChangeFeedback struct {
+			ChangeRef       string `json:"change_ref"`
+			HeadSHA         string `json:"head_sha"`
+			ActionableCount int    `json:"actionable_count"`
+			Items           []struct {
+				Kind        string `json:"kind"`
+				Actionable  bool   `json:"actionable"`
+				ProviderRef string `json:"provider_ref"`
+			} `json:"items"`
+		} `json:"change_feedback"`
+	}
+	if err := json.Unmarshal([]byte(retrySpec), &spec); err != nil {
+		t.Fatalf("decode retry RunSpec: %v\n%s", err, retrySpec)
+	}
+	if spec.ChangeFeedback.ChangeRef != "github://github.com/owner/repo/pulls/10" ||
+		spec.ChangeFeedback.HeadSHA != headSHA ||
+		spec.ChangeFeedback.ActionableCount != 3 ||
+		len(spec.ChangeFeedback.Items) != 3 {
+		t.Fatalf("unexpected retry RunSpec Change feedback: %#v\n%s", spec.ChangeFeedback, retrySpec)
+	}
+	for _, item := range spec.ChangeFeedback.Items {
+		if !item.Actionable {
+			t.Fatalf("retry RunSpec should include only actionable feedback, got %#v\n%s", item, retrySpec)
+		}
+		if item.Kind == "approval" {
+			t.Fatalf("retry RunSpec should not include approval feedback:\n%s", retrySpec)
+		}
+	}
+	if providerRef := readEventProviderRef(t, homeDir, "change_set.retry_targeted"); providerRef != "github://github.com/owner/repo/pulls/10" {
+		t.Fatalf("expected retry-targeted event provider_ref to be PR ref, got %q", providerRef)
+	}
+}
+
+func TestPRSyncFeedbackDoesNotCreateAgentRun(t *testing.T) {
+	homeDir, fakeProvider := setupDraftPRFeedbackTest(t)
+	feedbackProvider := &recordingChangeFeedbackProvider{
+		snapshot: workflow.ChangeFeedbackSnapshot{
+			ChangeRef:     "github://github.com/owner/repo/pulls/10",
+			RepositoryRef: "github://github.com/owner/repo",
+			Provider:      "github",
+			HeadSHA:       "abc123",
+			Items: []workflow.ChangeFeedbackItem{
+				{
+					ProviderRef: "github://github.com/owner/repo/pulls/10/comments/200",
+					Kind:        "review_comment",
+					Actionable:  true,
+					Summary:     "internal/cli/root.go:42",
+					Body:        "Please fix this.",
+					Path:        "internal/cli/root.go",
+					Line:        42,
+					CommitSHA:   "abc123",
+				},
+			},
+		},
+	}
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:       fakeProvider,
+		ChangeFeedbackProvider: feedbackProvider,
+	}, "pr", "sync-feedback", "10")
+	if err != nil {
+		t.Fatalf("expected pr sync-feedback to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	for _, want := range []string{
+		"Synced Change feedback for PR 10",
+		"ChangeSet: 1 draft_open forgelane/issue-123",
+		"Feedback items: 1",
+		"Actionable feedback: 1",
+		"Event: change_feedback.synced",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected pr sync-feedback output to contain %q, got:\n%s", want, stdout)
+		}
+	}
+	assertTableCount(t, homeDir, "agent_runs", 1)
+	assertTableCount(t, homeDir, "change_feedback_items", 1)
+	assertTableCount(t, homeDir, "control_actions", 4)
+}
+
+func TestPRRetryFailsWhenNoFeedbackIsActionable(t *testing.T) {
+	homeDir, fakeProvider := setupDraftPRFeedbackTest(t)
+	feedbackProvider := &recordingChangeFeedbackProvider{
+		snapshot: workflow.ChangeFeedbackSnapshot{
+			ChangeRef:     "github://github.com/owner/repo/pulls/10",
+			RepositoryRef: "github://github.com/owner/repo",
+			Provider:      "github",
+			HeadSHA:       "abc123",
+			Items: []workflow.ChangeFeedbackItem{
+				{
+					ProviderRef: "github://github.com/owner/repo/pulls/10/reviews/81",
+					Kind:        "approval",
+					Actionable:  false,
+					Summary:     "octocat approved",
+					State:       "APPROVED",
+					CommitSHA:   "abc123",
+				},
+			},
+		},
+	}
+
+	_, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:       fakeProvider,
+		ChangeFeedbackProvider: feedbackProvider,
+	}, "pr", "retry", "10")
+	if err == nil {
+		t.Fatal("expected pr retry to reject non-actionable feedback")
+	}
+	if !strings.Contains(err.Error(), "no actionable Change feedback for PR 10; pass --message to retry intentionally") {
+		t.Fatalf("unexpected pr retry error: %v\nstderr:\n%s", err, stderr)
+	}
+	assertTableCount(t, homeDir, "agent_runs", 1)
+	assertTableCount(t, homeDir, "change_feedback_items", 1)
+	assertTableCount(t, homeDir, "control_actions", 4)
+}
+
+func TestPRRetryMessageAuditsManualFeedbackWhenNoProviderFeedbackIsActionable(t *testing.T) {
+	homeDir, fakeProvider := setupDraftPRFeedbackTest(t)
+	feedbackProvider := &recordingChangeFeedbackProvider{
+		snapshot: workflow.ChangeFeedbackSnapshot{
+			ChangeRef:     "github://github.com/owner/repo/pulls/10",
+			RepositoryRef: "github://github.com/owner/repo",
+			Provider:      "github",
+			HeadSHA:       "abc123",
+			Items: []workflow.ChangeFeedbackItem{
+				{
+					ProviderRef: "github://github.com/owner/repo/pulls/10/reviews/81",
+					Kind:        "approval",
+					Actionable:  false,
+					Summary:     "octocat approved",
+					State:       "APPROVED",
+					CommitSHA:   "abc123",
+				},
+			},
+		},
+	}
+	message := "Retry after reproducing an intermittent CI failure locally."
+
+	stdout, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:       fakeProvider,
+		ChangeFeedbackProvider: feedbackProvider,
+	}, "pr", "retry", "10", "--message", message)
+	if err != nil {
+		t.Fatalf("expected pr retry --message to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	if !strings.Contains(stdout, "Retried PR 10 as AgentRun 2") || !strings.Contains(stdout, "Actionable feedback: 1") {
+		t.Fatalf("expected manual pr retry output, got:\n%s", stdout)
+	}
+
+	actions := readControlActions(t, homeDir)
+	retryAction := actions[len(actions)-1]
+	assertControlAction(t, retryAction, "retry", "succeeded", "local", map[string]any{
+		"change_ref": "github://github.com/owner/repo/pulls/10",
+	})
+	manualFeedback, ok := retryAction.input["manual_feedback"].([]any)
+	if !ok || len(manualFeedback) != 1 || manualFeedback[0] != message {
+		t.Fatalf("expected retry ControlAction to audit manual feedback %q, got %#v", message, retryAction.input)
+	}
+
+	retrySpec := readRunSpecJSON(t, homeDir, 2)
+	if !strings.Contains(retrySpec, `"kind":"manual"`) || !strings.Contains(retrySpec, message) {
+		t.Fatalf("expected retry RunSpec to include manual feedback, got:\n%s", retrySpec)
+	}
+}
+
+func TestPRRetryRejectsUnmappedPR(t *testing.T) {
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+	if _, stderr, err := executeForTest(t, "init", "--provider", "github"); err != nil {
+		t.Fatalf("expected init to configure current ForgeProject: %v\nstderr:\n%s", err, stderr)
+	}
+
+	_, stderr, err := executeForTest(t, "pr", "retry", "99")
+	if err == nil {
+		t.Fatal("expected pr retry to reject unmapped PR")
+	}
+	if !strings.Contains(err.Error(), "PR 99 is not mapped to an active ChangeSet") {
+		t.Fatalf("unexpected unmapped PR error: %v\nstderr:\n%s", err, stderr)
+	}
+	assertTableCount(t, homeDir, "agent_runs", 0)
+	assertTableCount(t, homeDir, "control_actions", 0)
+}
+
 func TestRunsEvidenceSummarizesCompletedDraftPRDelivery(t *testing.T) {
 	workingDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -4609,9 +4933,14 @@ func TestInitInfersOriginWithoutProvider(t *testing.T) {
 	if !strings.Contains(stdout, "Configured ForgeProject github://github.com/owner/repo") {
 		t.Fatalf("expected init output to describe inferred ForgeProject, got:\n%s", stdout)
 	}
+	if strings.Contains(stdout, "work-items") || strings.Contains(stdout, "AgentRun") {
+		t.Fatalf("bare init should only configure the ForgeProject, got:\n%s", stdout)
+	}
 
 	assertNoRepoLocalConfig(t, workingDir)
 	assertForgeProjects(t, homeDir, []string{"github://github.com/owner/repo"})
+	assertTableCount(t, homeDir, "work_items", 0)
+	assertTableCount(t, homeDir, "agent_runs", 0)
 }
 
 func TestInitIsIdempotentForMatchingForgeProject(t *testing.T) {
@@ -4692,6 +5021,63 @@ func runGit(t *testing.T, workingDir string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
 	}
+}
+
+func setupDraftPRFeedbackTest(t *testing.T) (string, *recordingWorkItemProvider) {
+	t.Helper()
+
+	workingDir := t.TempDir()
+	homeDir := t.TempDir()
+	runGit(t, workingDir, "init")
+	runGit(t, workingDir, "config", "user.email", "test@example.com")
+	runGit(t, workingDir, "config", "user.name", "ForgeLane Test")
+	runGit(t, workingDir, "remote", "add", "origin", "https://github.com/owner/repo")
+	if err := os.WriteFile(filepath.Join(workingDir, "README.md"), []byte("source repo\n"), 0o644); err != nil {
+		t.Fatalf("write source repo file: %v", err)
+	}
+	runGit(t, workingDir, "add", "README.md")
+	runGit(t, workingDir, "commit", "-m", "initial")
+	withWorkingDir(t, workingDir)
+	withHomeDir(t, homeDir)
+	if _, stderr, err := executeForTest(t, "init", "--provider", "github"); err != nil {
+		t.Fatalf("expected init to configure current ForgeProject: %v\nstderr:\n%s", err, stderr)
+	}
+
+	fakeProvider := &recordingWorkItemProvider{
+		issue: workitems.ProviderIssue{
+			ProviderRef:         "github://github.com/owner/repo/issues/123",
+			RepositoryRef:       "github://github.com/owner/repo",
+			Provider:            "github",
+			ProviderIssueNumber: 123,
+			Title:               "Retry a PR from provider feedback",
+			Body:                "Provider PR feedback should drive a follow-up AgentRun.",
+			Status:              "open",
+			RawStatus:           "open",
+			URL:                 "https://github.com/owner/repo/issues/123",
+			ProviderUpdatedAt:   time.Date(2026, 5, 30, 9, 10, 11, 0, time.UTC),
+		},
+	}
+	changeProvider := &recordingChangeProvider{
+		pushResult: workflow.ChangeBranchPushResult{
+			ChangeSetID:       1,
+			BranchProviderRef: "github://github.com/owner/repo/branches/forgelane/issue-123",
+			PushedCommitSHAs:  []string{"abc123"},
+		},
+		draftPRResult: workflow.ChangeDraftPRResult{
+			ChangeSetID:      1,
+			ChangeRef:        "github://github.com/owner/repo/pulls/10",
+			Draft:            true,
+			ProviderSnapshot: map[string]any{"number": float64(10), "draft": true, "head_sha": "abc123"},
+		},
+	}
+	if _, stderr, err := executeForTestWithOptions(t, Options{
+		WorkItemProvider:    fakeProvider,
+		AgentCommandPlanner: changingCommandPlanner{},
+		ChangeProvider:      changeProvider,
+	}, "runs", "start", "--agent-preset", "harmless-echo", "github://github.com/owner/repo/issues/123"); err != nil {
+		t.Fatalf("expected runs start to succeed: %v\nstderr:\n%s", err, stderr)
+	}
+	return homeDir, fakeProvider
 }
 
 type changingCommandPlanner struct{}
@@ -4784,6 +5170,20 @@ func (changeProviderWithoutReporter) PushChangeSetBranch(context.Context, workfl
 
 func (changeProviderWithoutReporter) CreateOrUpdateDraftPR(context.Context, workflow.ChangeDraftPRPlan) (workflow.ChangeDraftPRResult, error) {
 	return workflow.ChangeDraftPRResult{}, nil
+}
+
+type recordingChangeFeedbackProvider struct {
+	snapshot workflow.ChangeFeedbackSnapshot
+	err      error
+	calls    []workflow.ChangeFeedbackReadPlan
+}
+
+func (provider *recordingChangeFeedbackProvider) ReadChangeFeedback(_ context.Context, plan workflow.ChangeFeedbackReadPlan) (workflow.ChangeFeedbackSnapshot, error) {
+	provider.calls = append(provider.calls, plan)
+	if provider.err != nil {
+		return workflow.ChangeFeedbackSnapshot{}, provider.err
+	}
+	return provider.snapshot, nil
 }
 
 func gitOutput(t *testing.T, workingDir string, args ...string) string {
@@ -4950,6 +5350,41 @@ func assertTableCount(t *testing.T, homeDir string, table string, want int) {
 	}
 }
 
+func readLatestCommitRefSHA(t *testing.T, homeDir string, runID int64) string {
+	t.Helper()
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	var sha string
+	if err := db.QueryRow("SELECT sha FROM commit_refs WHERE agent_run_id = ? ORDER BY id DESC LIMIT 1", runID).Scan(&sha); err != nil {
+		t.Fatalf("query latest CommitRef SHA for AgentRun %d: %v", runID, err)
+	}
+	return sha
+}
+
+func assertChangeFeedbackRelationships(t *testing.T, homeDir string, sha string, want int) {
+	t.Helper()
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	var got int
+	err := db.QueryRow(`
+SELECT COUNT(*)
+FROM change_feedback_items cfi
+JOIN commit_refs cr ON cr.id = cfi.commit_ref_id
+JOIN events e ON e.id = cfi.sync_event_id
+WHERE cr.sha = ?
+	AND e.type = 'change_feedback.synced'`, sha).Scan(&got)
+	if err != nil {
+		t.Fatalf("query Change feedback relationships: %v", err)
+	}
+	if got != want {
+		t.Fatalf("expected %d Change feedback rows linked to CommitRef and sync Event, got %d", want, got)
+	}
+}
+
 type controlActionAudit struct {
 	actionType  string
 	status      string
@@ -5025,6 +5460,19 @@ func readEventPayload(t *testing.T, homeDir string, eventType string) map[string
 	return payload
 }
 
+func readEventProviderRef(t *testing.T, homeDir string, eventType string) string {
+	t.Helper()
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	var providerRef string
+	if err := db.QueryRow("SELECT provider_ref FROM events WHERE type = ? ORDER BY id DESC LIMIT 1", eventType).Scan(&providerRef); err != nil {
+		t.Fatalf("query Event provider_ref %s: %v", eventType, err)
+	}
+	return providerRef
+}
+
 func readEventPayloadForControlAction(t *testing.T, homeDir string, eventType string, controlActionID int64) map[string]any {
 	t.Helper()
 
@@ -5040,6 +5488,19 @@ func readEventPayloadForControlAction(t *testing.T, homeDir string, eventType st
 		t.Fatalf("decode Event payload %s for ControlAction %d: %v\n%s", eventType, controlActionID, err, payloadJSON)
 	}
 	return payload
+}
+
+func readRunSpecJSON(t *testing.T, homeDir string, agentRunID int64) string {
+	t.Helper()
+
+	db := openStateDB(t, homeDir)
+	defer db.Close()
+
+	var specJSON string
+	if err := db.QueryRow("SELECT spec_json FROM run_specs WHERE agent_run_id = ?", agentRunID).Scan(&specJSON); err != nil {
+		t.Fatalf("query RunSpec for AgentRun %d: %v", agentRunID, err)
+	}
+	return specJSON
 }
 
 func assertLogSegmentStreams(t *testing.T, homeDir string, wantStreams []string) {

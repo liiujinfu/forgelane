@@ -246,6 +246,30 @@ CREATE TABLE IF NOT EXISTS commit_refs (
 	UNIQUE(agent_run_id, sha)
 );
 
+CREATE TABLE IF NOT EXISTS change_feedback_items (
+	id INTEGER PRIMARY KEY,
+	change_set_id INTEGER NOT NULL REFERENCES change_sets(id),
+	agent_run_id INTEGER REFERENCES agent_runs(id),
+	control_action_id INTEGER REFERENCES control_actions(id),
+	commit_ref_id INTEGER REFERENCES commit_refs(id),
+	sync_event_id INTEGER REFERENCES events(id),
+	provider TEXT NOT NULL,
+	repository_ref TEXT NOT NULL,
+	change_ref TEXT NOT NULL,
+	provider_ref TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	actionable INTEGER NOT NULL DEFAULT 0,
+	summary TEXT NOT NULL,
+	body TEXT NOT NULL,
+	path TEXT NOT NULL DEFAULT '',
+	line INTEGER NOT NULL DEFAULT 0,
+	commit_sha TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL DEFAULT '',
+	provider_snapshot TEXT NOT NULL DEFAULT '',
+	synced_at TEXT NOT NULL,
+	created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS control_actions (
 	id INTEGER PRIMARY KEY,
 	type TEXT NOT NULL,
@@ -296,7 +320,9 @@ CREATE INDEX IF NOT EXISTS idx_change_sets_work_item_id ON change_sets(work_item
 CREATE UNIQUE INDEX IF NOT EXISTS idx_change_sets_one_active_per_work_item
 ON change_sets(work_item_id)
 WHERE status NOT IN ('merged', 'closed', 'abandoned');
-CREATE INDEX IF NOT EXISTS idx_commit_refs_agent_run_id ON commit_refs(agent_run_id);`
+CREATE INDEX IF NOT EXISTS idx_commit_refs_agent_run_id ON commit_refs(agent_run_id);
+CREATE INDEX IF NOT EXISTS idx_change_feedback_items_change_set_id ON change_feedback_items(change_set_id);
+CREATE INDEX IF NOT EXISTS idx_change_feedback_items_provider_ref ON change_feedback_items(provider_ref);`
 
 	if _, err := store.db.Exec(schema); err != nil {
 		return fmt.Errorf("initialize ForgeLane database schema: %w", err)
@@ -322,11 +348,23 @@ CREATE INDEX IF NOT EXISTS idx_commit_refs_agent_run_id ON commit_refs(agent_run
 	if err := store.ensureColumn("change_sets", "provider_snapshot", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := store.ensureColumn("change_feedback_items", "commit_ref_id", "INTEGER REFERENCES commit_refs(id)"); err != nil {
+		return err
+	}
+	if err := store.ensureColumn("change_feedback_items", "sync_event_id", "INTEGER REFERENCES events(id)"); err != nil {
+		return err
+	}
 	if _, err := store.db.Exec("CREATE INDEX IF NOT EXISTS idx_events_control_action_id ON events(control_action_id)"); err != nil {
 		return fmt.Errorf("initialize ControlAction event index: %w", err)
 	}
 	if _, err := store.db.Exec("CREATE INDEX IF NOT EXISTS idx_commit_refs_change_set_id ON commit_refs(change_set_id)"); err != nil {
 		return fmt.Errorf("initialize CommitRef ChangeSet index: %w", err)
+	}
+	if _, err := store.db.Exec("CREATE INDEX IF NOT EXISTS idx_change_feedback_items_commit_ref_id ON change_feedback_items(commit_ref_id)"); err != nil {
+		return fmt.Errorf("initialize Change feedback CommitRef index: %w", err)
+	}
+	if _, err := store.db.Exec("CREATE INDEX IF NOT EXISTS idx_change_feedback_items_sync_event_id ON change_feedback_items(sync_event_id)"); err != nil {
+		return fmt.Errorf("initialize Change feedback sync Event index: %w", err)
 	}
 	return nil
 }
@@ -2811,6 +2849,7 @@ VALUES (?, ?, ?)`,
 				AgentRunID:      runID,
 				ControlActionID: controlActionID,
 				ChangeSetID:     activeChangeSet.ID,
+				ProviderRef:     activeChangeSet.ChangeRef,
 				Payload: map[string]any{
 					"change_set_id":      activeChangeSet.ID,
 					"prior_agent_run_id": options.priorAgentRunID,
@@ -2879,6 +2918,7 @@ type agentRunEventInput struct {
 	AgentRunID      int64
 	ControlActionID int64
 	ChangeSetID     int64
+	ProviderRef     string
 	Payload         map[string]any
 }
 
@@ -2894,6 +2934,10 @@ func appendAgentRunEventTx(tx *sql.Tx, input agentRunEventInput) (Event, error) 
 	var changeSetID any
 	if input.ChangeSetID != 0 {
 		changeSetID = input.ChangeSetID
+	}
+	providerRef := input.ProviderRef
+	if providerRef == "" {
+		providerRef = input.WorkItemRef
 	}
 
 	result, err := tx.Exec(`
@@ -2923,7 +2967,7 @@ INSERT INTO events (
 		input.AgentRunID,
 		controlActionID,
 		changeSetID,
-		input.WorkItemRef,
+		providerRef,
 		string(payload),
 	)
 	if err != nil {
