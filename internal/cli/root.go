@@ -17,15 +17,17 @@ import (
 
 // Options configures the root command's process edges.
 type Options struct {
-	Stdout                       io.Writer
-	Stderr                       io.Writer
-	WorkItemProvider             workitems.Provider
-	WorkItemProviderFactory      func(workitems.ProviderRef) (workitems.Provider, error)
-	AgentCommandPlanner          workflow.AgentCommandPlanner
-	AgentCommandRunner           workflow.AgentCommandRunner
-	RepositoryChangeMaterializer workflow.RepositoryChangeMaterializer
-	ChangeProvider               workflow.ChangeProvider
-	ChangeProviderFactory        func(string) (workflow.ChangeProvider, error)
+	Stdout                        io.Writer
+	Stderr                        io.Writer
+	WorkItemProvider              workitems.Provider
+	WorkItemProviderFactory       func(workitems.ProviderRef) (workitems.Provider, error)
+	AgentCommandPlanner           workflow.AgentCommandPlanner
+	AgentCommandRunner            workflow.AgentCommandRunner
+	RepositoryChangeMaterializer  workflow.RepositoryChangeMaterializer
+	ChangeProvider                workflow.ChangeProvider
+	ChangeProviderFactory         func(string) (workflow.ChangeProvider, error)
+	ChangeFeedbackProvider        workflow.ChangeFeedbackProvider
+	ChangeFeedbackProviderFactory func(string) (workflow.ChangeFeedbackProvider, error)
 }
 
 // NewRootCommand constructs the ForgeLane CLI command tree.
@@ -58,9 +60,9 @@ func NewRootCommand(options Options) *cobra.Command {
 	root.AddCommand(newWorkflowCommand(stdout))
 	root.AddCommand(newVersionCommand(stdout))
 	root.AddCommand(newIssueCommand(stdout, options))
-	root.AddCommand(newPRCommand(stdout, options))
 	root.AddCommand(newWorkItemsCommand(stdout, options))
 	root.AddCommand(newRunsCommand(stdout, options))
+	root.AddCommand(newPRCommand(stdout, options))
 	root.AddCommand(newEventsCommand(stdout))
 
 	return root

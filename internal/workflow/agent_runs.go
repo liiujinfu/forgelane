@@ -27,7 +27,9 @@ type CreatePlannedAgentRunInput struct {
 
 // RequestAgentRunRetryInput configures the fresh RunSpec created for a retry.
 type RequestAgentRunRetryInput struct {
-	AgentPreset string
+	AgentPreset    string
+	ChangeSetID    int64
+	ChangeFeedback *ChangeFeedbackSnapshot
 }
 
 // WorkItemSnapshot is the cached provider-owned WorkItem state captured in a RunSpec.
@@ -56,6 +58,7 @@ type PlannedAgentRunPlan struct {
 	AgentPreset    string
 	CommandTimeout time.Duration
 	ControlAction  ControlActionPlan
+	ChangeFeedback *ChangeFeedbackSnapshot
 }
 
 // ControlActionPlan is the workflow decision for the operator action starting a run.
@@ -760,19 +763,53 @@ func RequestAgentRunRetry(store AgentRunRetryStore, priorRunID int64, input Requ
 	if err != nil {
 		return AgentRunCreateResult{}, err
 	}
+	plan.ChangeFeedback = input.ChangeFeedback
+	actionTargetType := "agent_run"
+	actionTargetRef := fmt.Sprintf("agent_run:%d", priorRunID)
+	actionReason := "forgelane runs retry"
+	actionInput := map[string]any{
+		"prior_agent_run_id": priorRunID,
+		"work_item_ref":      prior.WorkItem.ProviderRef,
+	}
+	if input.ChangeFeedback != nil {
+		actionReason = "forgelane pr retry"
+		actionTargetType = "change_set"
+		if input.ChangeSetID > 0 {
+			actionTargetRef = fmt.Sprintf("change_set:%d", input.ChangeSetID)
+			actionInput["change_set_id"] = input.ChangeSetID
+		}
+		actionInput["change_ref"] = input.ChangeFeedback.ChangeRef
+		actionInput["head_sha"] = input.ChangeFeedback.HeadSHA
+		actionInput["feedback_count"] = len(input.ChangeFeedback.Items)
+		actionInput["actionable_feedback_count"] = len(ActionableChangeFeedbackItems(input.ChangeFeedback.Items))
+		if manualFeedback := manualFeedbackBodies(input.ChangeFeedback.Items); len(manualFeedback) > 0 {
+			actionInput["manual_feedback"] = manualFeedback
+		}
+	}
 	plan.ControlAction = ControlActionPlan{
 		Type:        "retry",
-		TargetType:  "agent_run",
-		TargetRef:   fmt.Sprintf("agent_run:%d", priorRunID),
+		TargetType:  actionTargetType,
+		TargetRef:   actionTargetRef,
 		RequestedBy: "local",
-		Reason:      "forgelane runs retry",
-		Input: map[string]any{
-			"prior_agent_run_id": priorRunID,
-			"work_item_ref":      prior.WorkItem.ProviderRef,
-		},
-		Status: "succeeded",
+		Reason:      actionReason,
+		Input:       actionInput,
+		Status:      "succeeded",
 	}
 	return store.CreateRetryAgentRun(priorRunID, plan)
+}
+
+func manualFeedbackBodies(items []ChangeFeedbackItem) []string {
+	messages := make([]string, 0)
+	for _, item := range items {
+		if item.Kind != "manual" {
+			continue
+		}
+		message := strings.TrimSpace(item.Body)
+		if message != "" {
+			messages = append(messages, message)
+		}
+	}
+	return messages
 }
 
 func agentPresetFromRunSpec(specJSON string) (string, error) {
@@ -1227,6 +1264,7 @@ func (plan PlannedAgentRunPlan) EncodeRunSpec(runID int64) (string, error) {
 			EnvPolicy:        "scrubbed",
 			CredentialGrants: credentialGrantsForAgentPreset(plan.AgentPreset),
 		},
+		ChangeFeedback:      runSpecChangeFeedback(plan.ChangeFeedback),
 		TimeoutMilliseconds: plan.CommandTimeout.Milliseconds(),
 	}
 	encoded, err := json.Marshal(spec)
@@ -1237,12 +1275,13 @@ func (plan PlannedAgentRunPlan) EncodeRunSpec(runID int64) (string, error) {
 }
 
 type runSpecSnapshot struct {
-	RunID               string                      `json:"run_id"`
-	WorkItem            runSpecWorkItemSnapshot     `json:"work_item"`
-	Repo                runSpecRepoSnapshot         `json:"repo"`
-	Branch              string                      `json:"branch"`
-	AgentAdapter        runSpecAgentAdapterSnapshot `json:"agent_adapter"`
-	TimeoutMilliseconds int64                       `json:"timeout_milliseconds"`
+	RunID               string                         `json:"run_id"`
+	WorkItem            runSpecWorkItemSnapshot        `json:"work_item"`
+	Repo                runSpecRepoSnapshot            `json:"repo"`
+	Branch              string                         `json:"branch"`
+	AgentAdapter        runSpecAgentAdapterSnapshot    `json:"agent_adapter"`
+	ChangeFeedback      *runSpecChangeFeedbackSnapshot `json:"change_feedback,omitempty"`
+	TimeoutMilliseconds int64                          `json:"timeout_milliseconds"`
 }
 
 type runSpecWorkItemSnapshot struct {
@@ -1277,10 +1316,60 @@ type runSpecAgentAdapterSnapshot struct {
 	CredentialGrants []runSpecCredentialGrantSnapshot `json:"credential_grants,omitempty"`
 }
 
+type runSpecChangeFeedbackSnapshot struct {
+	Provider        string                              `json:"provider"`
+	RepositoryRef   string                              `json:"repository_ref"`
+	ChangeRef       string                              `json:"change_ref"`
+	HeadSHA         string                              `json:"head_sha"`
+	ActionableCount int                                 `json:"actionable_count"`
+	Items           []runSpecChangeFeedbackItemSnapshot `json:"items"`
+}
+
+type runSpecChangeFeedbackItemSnapshot struct {
+	ProviderRef string `json:"provider_ref"`
+	Kind        string `json:"kind"`
+	Actionable  bool   `json:"actionable"`
+	Summary     string `json:"summary"`
+	Body        string `json:"body,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Line        int    `json:"line,omitempty"`
+	CommitSHA   string `json:"commit_sha,omitempty"`
+	State       string `json:"state,omitempty"`
+}
+
 type runSpecCredentialGrantSnapshot struct {
 	Kind     string `json:"kind"`
 	SecretID string `json:"secret_id"`
 	Env      string `json:"env"`
+}
+
+func runSpecChangeFeedback(snapshot *ChangeFeedbackSnapshot) *runSpecChangeFeedbackSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	items := ActionableChangeFeedbackItems(snapshot.Items)
+	runSpecItems := make([]runSpecChangeFeedbackItemSnapshot, 0, len(items))
+	for _, item := range items {
+		runSpecItems = append(runSpecItems, runSpecChangeFeedbackItemSnapshot{
+			ProviderRef: item.ProviderRef,
+			Kind:        item.Kind,
+			Actionable:  item.Actionable,
+			Summary:     item.Summary,
+			Body:        item.Body,
+			Path:        item.Path,
+			Line:        item.Line,
+			CommitSHA:   item.CommitSHA,
+			State:       item.State,
+		})
+	}
+	return &runSpecChangeFeedbackSnapshot{
+		Provider:        snapshot.Provider,
+		RepositoryRef:   snapshot.RepositoryRef,
+		ChangeRef:       snapshot.ChangeRef,
+		HeadSHA:         snapshot.HeadSHA,
+		ActionableCount: len(runSpecItems),
+		Items:           runSpecItems,
+	}
 }
 
 func credentialGrantsForAgentPreset(agentPreset string) []runSpecCredentialGrantSnapshot {

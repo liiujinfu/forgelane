@@ -118,3 +118,21 @@ func changeProviderForRun(options Options, instanceStore *store.Store, runID int
 	}
 	return changeProviderForProvider(options, detail.WorkItem.Provider)
 }
+
+func changeFeedbackProviderForProvider(options Options, provider string) (workflow.ChangeFeedbackProvider, error) {
+	if options.ChangeFeedbackProvider != nil {
+		return options.ChangeFeedbackProvider, nil
+	}
+	if options.ChangeFeedbackProviderFactory != nil {
+		return options.ChangeFeedbackProviderFactory(provider)
+	}
+	if options.WorkItemProvider != nil {
+		return nil, nil
+	}
+	switch provider {
+	case "github":
+		return githubprovider.NewChangeFeedbackProvider(githubprovider.ChangeFeedbackProviderOptions{}), nil
+	default:
+		return nil, fmt.Errorf("unsupported ChangeFeedbackProvider %q", provider)
+	}
+}
